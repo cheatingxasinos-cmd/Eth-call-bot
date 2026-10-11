@@ -1,4 +1,4 @@
-import functools
+import functoolsb
 import io
 import json
 import math
@@ -7,6 +7,7 @@ import random
 import statistics
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import requests
@@ -27,11 +28,9 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json")
 GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
 
 W_MARKET = float(os.getenv("W_MARKET", "0.5"))
-MOM_W = float(os.getenv("MOM_W", "0.3"))
 MIN_CONF = float(os.getenv("MIN_CONF", "60"))
 CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "60"))
-DEF_SIGMA = 1.1e-4
-PRICES = deque(maxlen=120)
+TILT_W = float(os.getenv("TILT_W", "0.25"))   # max pull of the basket, in sigmas (x3 clip)
 
 LOGO_PATH = os.getenv("LOGO_PATH", "eth_logo.png")
 LIVE_SCALE = float(os.getenv("LIVE_SCALE", "1.5"))     # 1.5 = 1080x1200 GIF
@@ -53,7 +52,7 @@ def save_state(s):
         json.dump(s, f, indent=1)
 
 
-# ---------- data ----------
+# ---------- kalshi data ----------
 def cents(m, key):
     if m.get(key) is not None:
         return float(m[key])
@@ -88,45 +87,81 @@ def get_market(ticker):
     return r.json()["market"]
 
 
+# ---------- crypto prices (ETH, BTC, SOL) ----------
+WEIGHTS = {"ETH": 0.4, "BTC": 0.4, "SOL": 0.2}
+DEF_SIG = {"ETH": 1.1e-4, "BTC": 0.9e-4, "SOL": 1.8e-4}
+PRICES = {s: deque(maxlen=120) for s in WEIGHTS}
+
+
+def _cb(pair):
+    return float(requests.get(f"https://api.coinbase.com/v2/prices/{pair}/spot", timeout=5).json()["data"]["amount"])
+
+
+def _kr(pair):
+    r = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair": pair}, timeout=5).json()["result"]
+    return float(next(iter(r.values()))["c"][0])
+
+
+def _bs(pair):
+    return float(requests.get(f"https://www.bitstamp.net/api/v2/ticker/{pair}/", timeout=5).json()["last"])
+
+
+SOURCES = {
+    "ETH": [(_cb, "ETH-USD"), (_kr, "ETHUSD"), (_bs, "ethusd")],
+    "BTC": [(_cb, "BTC-USD"), (_kr, "XBTUSD"), (_bs, "btcusd")],
+    "SOL": [(_cb, "SOL-USD"), (_kr, "SOLUSD"), (_bs, "solusd")],
+}
+
+
+def _safe(job):
+    sym, fn, pair = job
+    try:
+        return sym, fn(pair)
+    except Exception:
+        return sym, None
+
+
+def all_prices():
+    """{sym: (median_price, n_exchanges)}; (None, 0) if every source failed."""
+    jobs = [(s, fn, pair) for s, srcs in SOURCES.items() for fn, pair in srcs]
+    got = {s: [] for s in SOURCES}
+    with ThreadPoolExecutor(len(jobs)) as ex:
+        for sym, p in ex.map(_safe, jobs):
+            if p:
+                got[sym].append(p)
+    return {s: ((statistics.median(v), len(v)) if v else (None, 0)) for s, v in got.items()}
+
+
 def eth_price():
-    px = []
-    for fn in (
-        lambda: float(requests.get("https://api.coinbase.com/v2/prices/ETH-USD/spot", timeout=5).json()["data"]["amount"]),
-        lambda: float(requests.get("https://api.kraken.com/0/public/Ticker?pair=ETHUSD", timeout=5).json()["result"]["XETHZUSD"]["c"][0]),
-        lambda: float(requests.get("https://www.bitstamp.net/api/v2/ticker/ethusd/", timeout=5).json()["last"]),
-    ):
-        try:
-            px.append(fn())
-        except Exception:
-            pass
-    return (statistics.median(px), len(px)) if px else (None, 0)
+    return all_prices()["ETH"]
 
 
 # ---------- prediction ----------
-def record_price(price):
+def record_price(sym, price):
     if price:
-        PRICES.append((time.time(), price))
+        PRICES[sym].append((time.time(), price))
 
 
 def norm_cdf(x):
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 
-def vol_per_sqrt_sec():
-    pts = list(PRICES)
+def vol(sym):
+    pts = list(PRICES[sym])
     rets = []
     for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
         dt = t1 - t0
         if dt > 0.5:
             rets.append(math.log(p1 / p0) / math.sqrt(dt))
+    base = DEF_SIG[sym]
     if len(rets) < 8:
-        return DEF_SIGMA
+        return base
     s = math.sqrt(sum(r * r for r in rets) / len(rets))
-    return max(DEF_SIGMA * 0.4, min(s, DEF_SIGMA * 4))
+    return max(base * 0.4, min(s, base * 4))
 
 
-def momentum():
-    pts = list(PRICES)
+def z60(sym):
+    pts = list(PRICES[sym])
     if len(pts) < 2:
         return 0.0
     t_now, p_now = pts[-1]
@@ -134,21 +169,39 @@ def momentum():
     if not old:
         return 0.0
     t0, p0 = old[-1]
-    return math.log(p_now / p0) / (t_now - t0)
+    return math.log(p_now / p0) / (vol(sym) * math.sqrt(t_now - t0))
 
 
-def model_prob(price, strike, secs_left):
+def z_open(sym, price, open_px, since_open):
+    if not price or not open_px or since_open < 20:
+        return 0.0
+    return math.log(price / open_px) / (vol(sym) * math.sqrt(since_open))
+
+
+def market_signal(prices, opens, since_open):
+    """Returns (tilt, breadth, per-coin z). Positive tilt = basket pulling ETH up."""
+    zs = {}
+    for s in WEIGHTS:
+        z = 0.6 * z60(s) + 0.4 * z_open(s, prices.get(s), opens.get(s), since_open)
+        zs[s] = max(-3.0, min(3.0, z))
+    basket = sum(WEIGHTS[s] * zs[s] for s in WEIGHTS)
+    agree = sum(WEIGHTS[s] * (0 if abs(zs[s]) < 0.15 else (1 if zs[s] > 0 else -1)) for s in WEIGHTS)
+    breadth = abs(agree) / sum(WEIGHTS.values())
+    return basket * (0.5 + 0.5 * breadth), breadth, zs
+
+
+def model_prob(price, strike, secs_left, tilt=0.0):
     if not price or not strike:
         return None
     tau = max(secs_left, 1)
-    sig = vol_per_sqrt_sec()
-    drift = max(-sig, min(sig, momentum())) * MOM_W
-    z = (math.log(price / strike) + drift * tau) / (sig * math.sqrt(tau))
+    sig = vol("ETH")
+    fade = min(1.0, math.sqrt(tau / 300))
+    z = math.log(price / strike) / (sig * math.sqrt(tau)) + TILT_W * max(-3.0, min(3.0, tilt)) * fade
     return max(1.0, min(99.0, norm_cdf(z) * 100))
 
 
-def predict(yes_mkt, price, strike, secs_left):
-    pm = model_prob(price, strike, secs_left)
+def predict(yes_mkt, price, strike, secs_left, tilt=0.0):
+    pm = model_prob(price, strike, secs_left, tilt)
     if pm is None:
         return yes_mkt, None
     return W_MARKET * yes_mkt + (1 - W_MARKET) * pm, pm
@@ -634,6 +687,10 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         title = f"{arrow} KALSHI ETH 15m: {side} | {tag}"
     if pm is not None:
         lines.append(f"**Strike model** UP {pm:.0f}% / DOWN {100 - pm:.0f}%")
+    mk = c.get("mkt")
+    if mk:
+        arrows = " / ".join(f"{sym} {'▲' if z >= 0 else '▼'}" for sym, z in mk["z"].items())
+        lines.append(f"**Basket** {arrows} (agreement {mk['breadth'] * 100:.0f}%)")
     if price:
         lines.append(f"**Price** ${price:,.2f} (median of {n_ex} exch)")
     lines.append(f"**Strike** {c['strike']:,.2f} | {max(int(secs_left), 0)}s left")
@@ -671,6 +728,7 @@ def send(embed, message_id=None, cur=None, outcome=None):
             continue
         r.raise_for_status()
         return r.json()["id"]
+    raise RuntimeError("discord rate limited")
 
 
 # ---------- core ----------
@@ -687,7 +745,8 @@ def settle_pending(state):
                     continue
                 res = "yes" if price >= p["strike"] else "no"
             win = (res == "yes") == (p["side"] == "UP")
-            state["history"].append({"ticker": p["ticker"], "side": p["side"], "win": win})
+            state["history"].append({"ticker": p["ticker"], "side": p["side"], "win": win,
+                                     "tilt": (p.get("mkt") or {}).get("tilt")})
             state["pending"].remove(p)
             yes_final = 100.0 if res == "yes" else 0.0
             p.setdefault("pts", []).append([900, 100 if res == "yes" else 0])
@@ -721,15 +780,27 @@ def tick(state):
     secs_left = close_ts - now
     elapsed = 900 - secs_left
     yes = yes_pct(m)
-    price, n_ex = eth_price()
-    record_price(price)
+    px = all_prices()
+    for s, (p, _) in px.items():
+        record_price(s, p)
+    price, n_ex = px["ETH"]
     strike = float(m.get("floor_strike") or m.get("cap_strike") or 0)
-    blend, pm = predict(yes, price, strike, secs_left)
 
     if cur is None:
         cur = {"ticker": m["ticker"], "side": None, "strike": strike, "close_ts": close_ts,
                "message_id": None, "pts": [], "eth": [], "locked": False, "conf": None}
         state["current"] = cur
+    cur.setdefault("open", {})
+    cur.setdefault("open_t", now)
+    for s, (p, _) in px.items():
+        if p:
+            cur["open"].setdefault(s, p)
+
+    now_px = {s: p for s, (p, _) in px.items()}
+    tilt, breadth, zs = market_signal(now_px, cur["open"], now - cur["open_t"])
+    blend, pm = predict(yes, price, strike, secs_left, tilt)
+    cur["mkt"] = {"tilt": round(tilt, 2), "breadth": round(breadth, 2),
+                  "z": {s: round(z, 2) for s, z in zs.items()}}
 
     if cur["side"] is None and secs_left > CALL_CUTOFF:
         if blend > MIN_CONF:
