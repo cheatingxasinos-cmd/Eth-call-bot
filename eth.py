@@ -7,9 +7,10 @@ import statistics
 import time
 from collections import deque
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageChops
 
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 SERIES = os.getenv("KALSHI_SERIES", "KXETH15M")
@@ -25,6 +26,12 @@ MIN_CONF = float(os.getenv("MIN_CONF", "60"))         # must be strictly above t
 CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "60"))     # no new calls with fewer secs than this left
 DEF_SIGMA = 1.1e-4                                    # ~60% annual vol, per sqrt(second)
 PRICES = deque(maxlen=120)                            # (timestamp, price)
+
+LOGO_PATH = os.getenv("LOGO_PATH", "eth_logo.png")
+CHART_TZ = ZoneInfo(os.getenv("CHART_TZ", "America/New_York"))
+LIVE_SCALE = float(os.getenv("LIVE_SCALE", "1.5"))    # 1.5 = 1080x1200 animated GIF
+FINAL_SCALE = float(os.getenv("FINAL_SCALE", "3"))    # 3 = 2160x2400 still PNG
+MAX_BYTES = int(float(os.getenv("MAX_MB", "7.5")) * 1024 * 1024)
 
 
 # ---------- state ----------
@@ -122,7 +129,7 @@ def momentum():
     if not old:
         return 0.0
     t0, p0 = old[-1]
-    return math.log(p_now / p0) / (t_now - t0)    # log-return per second
+    return math.log(p_now / p0) / (t_now - t0)
 
 
 def model_prob(price, strike, secs_left):
@@ -168,14 +175,12 @@ def stats(history):
     }
 
 
-# ---------- chart ----------
-LIVE_SCALE = float(os.getenv("LIVE_SCALE", "1.5"))    # 1.5 = 1920x1080 GIF
-FINAL_SCALE = float(os.getenv("FINAL_SCALE", "3"))    # 3 = 3840x2160 still PNG
-MAX_BYTES = int(float(os.getenv("MAX_MB", "7.5")) * 1024 * 1024)
-LW, LH = 1280, 720
-BG1, BG2 = (12, 16, 28), (26, 32, 50)
-C_UP, C_DN, ORANGE = (0, 224, 130), (255, 72, 92), (255, 159, 28)
-CYAN, AMBER = (0, 229, 255), (255, 190, 40)
+# ---------- chart (mobile card style) ----------
+CW, CH = 720, 800
+WHITE = (255, 255, 255, 255)
+MUTED = (160, 168, 178, 255)
+C_UP, C_DN, ORG = (0, 217, 142), (255, 87, 87), (255, 140, 58)
+AMBER = (255, 190, 40)
 
 
 @functools.lru_cache(maxsize=64)
@@ -209,270 +214,200 @@ def _dots(d, x0, y0, x1, y1, fill, w=1, on=3.0, off=5.0, phase=0.0):
         p += on + off
 
 
-def _candles(pts, step=30):
-    b = {}
-    for t, v in pts:
-        b.setdefault(min(int(t // step), 900 // step - 1), []).append(v)
-    out, prev = [], None
-    for i in sorted(b):
-        vs = b[i]
-        o = prev if prev is not None else vs[0]
-        out.append((i, o, max(vs + [o]), min(vs + [o]), vs[-1]))
-        prev = vs[-1]
+@functools.lru_cache(maxsize=8)
+def _logo(px):
+    try:
+        im = ImageOps.fit(Image.open(LOGO_PATH).convert("RGBA"), (px, px), Image.LANCZOS)
+    except Exception:
+        im = Image.new("RGBA", (px, px), (15, 26, 61, 255))
+        g = ImageDraw.Draw(im)
+        c = px / 2
+        u = px / 100
+        top, mid, low = (c, c - 36 * u), (c, c + 8 * u), (c, c + 38 * u)
+        lft, rgt = (c - 22 * u, c - 2 * u), (c + 22 * u, c - 2 * u)
+        g.polygon([top, rgt, mid], fill=(232, 159, 240, 255))
+        g.polygon([top, lft, mid], fill=(155, 77, 202, 255))
+        g.polygon([lft, mid, (c - 22 * u, c + 6 * u)], fill=(120, 60, 180, 255))
+        g.polygon([lft, mid, low], fill=(155, 77, 202, 255))
+        g.polygon([rgt, mid, low], fill=(232, 159, 240, 255))
+    m = Image.new("L", (px * 4, px * 4), 0)
+    ImageDraw.Draw(m).ellipse([0, 0, px * 4 - 1, px * 4 - 1], fill=255)
+    m = m.resize((px, px), Image.LANCZOS)
+    out = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+    out.paste(im, (0, 0), m)
     return out
 
 
-def _ema(vals, n):
-    a = 2 / (n + 1)
-    out = [vals[0]]
-    for v in vals[1:]:
-        out.append(out[-1] + a * (v - out[-1]))
-    return out
+def _clock(t):
+    dt = datetime.fromtimestamp(t, CHART_TZ)
+    return f"{dt.hour % 12 or 12}:{dt.minute:02d}{'am' if dt.hour < 12 else 'pm'}"
+
+
+def _bg(Wd, Hd):
+    h = Image.linear_gradient("L").transpose(Image.Transpose.ROTATE_90).resize((Wd, Hd))
+    top = ImageOps.colorize(h, (13, 31, 31), (45, 26, 31))
+    v = Image.linear_gradient("L").resize((Wd, Hd)).point(lambda p: min(255, int(p * 1.7)))
+    return Image.composite(Image.new("RGB", (Wd, Hd), (10, 10, 10)), top, v).convert("RGBA")
 
 
 def render_frames(cur, outcome, S, n):
-    Wd, Hd = int(LW * S), int(LH * S)
+    Wd, Hd = int(CW * S), int(CH * S)
     k = lambda v: v * S
-    lw1 = max(1, int(k(1)))
+    F = lambda sz, b=True: _ui(int(k(sz)), b)
+    lw = lambda v: max(1, int(k(v)))
+
     pts = cur.get("pts") or [[0, 50]]
-    cs = _candles(pts)
+    eth = cur.get("eth") or []
     side = cur.get("side")
     waiting = side is None
     is_up = side == "UP"
     yes_last = pts[-1][1]
-    last = yes_last if (is_up or waiting) else 100 - yes_last
-    best = max(yes_last, 100 - yes_last)
-    conf = cur.get("conf") or (best if waiting else last)
-    full = (not waiting) and (outcome == "win" or (outcome not in ("loss", "settling") and last >= 80))
-    if waiting:
-        col = CYAN
-    elif outcome == "settling":
-        col = AMBER
-    else:
-        col = C_UP if is_up else C_DN
-    hot = tuple(min(255, c + 150) for c in col)
-    fs, fm, fl, fx_big = _ui(int(k(11)), False), _ui(int(k(13))), _ui(int(k(20))), _ui(int(k(40)))
-    grey = (120, 132, 156, 255)
-
-    # plot geometry and auto-zoomed y range
-    X0, X1, Y0, Y1 = k(30), k(860), k(120), k(500)
-    lo, hi = min(c[3] for c in cs) - 4, max(c[2] for c in cs) + 4
-    if hi - lo < 20:
-        mid = (hi + lo) / 2
-        lo, hi = mid - 10, mid + 10
-    lo, hi = max(0.0, lo), min(100.0, hi)
-    if hi - lo < 20:
-        if lo <= 0:
-            hi = 20.0
-        else:
-            lo = hi - 20.0
-    Y = lambda v: Y1 - (v - lo) / (hi - lo) * (Y1 - Y0)
-    X = lambda t: X0 + (X1 - X0) * min(t, 900) / 900
-    cw = (X1 - X0) / 30
-
-    base = ImageOps.colorize(Image.linear_gradient("L").resize((Wd, Hd)), BG1, BG2).convert("RGBA")
-    d = ImageDraw.Draw(base, "RGBA")
-
-    # grid + axes
-    for i in range(6):
-        v = lo + (hi - lo) * i / 5
-        _dots(d, X0, Y(v), X1, Y(v), (140, 160, 200, 40), lw1, k(2), k(5))
-        d.text((X1 + k(10), Y(v) - k(7)), f"{v:.1f}", fill=grey, font=fs)
-    for m in range(0, 16, 3):
-        _dots(d, X(m * 60), Y0, X(m * 60), k(600), (140, 160, 200, 26), lw1, k(2), k(6))
-        d.text((X(m * 60) - k(8), k(610)), f"{m}m", fill=grey, font=fs)
-
-    # no-call band
-    bot_v, top_v = 100 - MIN_CONF, MIN_CONF
-    if bot_v < hi and top_v > lo:
-        yb, ya = max(Y0, Y(min(top_v, hi))), min(Y1, Y(max(bot_v, lo)))
-        d.rectangle([X0, yb, X1, ya], fill=AMBER + (12,))
-        hh = max(2, int(ya - yb))
-        hatch = Image.new("RGBA", (int(X1 - X0), hh), (0, 0, 0, 0))
-        hd = ImageDraw.Draw(hatch)
-        for xs in range(-hh, int(X1 - X0), int(k(14))):
-            hd.line([(xs, hh), (xs + hh, 0)], fill=AMBER + (20,), width=lw1)
-        base.alpha_composite(hatch, (int(X0), int(yb)))
-        d = ImageDraw.Draw(base, "RGBA")
-        if lo < top_v < hi:
-            _dots(d, X0, Y(top_v), X1, Y(top_v), AMBER + (170,), lw1 * 2, k(6), k(5))
-            d.text((X0 + k(8), Y(top_v) - k(15)), f"UP CALL > {MIN_CONF:.0f}", fill=AMBER + (210,), font=fs)
-        if lo < bot_v < hi:
-            _dots(d, X0, Y(bot_v), X1, Y(bot_v), AMBER + (170,), lw1 * 2, k(6), k(5))
-            d.text((X0 + k(8), Y(bot_v) + k(3)), f"DOWN CALL < {bot_v:.0f}", fill=AMBER + (210,), font=fs)
-
-    # activity bars
-    vy0, vy1 = k(525), k(600)
-    acts = [(c[2] - c[3]) + 0.3 for c in cs]
-    mx = max(acts)
-    d.text((X0, vy0 - k(16)), "ACTIVITY (HIGH-LOW RANGE)", fill=grey, font=fs)
-    for c, a in zip(cs, acts):
-        x = X0 + (c[0] + 0.5) * cw
-        cc = C_UP if c[4] >= c[1] else C_DN
-        d.rectangle([x - cw * 0.3, vy1 - a / mx * (vy1 - vy0), x + cw * 0.3, vy1], fill=cc + (130,))
-
-    # candles + EMAs (with glow)
-    gl = Image.new("RGBA", (Wd, Hd), (0, 0, 0, 0))
-    g = ImageDraw.Draw(gl)
-    for (i, o, h, lw_, c) in cs:
-        x = X0 + (i + 0.5) * cw
-        cc = C_UP if c >= o else C_DN
-        g.line([(x, Y(h)), (x, Y(lw_))], fill=cc + (255,), width=max(1, int(k(2))))
-        top, bot = Y(max(o, c)), Y(min(o, c))
-        if bot - top < k(2):
-            bot = top + k(2)
-        g.rectangle([x - cw * 0.3, top, x + cw * 0.3, bot], fill=cc + (255,))
-    if len(cs) > 1:
-        xs = [X0 + (c[0] + 0.5) * cw for c in cs]
-        closes = [c[4] for c in cs]
-        for n_, ecol in ((3, CYAN), (8, ORANGE)):
-            g.line([(x, Y(v)) for x, v in zip(xs, _ema(closes, n_))],
-                   fill=ecol + (255,), width=max(1, int(k(2.5))), joint="curve")
-    glow = gl.filter(ImageFilter.GaussianBlur(k(4)))
-    base.alpha_composite(glow)
-    base.alpha_composite(gl)
-    d = ImageDraw.Draw(base, "RGBA")
-    d.text((X0 + k(8), Y0 + k(4)), "EMA3", fill=CYAN + (255,), font=fs)
-    d.text((X0 + k(52), Y0 + k(4)), "EMA8", fill=ORANGE + (255,), font=fs)
-
-    # head position + price tag
-    lc = cs[-1]
-    lcx, ly = X0 + (lc[0] + 0.5) * cw, Y(lc[4])
-    d.rectangle([X1 + k(4), ly - k(10), X1 + k(66), ly + k(10)], fill=col + (255,))
-    d.text((X1 + k(9), ly - k(8)), f"{yes_last:.1f}", fill=(8, 10, 20, 255), font=fm)
-
-    # header
-    chg = yes_last - cs[0][1]
-    d.rectangle([X0, k(20), X0 + k(5), k(86)], fill=col + (255,))
-    d.text((X0 + k(16), k(18)), "ETH/USD", fill=(240, 246, 255, 255), font=fl)
-    d.text((X0 + k(112), k(23)), "15M  |  KALSHI YES", fill=grey, font=fm)
-    d.text((X0 + k(16), k(44)), f"{yes_last:.1f}%", fill=ORANGE + (255,), font=fx_big)
-    d.text((X0 + k(16) + d.textlength(f"{yes_last:.1f}%", font=fx_big) + k(14), k(62)),
-           f"{chg:+.1f}", fill=(C_UP if chg >= 0 else C_DN) + (255,), font=fl)
-
-    # signal panel
-    PX0, PX1, PY0, PY1 = k(910), k(1250), k(90), k(640)
-    d.rounded_rectangle([PX0, PY0, PX1, PY1], radius=k(14), fill=(255, 255, 255, 10),
-                        outline=(255, 255, 255, 36), width=lw1)
-    pl, pr = PX0 + k(20), PX1 - k(20)
-    d.text((pl, PY0 + k(14)), "SIGNAL", fill=grey, font=fs)
-    d.text((PX0 + k(110), k(138)), side if side else "NO CALL", fill=col + (255,), font=fx_big if side else fl)
-    d.text((PX0 + k(110), k(188)), f"{conf:.0f}% CONF" + ("  LOCKED" if side else ""), fill=col + (255,), font=fm)
-    d.text((pl, k(236)), "CONFIDENCE" if side else "BEST SIDE", fill=grey, font=fs)
-    gy0, gy1 = k(256), k(268)
-    d.rectangle([pl, gy0, pr, gy1], fill=(255, 255, 255, 22))
-    d.rectangle([pl, gy0, pl + (pr - pl) * max(0, min(conf, 100)) / 100, gy1], fill=col + (255,))
-    tx = pl + (pr - pl) * MIN_CONF / 100
-    d.line([(tx, gy0 - k(5)), (tx, gy1 + k(5))], fill=AMBER + (255,), width=max(1, int(k(2))))
-    d.text((tx - k(8), gy1 + k(7)), f"{MIN_CONF:.0f}", fill=AMBER + (255,), font=fs)
-
-    tl = "--:--"
-    if cur.get("close_ts"):
-        s_left = 0 if outcome else max(0, int(cur["close_ts"] - time.time()))
-        tl = f"{s_left // 60}:{s_left % 60:02d}"
-    rows = [("STRIKE", f"{cur['strike']:,.2f}" if cur.get("strike") else "--"),
-            ("ETH PRICE", f"${cur['price']:,.2f}" if cur.get("price") else "--"),
-            ("TIME LEFT", tl),
-            ("ENTRY AT", f"{cur['called_at'] // 60}:{cur['called_at'] % 60:02d}" if cur.get("called_at") is not None else "--")]
-    for i, (a, b) in enumerate(rows):
-        y = k(320 + i * 34)
-        d.text((pl, y), a, fill=grey, font=fs)
-        d.text((pr - d.textlength(b, font=fm), y - k(2)), b, fill=(235, 242, 255, 255), font=fm)
-        d.line([(pl, y + k(22)), (pr, y + k(22))], fill=(255, 255, 255, 16), width=lw1)
-
-    d.text((pl, k(500)), "MARKET DEPTH", fill=grey, font=fs)
-    by0, by1 = k(522), k(540)
-    yw = (pr - pl) * max(0, min(yes_last, 100)) / 100
-    d.rectangle([pl, by0, pl + yw, by1], fill=C_UP + (200,))
-    d.rectangle([pl + yw, by0, pr, by1], fill=C_DN + (200,))
-    d.text((pl, by1 + k(6)), f"YES {yes_last:.0f}%", fill=C_UP + (255,), font=fm)
-    nt = f"NO {100 - yes_last:.0f}%"
-    d.text((pr - d.textlength(nt, font=fm), by1 + k(6)), nt, fill=C_DN + (255,), font=fm)
-
-    # progress bar
-    d.line([(X0, k(702)), (X1, k(702))], fill=CYAN + (45,), width=max(1, int(k(3))))
-    d.line([(X0, k(702)), (X(pts[-1][0]), k(702))], fill=col + (255,), width=max(1, int(k(3))))
+    up_pct, dn_pct = yes_last, 100 - yes_last
+    conf = cur.get("conf") or max(up_pct, dn_pct)
+    strike = cur.get("strike") or (eth[0][1] if eth else 0)
+    now_px = eth[-1][1] if eth else (cur.get("price") or strike)
 
     if outcome == "win":
-        label = "WIN"
+        accent, label = C_UP, "WIN"
     elif outcome == "loss":
-        label = "LOSS"
+        accent, label = C_DN, "LOSS"
     elif outcome == "settling":
-        label = "SETTLING"
-    elif waiting:
-        label = "SCANNING"
-    elif full:
-        label = "FULL SEND" if is_up else "FULL SINK"
+        accent, label = AMBER, "SETTLING"
     else:
-        label = "HOLDING"
-    chip_w = d.textlength("SETTLING...", font=fl) + k(28)
-    sgn = -1 if is_up else 1
+        accent, label = None, None
+
+    base = _bg(Wd, Hd)
+    d = ImageDraw.Draw(base, "RGBA")
+
+    # ---- header ----
+    lg = int(k(60))
+    base.alpha_composite(_logo(lg), (int(k(24)), int(k(24))))
+    d.ellipse([k(24), k(24), k(24) + lg, k(24) + lg], outline=(255, 255, 255, 70), width=lw(1.5))
+    d.text((k(98), k(54)), "ETH 15 min", font=F(30), fill=WHITE, anchor="lm")
+    s_left = 0 if outcome else max(0, int((cur.get("close_ts") or time.time()) - time.time()))
+    badge = label or f"{s_left // 60}:{s_left % 60:02d}"
+    bw = max(104, int(len(badge) * 15 + 40))
+    bcol = (accent or WHITE[:3])
+    d.rounded_rectangle([k(696 - bw), k(30), k(696), k(76)], radius=k(14), fill=(255, 255, 255, 26),
+                        outline=(bcol + (200,)) if accent else None, width=lw(2))
+    d.text((k(696 - bw / 2), k(53)), badge, font=F(22), fill=(bcol + (255,)) if accent else WHITE, anchor="mm")
+
+    # ---- price row ----
+    close_ts = cur.get("close_ts") or time.time()
+    d.text((k(24), k(124)), f"Target · {_clock(close_ts - 900)}", font=F(15, False), fill=MUTED, anchor="ls")
+    d.text((k(24), k(166)), f"${strike:,.2f}" if strike else "--", font=F(32), fill=WHITE, anchor="ls")
+    diff = (now_px - strike) if strike else 0
+    dcol = C_UP if diff >= 0 else C_DN
+    d.text((k(372), k(124)), f"Now {'↑' if diff >= 0 else '↓'} ${abs(diff):,.2f}",
+           font=F(15), fill=dcol + (255,), anchor="ls")
+    d.text((k(372), k(166)), f"${now_px:,.2f}" if now_px else "--", font=F(32), fill=WHITE, anchor="ls")
+    d.ellipse([k(673), k(136), k(695), k(158)], outline=MUTED, width=lw(2))
+    d.text((k(684), k(147)), "i", font=F(15), fill=MUTED, anchor="mm")
+
+    # ---- chart ----
+    PY0, PY1, PX0, PX1 = k(250), k(560), k(84), k(676)
+    vals = [v for _, v in eth] + ([strike] if strike else [])
+    if not vals:
+        vals = [0.0, 1.0]
+    lo, hi = min(vals), max(vals)
+    span = max(hi - lo, (strike or hi or 1) * 0.0003)
+    mid = (hi + lo) / 2
+    lo, hi = mid - span / 2 * 1.3, mid + span / 2 * 1.3
+    Y = lambda v: PY1 - (v - lo) / (hi - lo) * (PY1 - PY0)
+    hx = hy = None
+    if eth:
+        t0, t1 = eth[0][0], eth[-1][0]
+        tspan = max(t1 - t0, 30)
+        co = [(PX0 + (PX1 - PX0) * (t - t0) / tspan, Y(v)) for t, v in eth]
+        if len(co) < 2:
+            co = [co[0], (co[0][0] + k(4), co[0][1])]
+        hx, hy = co[-1]
+        top_y = max(PY0, min(y for _, y in co))
+        mask = Image.new("L", (Wd, Hd), 0)
+        ImageDraw.Draw(mask).polygon(co + [(hx, PY1), (co[0][0], PY1)], fill=255)
+        fade = Image.new("L", (Wd, Hd), 0)
+        gh = max(2, int(PY1 - top_y))
+        grad = ImageOps.flip(Image.linear_gradient("L").resize((Wd, gh))).point(lambda v: int(v * 0.45))
+        fade.paste(grad, (0, int(top_y)))
+        fill = Image.new("RGBA", (Wd, Hd), (255, 140, 58, 0))
+        fill.putalpha(ImageChops.multiply(mask, fade))
+        base.alpha_composite(fill)
+        d = ImageDraw.Draw(base, "RGBA")
+        d.line(co, fill=ORG + (255,), width=lw(3), joint="curve")
+        for (x, y) in (co[0], co[-1]):
+            d.ellipse([x - k(1.5), y - k(1.5), x + k(1.5), y + k(1.5)], fill=ORG + (255,))
+    # left delta labels
+    for fr in (0.2, 0.5, 0.8):
+        v = lo + (hi - lo) * fr
+        dd = v - strike
+        c = C_UP if dd >= 0 else C_DN
+        d.text((k(24), Y(v)), f"{'+' if dd >= 0 else '-'} ${abs(dd):,.0f}", font=F(15), fill=c + (255,), anchor="lm")
+
+    # ---- status row ----
+    d.rounded_rectangle([k(24), k(586), k(696), k(650)], radius=k(18), fill=(255, 255, 255, 14))
+    base.alpha_composite(_logo(int(k(40))), (int(k(36)), int(k(598))))
+    if waiting:
+        l1 = "Scanning, no call yet"
+        l2 = f"Best side {max(up_pct, dn_pct):.0f}%, needs above {MIN_CONF:.0f}%"
+    else:
+        l1 = f"{side} call locked at {conf:.0f}%"
+        ca = cur.get("called_at")
+        l2 = f"Entry at {ca // 60}:{ca % 60:02d} into the window" if ca is not None else "Entry locked"
+    tx = k(92)
+    if not waiting:
+        _arrow(d, k(104), k(611), is_up, k(10), (C_UP if is_up else C_DN) + (255,))
+        tx = k(122)
+    d.text((tx, k(610)), l1, font=F(17), fill=WHITE, anchor="lm")
+    d.text((k(92), k(633)), l2, font=F(13, False), fill=MUTED, anchor="lm")
+
+    # ---- buttons ----
+    by0, by1 = k(672), k(772)
+    bwid = (720 - 48 - 14) / 2
+    for i, (name, pct, col, is_up_btn) in enumerate((("Up", up_pct, C_UP, True), ("Down", dn_pct, C_DN, False))):
+        x0 = k(24 + i * (bwid + 14))
+        x1 = x0 + k(bwid)
+        called = (not waiting) and (is_up_btn == is_up)
+        dim = (not waiting) and not called
+        a = 90 if dim else 255
+        d.rounded_rectangle([x0, by0, x1, by1], radius=k(30), fill=col + (a,),
+                            outline=(255, 255, 255, 255) if called else None, width=lw(3))
+        _arrow(d, x0 + k(40), (by0 + by1) / 2, is_up_btn, k(15), (255, 255, 255, 255 if not dim else 150))
+        d.text(((x0 + x1) / 2 + k(14), by0 + k(36)), f"{name} · {pct:.0f}%", font=F(24),
+               fill=(255, 255, 255, 255 if not dim else 170), anchor="mm")
+        d.text(((x0 + x1) / 2 + k(14), by0 + k(72)), f"{100 / max(pct, 1):.2f}x", font=F(16, False),
+               fill=(255, 255, 255, 220 if not dim else 120), anchor="mm")
+
+    # ---- animated frames ----
+    ty = Y(strike) if strike else (PY0 + PY1) / 2
     frames = []
     for f in range(n):
         t = f / n if n > 1 else 0.25
         sn = math.sin(2 * math.pi * t)
         im = base.copy()
-        fx = Image.new("RGBA", (Wd, Hd), (0, 0, 0, 0))
-        fd = ImageDraw.Draw(fx)
-        sx = X0 + (X1 - X0) * t
-        for i in range(28):
-            x = sx - i * k(2)
-            if x >= X0:
-                fd.line([(x, Y0), (x, Y1)], fill=col + (int(38 * (1 - i / 28)),), width=max(1, int(k(2))))
-        fd.line([(sx, Y0), (sx, Y1)], fill=hot + (110,), width=lw1)
-        _dots(fd, lcx, ly, X1, ly, col + (210,), max(1, int(k(1.5))), k(4), k(5), phase=t * k(9))
-        r = k(9) + k(3) * math.sin(2 * math.pi * 2 * t)
-        fd.ellipse([lcx - r, ly - r, lcx + r, ly + r], outline=col + (255,), width=max(1, int(k(2))))
-        fd.ellipse([lcx - k(3), ly - k(3), lcx + k(3), ly + k(3)], fill=(255, 255, 255, 255))
-        fd.rectangle([lcx - cw * 0.5, Y(lc[2]) - k(4), lcx + cw * 0.5, Y(lc[3]) + k(4)],
-                     outline=col + (int(110 + 90 * sn),), width=lw1)
-        pcx, pcy = PX0 + k(56), k(172)
-        if side:
-            bob = k(4) * sn if outcome is None else 0
-            _arrow(fd, pcx, pcy + bob, is_up, k(34), col + (255,), (255, 255, 255, 255))
-            if outcome is None:
-                ay = (Y(lc[2]) - k(28) - bob) if is_up else (Y(lc[3]) + k(28) + bob)
-                ay = max(Y0 + k(14), min(Y1 - k(14), ay))
-                _arrow(fd, lcx, ay, is_up, k(16 if full else 11), col + (255,), (255, 255, 255, 255))
-        else:
-            for ph in (0.0, 0.5):
-                rr = k(8 + 32 * ((t + ph) % 1))
-                fd.ellipse([pcx - rr, pcy - rr, pcx + rr, pcy + rr],
-                           outline=col + (int(230 * (1 - ((t + ph) % 1))),), width=max(1, int(k(2))))
-        if full and outcome is None:
-            for j in range(8):
-                ph = (t + j * 0.125) % 1
-                x = lcx + (j - 4) * k(5)
-                y0 = ly + sgn * (k(14) + ph * k(70))
-                fd.line([(x, y0), (x, y0 + sgn * k(11))], fill=col + (int(220 * (1 - ph)),), width=max(1, int(k(2))))
-        if outcome in ("win", "loss"):
-            fd.rectangle([k(2), k(2), Wd - k(3), Hd - k(3)], outline=col + (int(100 + 90 * sn),), width=max(2, int(k(3))))
-        im.alpha_composite(fx.filter(ImageFilter.GaussianBlur(k(5))))
-        im.alpha_composite(fx)
-        d2 = ImageDraw.Draw(im, "RGBA")
-        txt = label + ("." * (f % 4) if label in ("SCANNING", "SETTLING") else "")
-        x0 = Wd - k(30) - chip_w
-        d2.rectangle([x0, k(24), Wd - k(30), k(60)], fill=col + (40,), outline=col + (255,), width=max(1, int(k(2))))
-        tx2 = x0 + k(14)
-        if outcome in ("win", "loss") and n > 1 and f % 6 == 0:
-            d2.text((tx2 - k(2), k(28)), txt, fill=(255, 0, 200, 200), font=fl)
-            d2.text((tx2 + k(2), k(28)), txt, fill=(0, 240, 255, 200), font=fl)
-        d2.text((tx2, k(28)), txt, fill=(255, 255, 255, 255) if outcome else col + (255,), font=fl)
+        fd = ImageDraw.Draw(im, "RGBA")
+        _dots(fd, k(24), ty, k(696), ty, (190, 196, 206, 190), lw(1.5), k(6), k(5), phase=t * k(11))
+        fd.text((k(696), ty - k(10)), "TARGET ↓", font=F(13), fill=(190, 196, 206, 255), anchor="rs")
+        if hx is not None:
+            r = k(6 + 1.2 * sn)
+            fd.ellipse([hx - r, hy - r, hx + r, hy + r], fill=ORG + (255,))
+        if accent and outcome in ("win", "loss"):
+            fd.rounded_rectangle([k(3), k(3), Wd - k(4), Hd - k(4)], radius=k(24),
+                                 outline=accent + (int(110 + 90 * sn),), width=lw(4))
         frames.append(im.convert("RGB"))
     return frames
 
 
 def chart_file(cur, outcome=None):
-    """Returns (bytes, filename, mime). Live = 1080p GIF, final = 4K PNG, auto-shrinks if too big."""
+    """Returns (bytes, filename, mime). Live = animated GIF, final = still PNG, shrinks if too big."""
     S = FINAL_SCALE if outcome in ("win", "loss") else LIVE_SCALE
     while True:
-        frames = render_frames(cur, outcome, S, 1 if S > 2 else 12)
+        frames = render_frames(cur, outcome, S, 1 if S > 2 else 10)
         buf = io.BytesIO()
         if len(frames) == 1:
             frames[0].save(buf, format="PNG", optimize=True)
             res = (buf.getvalue(), "chart.png", "image/png")
         else:
-            frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], duration=80, loop=0)
+            frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], duration=90, loop=0)
             res = (buf.getvalue(), "chart.gif", "image/gif")
         if len(res[0]) <= MAX_BYTES or S <= 1:
             return res
@@ -614,7 +549,7 @@ def tick(state):
 
     if cur is None:
         cur = {"ticker": m["ticker"], "side": None, "strike": strike, "close_ts": close_ts,
-               "message_id": None, "pts": [], "locked": False, "conf": None}
+               "message_id": None, "pts": [], "eth": [], "locked": False, "conf": None}
         state["current"] = cur
 
     if cur["side"] is None and secs_left > CALL_CUTOFF:
@@ -624,6 +559,8 @@ def tick(state):
             cur.update(side="DOWN", conf=100 - blend, locked=True, called_at=round(elapsed))
 
     cur["price"] = price
+    if price:
+        cur.setdefault("eth", []).append([round(elapsed), round(price, 2)])
     cur["pts"].append([round(elapsed), round(yes, 1)])
     new_id = send(build_embed(cur, state, yes, price, n_ex, secs_left, blend=blend, pm=pm),
                   cur["message_id"], cur=cur)
