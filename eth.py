@@ -1,16 +1,30 @@
-import io, json, math, os, random, statistics, time
+import functools
+import io
+import json
+import math
+import os
+import statistics
+import time
+from collections import deque
 from datetime import datetime, timezone
+
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 SERIES = os.getenv("KALSHI_SERIES", "KXETH15M")
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 POLL = float(os.getenv("POLL_SECONDS", "10"))
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", str(345 * 60)))
-MAX_LATE = int(os.getenv("MAX_LATE_ENTRY", "90"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
+
+W_MARKET = float(os.getenv("W_MARKET", "0.5"))        # weight on Kalshi price vs. strike model
+MOM_W = float(os.getenv("MOM_W", "0.3"))              # momentum strength
+MIN_CONF = float(os.getenv("MIN_CONF", "60"))         # must be strictly above this to make a call
+CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "60"))     # no new calls with fewer secs than this left
+DEF_SIGMA = 1.1e-4                                    # ~60% annual vol, per sqrt(second)
+PRICES = deque(maxlen=120)                            # (timestamp, price)
 
 
 # ---------- state ----------
@@ -76,6 +90,59 @@ def eth_price():
     return (statistics.median(px), len(px)) if px else (None, 0)
 
 
+# ---------- prediction ----------
+def record_price(price):
+    if price:
+        PRICES.append((time.time(), price))
+
+
+def norm_cdf(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def vol_per_sqrt_sec():
+    pts = list(PRICES)
+    rets = []
+    for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
+        dt = t1 - t0
+        if dt > 0.5:
+            rets.append(math.log(p1 / p0) / math.sqrt(dt))
+    if len(rets) < 8:
+        return DEF_SIGMA
+    s = math.sqrt(sum(r * r for r in rets) / len(rets))
+    return max(DEF_SIGMA * 0.4, min(s, DEF_SIGMA * 4))
+
+
+def momentum():
+    pts = list(PRICES)
+    if len(pts) < 2:
+        return 0.0
+    t_now, p_now = pts[-1]
+    old = [x for x in pts if t_now - x[0] >= 60]
+    if not old:
+        return 0.0
+    t0, p0 = old[-1]
+    return math.log(p_now / p0) / (t_now - t0)    # log-return per second
+
+
+def model_prob(price, strike, secs_left):
+    """P(ETH finishes >= strike), in percent, or None if inputs are missing."""
+    if not price or not strike:
+        return None
+    tau = max(secs_left, 1)
+    sig = vol_per_sqrt_sec()
+    drift = max(-sig, min(sig, momentum())) * MOM_W
+    z = (math.log(price / strike) + drift * tau) / (sig * math.sqrt(tau))
+    return max(1.0, min(99.0, norm_cdf(z) * 100))
+
+
+def predict(yes_mkt, price, strike, secs_left):
+    pm = model_prob(price, strike, secs_left)
+    if pm is None:
+        return yes_mkt, None
+    return W_MARKET * yes_mkt + (1 - W_MARKET) * pm, pm
+
+
 # ---------- stats ----------
 def stats(history):
     def rec(rows):
@@ -102,178 +169,320 @@ def stats(history):
 
 
 # ---------- chart ----------
-W, H = 800, 360
-PL, PR, PT, PB = 50, 30, 56, 40
-BG = (18, 20, 28)
+LIVE_SCALE = float(os.getenv("LIVE_SCALE", "1.5"))    # 1.5 = 1920x1080 GIF
+FINAL_SCALE = float(os.getenv("FINAL_SCALE", "3"))    # 3 = 3840x2160 still PNG
+MAX_BYTES = int(float(os.getenv("MAX_MB", "7.5")) * 1024 * 1024)
+LW, LH = 1280, 720
+BG1, BG2 = (12, 16, 28), (26, 32, 50)
+C_UP, C_DN, ORANGE = (0, 224, 130), (255, 72, 92), (255, 159, 28)
+CYAN, AMBER = (0, 229, 255), (255, 190, 40)
 
 
-def _font(size):
-    try:
-        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
-    except OSError:
-        return ImageFont.load_default()
+@functools.lru_cache(maxsize=64)
+def _ui(size, bold=True):
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    for p in (os.getenv("CHART_FONT", ""), f"/usr/share/fonts/truetype/dejavu/{name}"):
+        try:
+            return ImageFont.truetype(p, size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
 
 
-def _xy(t, v):
-    return PL + (W - PL - PR) * min(t / 900, 1), PT + (H - PT - PB) * (1 - v / 100)
+def _arrow(d, cx, cy, up, size, fill, outline=None):
+    shape = [(0, -1.0), (0.9, -0.1), (0.35, -0.1), (0.35, 0.9),
+             (-0.35, 0.9), (-0.35, -0.1), (-0.9, -0.1)]
+    poly = [(cx + px * size, cy + (py if up else -py) * size) for px, py in shape]
+    d.polygon(poly, fill=fill, outline=outline)
 
 
-def _rocket(d, x, y, ang, sc, flame, body_col):
-    c, s = math.cos(ang), math.sin(ang)
-
-    def r(px, py):
-        return (x + (px * c - py * s) * sc, y + (px * s + py * c) * sc)
-
-    if flame > 0:
-        d.polygon([r(-10, -5), r(-10 - flame, 0), r(-10, 5)], fill=(255, 140, 0))
-        d.polygon([r(-10, -3), r(-10 - flame * 0.6, 0), r(-10, 3)], fill=(255, 235, 120))
-    d.polygon([r(-10, -6), r(-17, -13), r(-3, -6)], fill=body_col)
-    d.polygon([r(-10, 6), r(-17, 13), r(-3, 6)], fill=body_col)
-    d.polygon([r(18, 0), r(8, -6), r(-10, -6), r(-10, 6), r(8, 6)], fill=(235, 238, 245))
-    d.polygon([r(18, 0), r(8, -6), r(8, 6)], fill=body_col)
-    cx, cy = r(1, 0)
-    d.ellipse([cx - 3 * sc, cy - 3 * sc, cx + 3 * sc, cy + 3 * sc], fill=(60, 140, 255))
+def _dots(d, x0, y0, x1, y1, fill, w=1, on=3.0, off=5.0, phase=0.0):
+    L = math.hypot(x1 - x0, y1 - y0)
+    if L <= 0:
+        return
+    ux, uy = (x1 - x0) / L, (y1 - y0) / L
+    p = -(phase % (on + off))
+    while p < L:
+        a, b = max(p, 0), min(p + on, L)
+        if b > a:
+            d.line([(x0 + ux * a, y0 + uy * a), (x0 + ux * b, y0 + uy * b)], fill=fill, width=w)
+        p += on + off
 
 
-def _ship(d, x, y, ang, sc, f, full, outcome):
-    c, s = math.cos(ang), math.sin(ang)
-
-    def r(px, py):
-        return (x + (px * c - py * s) * sc, y + (px * s + py * c) * sc)
-
-    def box(x0, y0, x1, y1, fill):
-        d.polygon([r(x0, y0), r(x1, y0), r(x1, y1), r(x0, y1)], fill=fill)
-
-    d.line([r(-27, -2), r(-27, -17)], fill=(200, 200, 205), width=2)
-    d.line([r(29, -2), r(29, -15)], fill=(200, 200, 205), width=2)
-    d.polygon([r(-32, -2), r(36, -2), r(28, 8), r(-28, 8)], fill=(25, 25, 32))
-    d.polygon([r(-29.5, 5), r(31, 5), r(28, 8), r(-28, 8)], fill=(185, 35, 35))
-    box(-22, -10, 24, -2, (238, 240, 246))
-    for px in range(-19, 23, 6):
-        a = r(px, -6)
-        d.ellipse([a[0] - 1, a[1] - 1, a[0] + 1, a[1] + 1], fill=(60, 90, 140))
-    for px in (-14, -5, 4, 13):
-        box(px - 2.5, -22, px + 2.5, -10, (214, 160, 80))
-        box(px - 2.5, -22, px + 2.5, -19, (20, 20, 24))
-    if outcome != "win":
-        for px in (-14, -5, 4, 13):
-            sx, sy = r(px, -24)
-            off = ((f * 1.5 + px) % 16) / 16
-            rad = 2 + off * 4
-            g = int(150 - off * 70)
-            d.ellipse([sx - off * 14 - rad, sy - off * 10 - rad, sx - off * 14 + rad, sy - off * 10 + rad], fill=(g, g, g + 8))
-    wy = y + 5 * sc
-    wpts = [(x - 50 * sc + i * 5 * sc, wy + math.sin(f / 16 * 6.28 * 2 + i * 0.9) * 3) for i in range(21)]
-    d.line(wpts, fill=(70, 135, 205), width=3)
-    if outcome != "loss":
-        for k in range(8):
-            age = ((f + k * 2) % 16) / 16
-            bx = x + (k - 4) * 4 * sc + math.sin(k + f * 0.4) * 3
-            by = y + 10 * sc - age * 45
-            rad = 1 + int(3 * (1 - age))
-            d.ellipse([bx - rad, by - rad, bx + rad, by + rad], outline=(150, 200, 240))
+def _candles(pts, step=30):
+    b = {}
+    for t, v in pts:
+        b.setdefault(min(int(t // step), 900 // step - 1), []).append(v)
+    out, prev = [], None
+    for i in sorted(b):
+        vs = b[i]
+        o = prev if prev is not None else vs[0]
+        out.append((i, o, max(vs + [o]), min(vs + [o]), vs[-1]))
+        prev = vs[-1]
+    return out
 
 
-def render_chart(cur, outcome=None):
+def _ema(vals, n):
+    a = 2 / (n + 1)
+    out = [vals[0]]
+    for v in vals[1:]:
+        out.append(out[-1] + a * (v - out[-1]))
+    return out
+
+
+def render_frames(cur, outcome, S, n):
+    Wd, Hd = int(LW * S), int(LH * S)
+    k = lambda v: v * S
+    lw1 = max(1, int(k(1)))
     pts = cur.get("pts") or [[0, 50]]
-    if len(pts) < 2:
-        pts = [pts[0], [pts[0][0] + 2, pts[0][1]]]
-    co = [_xy(t, v) for t, v in pts]
-    is_up = cur["side"] == "UP"
+    cs = _candles(pts)
+    side = cur.get("side")
+    waiting = side is None
+    is_up = side == "UP"
     yes_last = pts[-1][1]
-    last = yes_last if is_up else 100 - yes_last
-    full = outcome == "win" or (outcome not in ("loss", "settling") and last >= 80)
-    col = (0, 255, 90) if is_up else (255, 59, 48)
-    dim = tuple(int(col[i] * 0.16 + BG[i] * 0.84) for i in range(3))
-    hx, hy = co[-1]
-    j = max(0, len(co) - 6)
-    ang = max(-0.7, min(0.7, math.atan2(hy - co[j][1], max(hx - co[j][0], 1))))
-    if outcome == "loss" and is_up:
-        ang = 1.2
-    if not is_up:
-        if outcome == "win":
-            ang = 1.1
-        elif outcome == "loss":
-            ang = 0
-        elif full:
-            ang = max(ang, 0.5)
-    sc = 1.6 if full else 1.2
-    f_big, f_sm = _font(22), _font(12)
-    base_y = _xy(0, 0)[1]
-    rng = random.Random(7)
-    stars = [(rng.randint(0, W), rng.randint(0, H), rng.random() * 6.28) for _ in range(45)]
-    N, frames = 16, []
-    for f in range(N):
-        im = Image.new("RGB", (W, H), BG)
-        d = ImageDraw.Draw(im)
-        for sx, sy, ph in stars:
-            b = int(70 + 60 * math.sin(f / N * 12.56 + ph))
-            d.point((sx, sy), fill=(b, b, b + 20))
-        for v in (0, 25, 50, 75, 100):
-            y = _xy(0, v)[1]
-            d.line([(PL, y), (W - PR, y)], fill=(95, 99, 115) if v == 50 else (40, 44, 58))
-            d.text((10, y - 7), f"{v}%", fill=(130, 134, 150), font=f_sm)
-        for m in (0, 5, 10, 15):
-            d.text((_xy(m * 60, 0)[0] - 8, H - PB + 10), f"{m}m", fill=(130, 134, 150), font=f_sm)
-        d.polygon(co + [(hx, base_y), (co[0][0], base_y)], fill=dim)
-        d.line(co, fill=col, width=3, joint="curve")
-        if is_up and outcome != "loss":
-            for k in range(10):
-                age = ((f + k * 1.6) % N) / N
-                dist = (16 * sc) + age * 75
-                sx = hx - math.cos(ang) * dist
-                sy = hy - math.sin(ang) * dist + math.sin(k * 2.1 + f * 0.5) * age * 12
-                rad = max(1, int((6 if full else 4) * (1 - age)))
-                fade = 1 - age
-                d.ellipse([sx - rad, sy - rad, sx + rad, sy + rad],
-                          fill=(int(255 * fade), int(150 * fade), int(20 * fade)))
-        pulse = 5 + 2 * math.sin(f / N * 6.28 * 2)
-        d.ellipse([hx - pulse, hy - pulse, hx + pulse, hy + pulse], outline=col, width=2)
-        flick = 0.75 + 0.25 * math.sin(f * 1.7) + 0.15 * rng.random()
-        bob = math.sin(f / N * 6.28) * 3
-        if is_up:
-            flame = 0 if outcome == "loss" else (28 if full else 14) * flick
-            _rocket(d, hx + math.cos(ang) * 10 * sc, hy + math.sin(ang) * 10 * sc + bob, ang, sc, flame, col)
+    last = yes_last if (is_up or waiting) else 100 - yes_last
+    best = max(yes_last, 100 - yes_last)
+    conf = cur.get("conf") or (best if waiting else last)
+    full = (not waiting) and (outcome == "win" or (outcome not in ("loss", "settling") and last >= 80))
+    if waiting:
+        col = CYAN
+    elif outcome == "settling":
+        col = AMBER
+    else:
+        col = C_UP if is_up else C_DN
+    hot = tuple(min(255, c + 150) for c in col)
+    fs, fm, fl, fx_big = _ui(int(k(11)), False), _ui(int(k(13))), _ui(int(k(20))), _ui(int(k(40)))
+    grey = (120, 132, 156, 255)
+
+    # plot geometry and auto-zoomed y range
+    X0, X1, Y0, Y1 = k(30), k(860), k(120), k(500)
+    lo, hi = min(c[3] for c in cs) - 4, max(c[2] for c in cs) + 4
+    if hi - lo < 20:
+        mid = (hi + lo) / 2
+        lo, hi = mid - 10, mid + 10
+    lo, hi = max(0.0, lo), min(100.0, hi)
+    if hi - lo < 20:
+        if lo <= 0:
+            hi = 20.0
         else:
-            sink = 14 if outcome == "win" else (6 if full else 0)
-            _ship(d, hx, hy + bob + sink, ang, sc, f, full, outcome)
-        d.text((PL, 14), f"ETH 15m  {cur['side']}  {last:.0f}%", fill=(240, 242, 250), font=f_big)
-        if outcome == "win":
-            label, lcol = "WIN", (0, 255, 90)
-        elif outcome == "loss":
-            label, lcol = "LOSS", (255, 59, 48)
-        elif full:
-            word = "FULL SEND" if is_up else "FULL SINK"
-            label, lcol = (word if f % 4 < 2 else word + " >>>"), col
+            lo = hi - 20.0
+    Y = lambda v: Y1 - (v - lo) / (hi - lo) * (Y1 - Y0)
+    X = lambda t: X0 + (X1 - X0) * min(t, 900) / 900
+    cw = (X1 - X0) / 30
+
+    base = ImageOps.colorize(Image.linear_gradient("L").resize((Wd, Hd)), BG1, BG2).convert("RGBA")
+    d = ImageDraw.Draw(base, "RGBA")
+
+    # grid + axes
+    for i in range(6):
+        v = lo + (hi - lo) * i / 5
+        _dots(d, X0, Y(v), X1, Y(v), (140, 160, 200, 40), lw1, k(2), k(5))
+        d.text((X1 + k(10), Y(v) - k(7)), f"{v:.1f}", fill=grey, font=fs)
+    for m in range(0, 16, 3):
+        _dots(d, X(m * 60), Y0, X(m * 60), k(600), (140, 160, 200, 26), lw1, k(2), k(6))
+        d.text((X(m * 60) - k(8), k(610)), f"{m}m", fill=grey, font=fs)
+
+    # no-call band
+    bot_v, top_v = 100 - MIN_CONF, MIN_CONF
+    if bot_v < hi and top_v > lo:
+        yb, ya = max(Y0, Y(min(top_v, hi))), min(Y1, Y(max(bot_v, lo)))
+        d.rectangle([X0, yb, X1, ya], fill=AMBER + (12,))
+        hh = max(2, int(ya - yb))
+        hatch = Image.new("RGBA", (int(X1 - X0), hh), (0, 0, 0, 0))
+        hd = ImageDraw.Draw(hatch)
+        for xs in range(-hh, int(X1 - X0), int(k(14))):
+            hd.line([(xs, hh), (xs + hh, 0)], fill=AMBER + (20,), width=lw1)
+        base.alpha_composite(hatch, (int(X0), int(yb)))
+        d = ImageDraw.Draw(base, "RGBA")
+        if lo < top_v < hi:
+            _dots(d, X0, Y(top_v), X1, Y(top_v), AMBER + (170,), lw1 * 2, k(6), k(5))
+            d.text((X0 + k(8), Y(top_v) - k(15)), f"UP CALL > {MIN_CONF:.0f}", fill=AMBER + (210,), font=fs)
+        if lo < bot_v < hi:
+            _dots(d, X0, Y(bot_v), X1, Y(bot_v), AMBER + (170,), lw1 * 2, k(6), k(5))
+            d.text((X0 + k(8), Y(bot_v) + k(3)), f"DOWN CALL < {bot_v:.0f}", fill=AMBER + (210,), font=fs)
+
+    # activity bars
+    vy0, vy1 = k(525), k(600)
+    acts = [(c[2] - c[3]) + 0.3 for c in cs]
+    mx = max(acts)
+    d.text((X0, vy0 - k(16)), "ACTIVITY (HIGH-LOW RANGE)", fill=grey, font=fs)
+    for c, a in zip(cs, acts):
+        x = X0 + (c[0] + 0.5) * cw
+        cc = C_UP if c[4] >= c[1] else C_DN
+        d.rectangle([x - cw * 0.3, vy1 - a / mx * (vy1 - vy0), x + cw * 0.3, vy1], fill=cc + (130,))
+
+    # candles + EMAs (with glow)
+    gl = Image.new("RGBA", (Wd, Hd), (0, 0, 0, 0))
+    g = ImageDraw.Draw(gl)
+    for (i, o, h, lw_, c) in cs:
+        x = X0 + (i + 0.5) * cw
+        cc = C_UP if c >= o else C_DN
+        g.line([(x, Y(h)), (x, Y(lw_))], fill=cc + (255,), width=max(1, int(k(2))))
+        top, bot = Y(max(o, c)), Y(min(o, c))
+        if bot - top < k(2):
+            bot = top + k(2)
+        g.rectangle([x - cw * 0.3, top, x + cw * 0.3, bot], fill=cc + (255,))
+    if len(cs) > 1:
+        xs = [X0 + (c[0] + 0.5) * cw for c in cs]
+        closes = [c[4] for c in cs]
+        for n_, ecol in ((3, CYAN), (8, ORANGE)):
+            g.line([(x, Y(v)) for x, v in zip(xs, _ema(closes, n_))],
+                   fill=ecol + (255,), width=max(1, int(k(2.5))), joint="curve")
+    glow = gl.filter(ImageFilter.GaussianBlur(k(4)))
+    base.alpha_composite(glow)
+    base.alpha_composite(gl)
+    d = ImageDraw.Draw(base, "RGBA")
+    d.text((X0 + k(8), Y0 + k(4)), "EMA3", fill=CYAN + (255,), font=fs)
+    d.text((X0 + k(52), Y0 + k(4)), "EMA8", fill=ORANGE + (255,), font=fs)
+
+    # head position + price tag
+    lc = cs[-1]
+    lcx, ly = X0 + (lc[0] + 0.5) * cw, Y(lc[4])
+    d.rectangle([X1 + k(4), ly - k(10), X1 + k(66), ly + k(10)], fill=col + (255,))
+    d.text((X1 + k(9), ly - k(8)), f"{yes_last:.1f}", fill=(8, 10, 20, 255), font=fm)
+
+    # header
+    chg = yes_last - cs[0][1]
+    d.rectangle([X0, k(20), X0 + k(5), k(86)], fill=col + (255,))
+    d.text((X0 + k(16), k(18)), "ETH/USD", fill=(240, 246, 255, 255), font=fl)
+    d.text((X0 + k(112), k(23)), "15M  |  KALSHI YES", fill=grey, font=fm)
+    d.text((X0 + k(16), k(44)), f"{yes_last:.1f}%", fill=ORANGE + (255,), font=fx_big)
+    d.text((X0 + k(16) + d.textlength(f"{yes_last:.1f}%", font=fx_big) + k(14), k(62)),
+           f"{chg:+.1f}", fill=(C_UP if chg >= 0 else C_DN) + (255,), font=fl)
+
+    # signal panel
+    PX0, PX1, PY0, PY1 = k(910), k(1250), k(90), k(640)
+    d.rounded_rectangle([PX0, PY0, PX1, PY1], radius=k(14), fill=(255, 255, 255, 10),
+                        outline=(255, 255, 255, 36), width=lw1)
+    pl, pr = PX0 + k(20), PX1 - k(20)
+    d.text((pl, PY0 + k(14)), "SIGNAL", fill=grey, font=fs)
+    d.text((PX0 + k(110), k(138)), side if side else "NO CALL", fill=col + (255,), font=fx_big if side else fl)
+    d.text((PX0 + k(110), k(188)), f"{conf:.0f}% CONF" + ("  LOCKED" if side else ""), fill=col + (255,), font=fm)
+    d.text((pl, k(236)), "CONFIDENCE" if side else "BEST SIDE", fill=grey, font=fs)
+    gy0, gy1 = k(256), k(268)
+    d.rectangle([pl, gy0, pr, gy1], fill=(255, 255, 255, 22))
+    d.rectangle([pl, gy0, pl + (pr - pl) * max(0, min(conf, 100)) / 100, gy1], fill=col + (255,))
+    tx = pl + (pr - pl) * MIN_CONF / 100
+    d.line([(tx, gy0 - k(5)), (tx, gy1 + k(5))], fill=AMBER + (255,), width=max(1, int(k(2))))
+    d.text((tx - k(8), gy1 + k(7)), f"{MIN_CONF:.0f}", fill=AMBER + (255,), font=fs)
+
+    tl = "--:--"
+    if cur.get("close_ts"):
+        s_left = 0 if outcome else max(0, int(cur["close_ts"] - time.time()))
+        tl = f"{s_left // 60}:{s_left % 60:02d}"
+    rows = [("STRIKE", f"{cur['strike']:,.2f}" if cur.get("strike") else "--"),
+            ("ETH PRICE", f"${cur['price']:,.2f}" if cur.get("price") else "--"),
+            ("TIME LEFT", tl),
+            ("ENTRY AT", f"{cur['called_at'] // 60}:{cur['called_at'] % 60:02d}" if cur.get("called_at") is not None else "--")]
+    for i, (a, b) in enumerate(rows):
+        y = k(320 + i * 34)
+        d.text((pl, y), a, fill=grey, font=fs)
+        d.text((pr - d.textlength(b, font=fm), y - k(2)), b, fill=(235, 242, 255, 255), font=fm)
+        d.line([(pl, y + k(22)), (pr, y + k(22))], fill=(255, 255, 255, 16), width=lw1)
+
+    d.text((pl, k(500)), "MARKET DEPTH", fill=grey, font=fs)
+    by0, by1 = k(522), k(540)
+    yw = (pr - pl) * max(0, min(yes_last, 100)) / 100
+    d.rectangle([pl, by0, pl + yw, by1], fill=C_UP + (200,))
+    d.rectangle([pl + yw, by0, pr, by1], fill=C_DN + (200,))
+    d.text((pl, by1 + k(6)), f"YES {yes_last:.0f}%", fill=C_UP + (255,), font=fm)
+    nt = f"NO {100 - yes_last:.0f}%"
+    d.text((pr - d.textlength(nt, font=fm), by1 + k(6)), nt, fill=C_DN + (255,), font=fm)
+
+    # progress bar
+    d.line([(X0, k(702)), (X1, k(702))], fill=CYAN + (45,), width=max(1, int(k(3))))
+    d.line([(X0, k(702)), (X(pts[-1][0]), k(702))], fill=col + (255,), width=max(1, int(k(3))))
+
+    if outcome == "win":
+        label = "WIN"
+    elif outcome == "loss":
+        label = "LOSS"
+    elif outcome == "settling":
+        label = "SETTLING"
+    elif waiting:
+        label = "SCANNING"
+    elif full:
+        label = "FULL SEND" if is_up else "FULL SINK"
+    else:
+        label = "HOLDING"
+    chip_w = d.textlength("SETTLING...", font=fl) + k(28)
+    sgn = -1 if is_up else 1
+    frames = []
+    for f in range(n):
+        t = f / n if n > 1 else 0.25
+        sn = math.sin(2 * math.pi * t)
+        im = base.copy()
+        fx = Image.new("RGBA", (Wd, Hd), (0, 0, 0, 0))
+        fd = ImageDraw.Draw(fx)
+        sx = X0 + (X1 - X0) * t
+        for i in range(28):
+            x = sx - i * k(2)
+            if x >= X0:
+                fd.line([(x, Y0), (x, Y1)], fill=col + (int(38 * (1 - i / 28)),), width=max(1, int(k(2))))
+        fd.line([(sx, Y0), (sx, Y1)], fill=hot + (110,), width=lw1)
+        _dots(fd, lcx, ly, X1, ly, col + (210,), max(1, int(k(1.5))), k(4), k(5), phase=t * k(9))
+        r = k(9) + k(3) * math.sin(2 * math.pi * 2 * t)
+        fd.ellipse([lcx - r, ly - r, lcx + r, ly + r], outline=col + (255,), width=max(1, int(k(2))))
+        fd.ellipse([lcx - k(3), ly - k(3), lcx + k(3), ly + k(3)], fill=(255, 255, 255, 255))
+        fd.rectangle([lcx - cw * 0.5, Y(lc[2]) - k(4), lcx + cw * 0.5, Y(lc[3]) + k(4)],
+                     outline=col + (int(110 + 90 * sn),), width=lw1)
+        pcx, pcy = PX0 + k(56), k(172)
+        if side:
+            bob = k(4) * sn if outcome is None else 0
+            _arrow(fd, pcx, pcy + bob, is_up, k(34), col + (255,), (255, 255, 255, 255))
+            if outcome is None:
+                ay = (Y(lc[2]) - k(28) - bob) if is_up else (Y(lc[3]) + k(28) + bob)
+                ay = max(Y0 + k(14), min(Y1 - k(14), ay))
+                _arrow(fd, lcx, ay, is_up, k(16 if full else 11), col + (255,), (255, 255, 255, 255))
         else:
-            label, lcol = "HOLDING", col
-        d.text((W - PR - d.textlength(label, font=f_big), 14), label, fill=lcol, font=f_big)
-        frames.append(im)
-    buf = io.BytesIO()
-    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], duration=70, loop=0, disposal=2)
-    return buf.getvalue()
+            for ph in (0.0, 0.5):
+                rr = k(8 + 32 * ((t + ph) % 1))
+                fd.ellipse([pcx - rr, pcy - rr, pcx + rr, pcy + rr],
+                           outline=col + (int(230 * (1 - ((t + ph) % 1))),), width=max(1, int(k(2))))
+        if full and outcome is None:
+            for j in range(8):
+                ph = (t + j * 0.125) % 1
+                x = lcx + (j - 4) * k(5)
+                y0 = ly + sgn * (k(14) + ph * k(70))
+                fd.line([(x, y0), (x, y0 + sgn * k(11))], fill=col + (int(220 * (1 - ph)),), width=max(1, int(k(2))))
+        if outcome in ("win", "loss"):
+            fd.rectangle([k(2), k(2), Wd - k(3), Hd - k(3)], outline=col + (int(100 + 90 * sn),), width=max(2, int(k(3))))
+        im.alpha_composite(fx.filter(ImageFilter.GaussianBlur(k(5))))
+        im.alpha_composite(fx)
+        d2 = ImageDraw.Draw(im, "RGBA")
+        txt = label + ("." * (f % 4) if label in ("SCANNING", "SETTLING") else "")
+        x0 = Wd - k(30) - chip_w
+        d2.rectangle([x0, k(24), Wd - k(30), k(60)], fill=col + (40,), outline=col + (255,), width=max(1, int(k(2))))
+        tx2 = x0 + k(14)
+        if outcome in ("win", "loss") and n > 1 and f % 6 == 0:
+            d2.text((tx2 - k(2), k(28)), txt, fill=(255, 0, 200, 200), font=fl)
+            d2.text((tx2 + k(2), k(28)), txt, fill=(0, 240, 255, 200), font=fl)
+        d2.text((tx2, k(28)), txt, fill=(255, 255, 255, 255) if outcome else col + (255,), font=fl)
+        frames.append(im.convert("RGB"))
+    return frames
+
+
+def chart_file(cur, outcome=None):
+    """Returns (bytes, filename, mime). Live = 1080p GIF, final = 4K PNG, auto-shrinks if too big."""
+    S = FINAL_SCALE if outcome in ("win", "loss") else LIVE_SCALE
+    while True:
+        frames = render_frames(cur, outcome, S, 1 if S > 2 else 12)
+        buf = io.BytesIO()
+        if len(frames) == 1:
+            frames[0].save(buf, format="PNG", optimize=True)
+            res = (buf.getvalue(), "chart.png", "image/png")
+        else:
+            frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], duration=80, loop=0)
+            res = (buf.getvalue(), "chart.gif", "image/gif")
+        if len(res[0]) <= MAX_BYTES or S <= 1:
+            return res
+        S *= 0.75
 
 
 # ---------- discord ----------
-def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None):
+def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None, pm=None):
     side = c["side"]
-    conf = yes if side == "UP" else 100 - yes
-    if outcome == "win":
-        tag, color = "✅ WIN", GREEN
-    elif outcome == "loss":
-        tag, color = "❌ LOSS", RED
-    elif outcome == "settling":
-        tag, color = "⏳ SETTLING", GREY
-    else:
-        tag, color = "HOLD", GREEN if side == "UP" else RED
-    lines = [
-        f"**Call:** {side} ({conf:.0f}% confidence)",
-        f"**Action:** {'HOLD (if holding ' + ('YES' if side == 'UP' else 'NO') + ')' if not outcome else tag}",
-        f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%",
-    ]
-    if price:
-        lines.append(f"**Price** ${price:,.2f} (CF constituents median ({n_ex} exch))")
-    lines.append(f"**Strike** {c['strike']:,.2f} | {max(int(secs_left), 0)}s left")
+    p_up = blend if blend is not None else yes
     s = stats(state["history"])
     fields = [
         {"name": "All-time", "value": s["all"], "inline": True},
@@ -282,8 +491,40 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None):
         {"name": "UP calls", "value": s["up"], "inline": True},
         {"name": "DOWN calls", "value": s["down"], "inline": True},
     ]
+
+    if side is None:
+        best = max(p_up, 100 - p_up)
+        lines = [
+            f"**Call:** ⚪ NO CALL (best side {best:.0f}%, needs above {MIN_CONF:.0f}%)",
+            "**Action:** WAIT, no position",
+            f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%",
+        ]
+        title, color = "⚪ KALSHI ETH 15m: NO CALL", GREY
+    else:
+        arrow = "🆙" if side == "UP" else "⬇️"
+        conf = c.get("conf") or (p_up if side == "UP" else 100 - p_up)
+        if outcome == "win":
+            tag, color = "✅ WIN", GREEN
+        elif outcome == "loss":
+            tag, color = "❌ LOSS", RED
+        elif outcome == "settling":
+            tag, color = "⏳ SETTLING", GREY
+        else:
+            tag, color = "HOLD", GREEN if side == "UP" else RED
+        lines = [
+            f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry, 🔒 locked)",
+            f"**Action:** {'HOLD (if holding ' + ('YES' if side == 'UP' else 'NO') + ')' if not outcome else tag}",
+            f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%",
+        ]
+        title = f"{arrow} KALSHI ETH 15m: {side} | {tag}"
+
+    if pm is not None:
+        lines.append(f"**Strike model** UP {pm:.0f}% / DOWN {100 - pm:.0f}%")
+    if price:
+        lines.append(f"**Price** ${price:,.2f} (median of {n_ex} exch)")
+    lines.append(f"**Strike** {c['strike']:,.2f} | {max(int(secs_left), 0)}s left")
     return {
-        "title": f"KALSHI ETH 15m: {side} | {tag}",
+        "title": title,
         "description": "\n".join(lines),
         "color": color,
         "fields": fields,
@@ -294,16 +535,16 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None):
 
 def send(embed, message_id=None, cur=None, outcome=None):
     payload = {"embeds": [embed]}
-    gif = None
+    f_data = None
     if cur is not None:
-        embed["image"] = {"url": "attachment://chart.gif"}
+        f_data = chart_file(cur, outcome)
+        embed["image"] = {"url": f"attachment://{f_data[1]}"}
         if message_id:
             payload["attachments"] = []
-        gif = render_chart(cur, outcome)
     for _ in range(3):
-        kw = {"timeout": 20}
-        if gif:
-            kw["files"] = {"files[0]": ("chart.gif", gif, "image/gif")}
+        kw = {"timeout": 60}
+        if f_data:
+            kw["files"] = {"files[0]": (f_data[1], f_data[0], f_data[2])}
             kw["data"] = {"payload_json": json.dumps(payload)}
         else:
             kw["json"] = payload
@@ -350,33 +591,42 @@ def tick(state):
     now = time.time()
 
     if cur and (m is None or m["ticker"] != cur["ticker"]):
-        state["pending"].append(cur)
-        state["current"] = cur = None
-        p = state["pending"][-1]
-        send(build_embed(p, state, 50, None, 0, 0, "settling"), p["message_id"], cur=p, outcome="settling")
+        state["current"] = None
+        if cur["side"] is None:
+            last_yes = cur["pts"][-1][1] if cur["pts"] else 50
+            send(build_embed(cur, state, last_yes, None, 0, 0), cur["message_id"], cur=cur)
+        else:
+            state["pending"].append(cur)
+            send(build_embed(cur, state, 50, None, 0, 0, "settling"), cur["message_id"], cur=cur, outcome="settling")
+        cur = None
         save_state(state)
     if m is None:
         return
 
     close_ts = ts(m["close_time"])
     secs_left = close_ts - now
+    elapsed = 900 - secs_left
     yes = yes_pct(m)
     price, n_ex = eth_price()
+    record_price(price)
+    strike = float(m.get("floor_strike") or m.get("cap_strike") or 0)
+    blend, pm = predict(yes, price, strike, secs_left)
 
     if cur is None:
-        if close_ts - 900 + MAX_LATE < now:
-            return
-        strike = float(m.get("floor_strike") or m.get("cap_strike") or 0)
-        if abs(yes - 50) < 0.01 and price:
-            side = "UP" if price >= strike else "DOWN"
-        else:
-            side = "UP" if yes > 50 else "DOWN"
-        cur = {"ticker": m["ticker"], "side": side, "strike": strike,
-               "close_ts": close_ts, "message_id": None, "pts": []}
+        cur = {"ticker": m["ticker"], "side": None, "strike": strike, "close_ts": close_ts,
+               "message_id": None, "pts": [], "locked": False, "conf": None}
         state["current"] = cur
 
-    cur["pts"].append([round(900 - secs_left), round(yes, 1)])
-    new_id = send(build_embed(cur, state, yes, price, n_ex, secs_left), cur["message_id"], cur=cur)
+    if cur["side"] is None and secs_left > CALL_CUTOFF:
+        if blend > MIN_CONF:
+            cur.update(side="UP", conf=blend, locked=True, called_at=round(elapsed))
+        elif (100 - blend) > MIN_CONF:
+            cur.update(side="DOWN", conf=100 - blend, locked=True, called_at=round(elapsed))
+
+    cur["price"] = price
+    cur["pts"].append([round(elapsed), round(yes, 1)])
+    new_id = send(build_embed(cur, state, yes, price, n_ex, secs_left, blend=blend, pm=pm),
+                  cur["message_id"], cur=cur)
     if cur["message_id"] is None:
         cur["message_id"] = new_id
     save_state(state)
