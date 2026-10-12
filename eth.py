@@ -28,10 +28,14 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json")
 GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
 
 W_MARKET = float(os.getenv("W_MARKET", "0.5"))
-MIN_CONF = float(os.getenv("MIN_CONF", "61"))
-FLIP_CONF = float(os.getenv("FLIP_CONF", "25"))
 CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "60"))
 TILT_W = float(os.getenv("TILT_W", "0.25"))   # max pull of the basket, in sigmas (x3 clip)
+
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.22"))    # composite needed to call (0.22 ~ 61% conf)
+FLIP_SCORE = float(os.getenv("FLIP_SCORE", "0.15"))  # opposing score that triggers cashout
+CALL_AFTER = int(os.getenv("CALL_AFTER", "60"))      # secs into window before calling
+W_FIB, W_TREND, W_PROB = 0.40, 0.35, 0.25
+FIB_LEVELS = (0.236, 0.382, 0.5, 0.618, 0.786)
 
 LOGO_PATH = os.getenv("LOGO_PATH", "eth_logo.png")
 LIVE_SCALE = float(os.getenv("LIVE_SCALE", "1.5"))     # 1.5 = 1080x1200 GIF
@@ -207,17 +211,59 @@ def predict(yes_mkt, price, strike, secs_left, tilt=0.0):
     return W_MARKET * yes_mkt + (1 - W_MARKET) * pm, pm
 
 
-def pick_call(readings):
-    """readings: {"ETH": up_pct, "BTC": up_pct}. Strongest reading wins, must be >= MIN_CONF."""
-    best = None
-    for sym, p in readings.items():
-        if p is None:
-            continue
-        side = "UP" if p >= 50 else "DOWN"
-        conf = p if side == "UP" else 100 - p
-        if best is None or conf > best[1]:
-            best = (side, conf, sym)
-    return best if best and best[1] >= MIN_CONF else None
+def _fib_score(d):
+    """Retracement depth of the last swing (0 = at the extreme, 1 = full retrace).
+    Positive = swing direction likely continues."""
+    if d < 0.236:
+        return 1.0
+    if d < 0.382:
+        return 0.7
+    if d < 0.5:
+        return 0.5
+    if d < 0.618:
+        return 0.2
+    if d < 0.786:
+        return -0.3
+    return -0.8   # swing failed, reversal
+
+
+def fib_signal(prices):
+    """(score -1..1, nearest fib level string or None)"""
+    if len(prices) < 8:
+        return 0.0, None
+    hi, lo, now = max(prices), min(prices), prices[-1]
+    if hi - lo < now * 0.0003:
+        return 0.0, None
+    up_swing = prices.index(lo) < len(prices) - 1 - prices[::-1].index(hi)
+    d = (hi - now) / (hi - lo) if up_swing else (now - lo) / (hi - lo)
+    d = max(0.0, min(1.0, d))
+    lvl = min(FIB_LEVELS, key=lambda r: abs(r - d))
+    return (1 if up_swing else -1) * _fib_score(d), f"{lvl * 100:.1f}".rstrip("0").rstrip(".")
+
+
+def trend_signal(prices, tilt):
+    if len(prices) < 8:
+        ema = 0.0
+    else:
+        e3, e8 = _ema(prices, 3)[-1], _ema(prices, 8)[-1]
+        ema = math.tanh(math.log(e3 / e8) / (vol("ETH") * math.sqrt(30)))
+    return 0.5 * ema + 0.5 * math.tanh(tilt / 1.5)
+
+
+def composite(fib, trend, blend):
+    prob = max(-1.0, min(1.0, (blend - 50) / 50))
+    return W_FIB * fib + W_TREND * trend + W_PROB * prob, prob
+
+
+def pick_call(score, fib, trend, prob):
+    if abs(score) < MIN_SCORE:
+        return None
+    sgn = 1 if score > 0 else -1
+    if sum(1 for x in (fib, trend, prob) if x * sgn > 0.1) < 2:
+        return None
+    if fib * sgn < -0.5 or trend * sgn < -0.5:
+        return None
+    return ("UP" if sgn > 0 else "DOWN"), 50 + 50 * min(1.0, abs(score))
 
 
 # ---------- stats ----------
@@ -241,24 +287,15 @@ def momentum_level(c):
 
 
 def flip_potential(c):
-    rd = c.get("read") or {}
-    live = rd.get(c.get("src", "ETH"))
-    if live is None:
+    sc = c.get("score")
+    if sc is None:
         return None
-    return 100 - live if c["side"] == "UP" else live
+    sgn = 1 if c["side"] == "UP" else -1
+    return max(0.0, min(100.0, 50 - 50 * sgn * sc))
 
 
 def fib_level(c):
-    eth = c.get("eth") or []
-    if len(eth) < 5:
-        return None
-    prices = [p for _, p in eth]
-    hi, lo, now = max(prices), min(prices), prices[-1]
-    if hi <= lo:
-        return None
-    levels = {r: hi - (hi - lo) * r for r in (0.236, 0.382, 0.5, 0.618, 0.786)}
-    r = min(levels, key=lambda x: abs(levels[x] - now))
-    return f"{r * 100:.1f}".rstrip("0").rstrip(".")
+    return c.get("fib")
 
 
 # ---------- chart ----------
@@ -607,7 +644,7 @@ def render_frames(cur, outcome, S, n):
     tx = k(92)
     if waiting:
         l1 = "Scanning, no call yet"
-        l2 = f"Best side {max(up_pct, dn_pct):.0f}%, needs above {MIN_CONF:.0f}%"
+        l2 = f"Signal {abs(cur.get('score') or 0) * 100:.0f}, needs {MIN_SCORE * 100:.0f}+"
     else:
         l1 = f"{side} call · {conf:.0f}% confidence"
         l2 = f"Entry at {ca // 60}:{ca % 60:02d} into the window" if ca is not None else "Entry locked"
@@ -686,10 +723,9 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         {"name": "All-time", "value": s["all"], "inline": True},
     ]
     if side is None:
-        rd = c.get("read") or {"ETH": p_up}
-        best = max(max(v, 100 - v) for v in rd.values())
+        sc = abs(c.get("score") or 0)
         lines = [
-            f"**Call:** ⚪ NO CALL (best side {best:.0f}%, needs above {MIN_CONF:.0f}%)",
+            f"**Call:** ⚪ NO CALL (signal {sc * 100:.0f}, needs {MIN_SCORE * 100:.0f}+ with Fib and trend agreeing)",
             "**Action:** WAIT, no position",
             f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%",
         ]
@@ -714,7 +750,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         fp = flip_potential(c)
         fp_txt = f" | flip potential {fp:.0f}%" if fp is not None and not outcome else ""
         fl = fib_level(c)
-        fib_txt = f" | based on recent Fibonacci sequence, price near {fl}% level" if fl and not outcome else ""
+        fib_txt = f" | Fibonacci retracement at {fl}% + trend" if fl and not outcome else ""
         lines = [
             f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry, 🔒 locked){fib_txt} | momentum is {momentum_level(c)}{fp_txt}",
             f"**Action:** {action}",
@@ -727,6 +763,9 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
     if mk:
         arrows = " / ".join(f"{sym} {'▲' if z >= 0 else '▼'}" for sym, z in mk["z"].items())
         lines.append(f"**Basket** {arrows} (agreement {mk['breadth'] * 100:.0f}%)")
+    sg = c.get("sig")
+    if sg:
+        lines.append(f"**Signals** Fib {sg['fib']:+.2f} | Trend {sg['trend']:+.2f} | Odds {sg['prob']:+.2f}")
     if price:
         lines.append(f"**Price** ${price:,.2f} (median of {n_ex} exch)")
     lines.append(f"**Strike** {c['strike']:,.2f} | {max(int(secs_left), 0)}s left")
@@ -782,7 +821,8 @@ def settle_pending(state):
                 res = "yes" if price >= p["strike"] else "no"
             win = (res == "yes") == (p["side"] == "UP")
             state["history"].append({"ticker": p["ticker"], "side": p["side"], "win": win,
-                                     "tilt": (p.get("mkt") or {}).get("tilt")})
+                                     "tilt": (p.get("mkt") or {}).get("tilt"),
+                                     "sig": p.get("sig")})
             state["pending"].remove(p)
             yes_final = 100.0 if res == "yes" else 0.0
             p.setdefault("pts", []).append([900, 100 if res == "yes" else 0])
@@ -838,19 +878,24 @@ def tick(state):
     cur["mkt"] = {"tilt": round(tilt, 2), "breadth": round(breadth, 2),
                   "z": {s: round(z, 2) for s, z in zs.items()}}
 
-    blend_btc, _ = predict(yes, price, strike, secs_left, zs.get("BTC", 0.0))
-    readings = {"ETH": blend, "BTC": blend_btc}
-    cur["read"] = readings
+    cur["read"] = {"ETH": blend}
+    series = [p for _, p in list(PRICES["ETH"])[-90:]]
+    fib, fib_lvl = fib_signal(series)
+    trend = trend_signal(series, tilt)
+    score, prob = composite(fib, trend, blend)
+    cur["score"] = round(score, 3)
+    cur["fib"] = fib_lvl
+    cur["sig"] = {"fib": round(fib, 2), "trend": round(trend, 2), "prob": round(prob, 2)}
 
-    if cur["side"] is None and secs_left > CALL_CUTOFF:
-        pick = pick_call(readings)
+    if cur["side"] is None and CALL_AFTER <= elapsed and secs_left > CALL_CUTOFF:
+        pick = pick_call(score, fib, trend, prob)
         if pick:
-            side, conf, src = pick
-            cur.update(side=side, conf=conf, locked=True, called_at=round(elapsed), src=src)
+            side, conf = pick
+            cur.update(side=side, conf=conf, locked=True, called_at=round(elapsed), src="ETH")
 
     if cur["side"] and not cur.get("flipped"):
-        live = readings.get(cur.get("src", "ETH"))
-        if live is not None and (live if cur["side"] == "UP" else 100 - live) < FLIP_CONF:
+        sgn = 1 if cur["side"] == "UP" else -1
+        if score * sgn < -FLIP_SCORE:
             cur["flipped"] = True
 
     cur["price"] = price
@@ -877,4 +922,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+main()
