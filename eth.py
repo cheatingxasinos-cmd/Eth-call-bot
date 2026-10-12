@@ -24,7 +24,7 @@ except Exception:
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 SERIES = os.getenv("KALSHI_SERIES", "KXETH15M")
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
-POLL = float(os.getenv("POLL_SECONDS", "1"))                  # sampling interval
+POLL = float(os.getenv("POLL_SECONDS", "0.5"))                # sampling interval
 EDIT_SECONDS = float(os.getenv("EDIT_SECONDS", "0"))          # 0 = refresh whenever the sender is free
 NEW_MSG_SECONDS = float(os.getenv("NEW_MSG_SECONDS", "30"))   # post a fresh message
 MIN_GAP = float(os.getenv("MIN_GAP", "10"))                   # min secs between momentum-shift posts
@@ -40,7 +40,7 @@ MIN_SCORE = float(os.getenv("MIN_SCORE", "0.22"))    # kept for reference, no lo
 MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))        # momentum needed to take the first-mover slot
 FLIP_SCORE = float(os.getenv("FLIP_SCORE", "0.15"))  # opposing score that triggers SELL
 CALL_AFTER = int(os.getenv("CALL_AFTER", "15"))      # secs into window before calling
-CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "3"))  # momentum must hold this long
+CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "1.5"))  # momentum must hold this long
 W_MOM = float(os.getenv("W_MOM", "0.60"))
 W_FIB = float(os.getenv("W_FIB", "0.15"))
 W_TREND = float(os.getenv("W_TREND", "0.15"))
@@ -766,7 +766,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
     if side is None:
         mom_now = abs((c.get("sig") or {}).get("mom", 0))
         lines = [
-            f"**Call:** ⚪ NO CALL (momentum {mom_now * 100:.0f}, needs {MOM_MIN * 100:.0f}+ held for {CONFIRM_SECONDS:.0f}s)",
+            f"**Call:** ⚪ NO CALL (momentum {mom_now * 100:.0f}, needs {MOM_MIN * 100:.0f}+ held for {CONFIRM_SECONDS:.1f}s)",
             "**Action:** WAIT, no position",
             f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%",
         ]
