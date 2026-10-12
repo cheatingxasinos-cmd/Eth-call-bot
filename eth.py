@@ -222,27 +222,38 @@ def pick_call(readings):
 
 # ---------- stats ----------
 def stats(history):
-    def rec(rows):
-        w = sum(1 for h in rows if h["win"])
-        n = len(rows)
-        return f"{w}W-{n - w}L ({w / n * 100:.0f}%)" if n else "n/a"
+    n = len(history)
+    w = sum(1 for h in history if h["win"])
+    return {"all": f"{w}W-{n - w}L ({w / n * 100:.0f}%)" if n else "n/a"}
 
-    last = history[-20:]
-    streak = 0
-    for h in reversed(history):
-        if streak == 0 or h["win"] == (streak > 0):
-            streak += 1 if h["win"] else -1
-        else:
-            break
-    streak_txt = f"{streak}W" if streak > 0 else f"{-streak}L" if streak < 0 else "n/a"
-    lw = sum(1 for h in last if h["win"])
-    return {
-        "all": rec(history),
-        "last20": f"{lw}/{len(last)} ({lw / len(last) * 100:.0f}%)" if last else "n/a",
-        "streak": streak_txt,
-        "up": rec([h for h in history if h["side"] == "UP"]),
-        "down": rec([h for h in history if h["side"] == "DOWN"]),
-    }
+
+# ---------- call labels ----------
+def conf_level(conf):
+    if conf >= 78.6:
+        return "HIGH"
+    if conf >= 61.8:
+        return "MODERATE"
+    return "LOW"
+
+
+def momentum_level(c):
+    mk = c.get("mkt")
+    if not mk:
+        return "LOW"
+    m = abs(mk["tilt"])
+    if m >= 1.2:
+        return "HIGH"
+    if m >= 0.5:
+        return "MODERATE"
+    return "LOW"
+
+
+def flip_potential(c):
+    rd = c.get("read") or {}
+    live = rd.get(c.get("src", "ETH"))
+    if live is None:
+        return None
+    return 100 - live if c["side"] == "UP" else live
 
 
 # ---------- chart ----------
@@ -668,10 +679,6 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
     s = stats(state["history"])
     fields = [
         {"name": "All-time", "value": s["all"], "inline": True},
-        {"name": "Last 20", "value": s["last20"], "inline": True},
-        {"name": "Streak", "value": s["streak"], "inline": True},
-        {"name": "UP calls", "value": s["up"], "inline": True},
-        {"name": "DOWN calls", "value": s["down"], "inline": True},
     ]
     if side is None:
         rd = c.get("read") or {"ETH": p_up}
@@ -699,8 +706,10 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
             action = "RESULT FLIPPED, CASHOUT"
         else:
             action = "HOLD (if holding " + ("YES" if side == "UP" else "NO") + ")"
+        fp = flip_potential(c)
+        fp_txt = f" | flip potential {fp:.0f}%" if fp is not None and not outcome else ""
         lines = [
-            f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry, 🔒 locked)",
+            f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry, 🔒 locked) | based on recent Fibonacci sequence confidence is {conf_level(conf)} | momentum is {momentum_level(c)}{fp_txt}",
             f"**Action:** {action}",
             f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%",
         ]
