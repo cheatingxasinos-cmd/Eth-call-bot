@@ -228,14 +228,6 @@ def stats(history):
 
 
 # ---------- call labels ----------
-def conf_level(conf):
-    if conf >= 78.6:
-        return "HIGH"
-    if conf >= 61.8:
-        return "MODERATE"
-    return "LOW"
-
-
 def momentum_level(c):
     mk = c.get("mkt")
     if not mk:
@@ -254,6 +246,19 @@ def flip_potential(c):
     if live is None:
         return None
     return 100 - live if c["side"] == "UP" else live
+
+
+def fib_level(c):
+    eth = c.get("eth") or []
+    if len(eth) < 5:
+        return None
+    prices = [p for _, p in eth]
+    hi, lo, now = max(prices), min(prices), prices[-1]
+    if hi <= lo:
+        return None
+    levels = {r: hi - (hi - lo) * r for r in (0.236, 0.382, 0.5, 0.618, 0.786)}
+    r = min(levels, key=lambda x: abs(levels[x] - now))
+    return f"{r * 100:.1f}".rstrip("0").rstrip(".")
 
 
 # ---------- chart ----------
@@ -708,8 +713,10 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
             action = "HOLD (if holding " + ("YES" if side == "UP" else "NO") + ")"
         fp = flip_potential(c)
         fp_txt = f" | flip potential {fp:.0f}%" if fp is not None and not outcome else ""
+        fl = fib_level(c)
+        fib_txt = f" | based on recent Fibonacci sequence, price near {fl}% level" if fl and not outcome else ""
         lines = [
-            f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry, 🔒 locked) | based on recent Fibonacci sequence confidence is {conf_level(conf)} | momentum is {momentum_level(c)}{fp_txt}",
+            f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry, 🔒 locked){fib_txt} | momentum is {momentum_level(c)}{fp_txt}",
             f"**Action:** {action}",
             f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%",
         ]
