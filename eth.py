@@ -28,7 +28,8 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json")
 GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
 
 W_MARKET = float(os.getenv("W_MARKET", "0.5"))
-MIN_CONF = float(os.getenv("MIN_CONF", "60"))
+MIN_CONF = float(os.getenv("MIN_CONF", "70"))
+FLIP_CONF = float(os.getenv("FLIP_CONF", "25"))
 CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "60"))
 TILT_W = float(os.getenv("TILT_W", "0.25"))   # max pull of the basket, in sigmas (x3 clip)
 
@@ -87,9 +88,9 @@ def get_market(ticker):
     return r.json()["market"]
 
 
-# ---------- crypto prices (ETH, BTC, SOL) ----------
-WEIGHTS = {"ETH": 0.4, "BTC": 0.4, "SOL": 0.2}
-DEF_SIG = {"ETH": 1.1e-4, "BTC": 0.9e-4, "SOL": 1.8e-4}
+# ---------- crypto prices (ETH, BTC) ----------
+WEIGHTS = {"ETH": 0.5, "BTC": 0.5}
+DEF_SIG = {"ETH": 1.1e-4, "BTC": 0.9e-4}
 PRICES = {s: deque(maxlen=120) for s in WEIGHTS}
 
 
@@ -109,7 +110,6 @@ def _bs(pair):
 SOURCES = {
     "ETH": [(_cb, "ETH-USD"), (_kr, "ETHUSD"), (_bs, "ethusd")],
     "BTC": [(_cb, "BTC-USD"), (_kr, "XBTUSD"), (_bs, "btcusd")],
-    "SOL": [(_cb, "SOL-USD"), (_kr, "SOLUSD"), (_bs, "solusd")],
 }
 
 
@@ -205,6 +205,19 @@ def predict(yes_mkt, price, strike, secs_left, tilt=0.0):
     if pm is None:
         return yes_mkt, None
     return W_MARKET * yes_mkt + (1 - W_MARKET) * pm, pm
+
+
+def pick_call(readings):
+    """readings: {"ETH": up_pct, "BTC": up_pct}. Strongest reading wins, must be >= MIN_CONF."""
+    best = None
+    for sym, p in readings.items():
+        if p is None:
+            continue
+        side = "UP" if p >= 50 else "DOWN"
+        conf = p if side == "UP" else 100 - p
+        if best is None or conf > best[1]:
+            best = (side, conf, sym)
+    return best if best and best[1] >= MIN_CONF else None
 
 
 # ---------- stats ----------
@@ -661,7 +674,8 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         {"name": "DOWN calls", "value": s["down"], "inline": True},
     ]
     if side is None:
-        best = max(p_up, 100 - p_up)
+        rd = c.get("read") or {"ETH": p_up}
+        best = max(max(v, 100 - v) for v in rd.values())
         lines = [
             f"**Call:** ⚪ NO CALL (best side {best:.0f}%, needs above {MIN_CONF:.0f}%)",
             "**Action:** WAIT, no position",
@@ -679,9 +693,15 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
             tag, color = "⏳ SETTLING", GREY
         else:
             tag, color = "HOLD", GREEN if side == "UP" else RED
+        if outcome:
+            action = tag
+        elif c.get("flipped"):
+            action = "RESULT FLIPPED, CASHOUT"
+        else:
+            action = "HOLD (if holding " + ("YES" if side == "UP" else "NO") + ")"
         lines = [
             f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry, 🔒 locked)",
-            f"**Action:** {'HOLD (if holding ' + ('YES' if side == 'UP' else 'NO') + ')' if not outcome else tag}",
+            f"**Action:** {action}",
             f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%",
         ]
         title = f"{arrow} KALSHI ETH 15m: {side} | {tag}"
@@ -802,11 +822,20 @@ def tick(state):
     cur["mkt"] = {"tilt": round(tilt, 2), "breadth": round(breadth, 2),
                   "z": {s: round(z, 2) for s, z in zs.items()}}
 
+    blend_btc, _ = predict(yes, price, strike, secs_left, zs.get("BTC", 0.0))
+    readings = {"ETH": blend, "BTC": blend_btc}
+    cur["read"] = readings
+
     if cur["side"] is None and secs_left > CALL_CUTOFF:
-        if blend > MIN_CONF:
-            cur.update(side="UP", conf=blend, locked=True, called_at=round(elapsed))
-        elif (100 - blend) > MIN_CONF:
-            cur.update(side="DOWN", conf=100 - blend, locked=True, called_at=round(elapsed))
+        pick = pick_call(readings)
+        if pick:
+            side, conf, src = pick
+            cur.update(side=side, conf=conf, locked=True, called_at=round(elapsed), src=src)
+
+    if cur["side"] and not cur.get("flipped"):
+        live = readings.get(cur.get("src", "ETH"))
+        if live is not None and (live if cur["side"] == "UP" else 100 - live) < FLIP_CONF:
+            cur["flipped"] = True
 
     cur["price"] = price
     if price:
@@ -827,8 +856,8 @@ def main():
             tick(state)
         except Exception as e:
             print("tick error", e)
+        save_state(state)
         time.sleep(POLL)
-    save_state(state)
 
 
 if __name__ == "__main__":
