@@ -37,7 +37,7 @@ CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "60"))
 TILT_W = float(os.getenv("TILT_W", "0.25"))   # max pull of the basket, in sigmas (x3 clip)
 
 MIN_SCORE = float(os.getenv("MIN_SCORE", "0.22"))    # kept for reference, no longer gates the first call
-MOM_MIN = float(os.getenv("MOM_MIN", "0.20"))        # momentum needed to take the first-mover slot
+MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))        # momentum needed to take the first-mover slot
 FLIP_SCORE = float(os.getenv("FLIP_SCORE", "0.15"))  # opposing score that triggers SELL
 CALL_AFTER = int(os.getenv("CALL_AFTER", "15"))      # secs into window before calling
 CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "3"))  # momentum must hold this long
