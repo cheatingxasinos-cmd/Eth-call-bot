@@ -1,4 +1,3 @@
-I haven't run it, so watch the first few windows.
 import copy
 import functools
 import io
