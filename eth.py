@@ -744,9 +744,11 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         if outcome:
             action = tag
         elif c.get("flipped"):
-            action = "RESULT FLIPPED, CASHOUT"
+            action = "SELL"
+        elif not c.get("buy_shown"):
+            action = "BUY"
         else:
-            action = "HOLD (if holding " + ("YES" if side == "UP" else "NO") + ")"
+            action = "HOLD"
         fp = flip_potential(c)
         fp_txt = f" | flip potential {fp:.0f}%" if fp is not None and not outcome else ""
         fl = fib_level(c)
@@ -906,6 +908,8 @@ def tick(state):
                   cur["message_id"], cur=cur)
     if cur["message_id"] is None:
         cur["message_id"] = new_id
+    if cur["side"] and not cur.get("buy_shown"):
+        cur["buy_shown"] = True
     save_state(state)
 
 
@@ -921,4 +925,5 @@ def main():
         time.sleep(POLL)
 
 
-if __name__ == "__main__":main()
+if __name__ == "__main__":
+    main()
