@@ -28,7 +28,7 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json")
 GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
 
 W_MARKET = float(os.getenv("W_MARKET", "0.5"))
-MIN_CONF = float(os.getenv("MIN_CONF", "59"))
+MIN_CONF = float(os.getenv("MIN_CONF", "51"))
 FLIP_CONF = float(os.getenv("FLIP_CONF", "25"))
 CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "60"))
 TILT_W = float(os.getenv("TILT_W", "0.25"))   # max pull of the basket, in sigmas (x3 clip)
