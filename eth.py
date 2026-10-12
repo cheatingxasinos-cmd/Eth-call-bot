@@ -797,7 +797,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
             f"**Action:** {action}",
             f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%",
         ]
-        title = f"{arrow} KALSHI ETH 15m: {side} | {tag}"
+        title = f"{arrow} KALSHI ETH 15m: {side} | {'SELL' if c.get('flipped') and not outcome else tag}"
     if pm is not None:
         lines.append(f"**Strike model** UP {pm:.0f}% / DOWN {100 - pm:.0f}%")
     mk = c.get("mkt")
