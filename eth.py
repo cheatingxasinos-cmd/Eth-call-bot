@@ -285,7 +285,7 @@ def _pressure(p):
     return (ups - dns) / t if t > 0 else 0.0
 
 
-def momentum_fast(sym="ETH", win=20):
+def momentum_fast(sym="ETH", win=10):
     """Positive = buyers gaining, negative = sellers gaining (time-based, raw ticks)."""
     pts = list(PRICES[sym])
     if len(pts) < 6:
