@@ -41,10 +41,10 @@ MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))
 FLIP_SCORE = float(os.getenv("FLIP_SCORE", "99"))       # old flip trigger off by default
 CALL_AFTER = int(os.getenv("CALL_AFTER", "99999"))      # old momentum trigger off by default
 CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "1.5"))
-W_MOM = float(os.getenv("W_MOM", "0.35"))         # was 0.50
+W_MOM = float(os.getenv("W_MOM", "0.35"))
 W_RSI = float(os.getenv("W_RSI", "0.10"))
-W_FIB = float(os.getenv("W_FIB", "0.35"))         # was 0.15
-W_TREND = float(os.getenv("W_TREND", "0.10"))     # was 0.15
+W_FIB = float(os.getenv("W_FIB", "0.35"))
+W_TREND = float(os.getenv("W_TREND", "0.10"))
 W_PROB = float(os.getenv("W_PROB", "0.10"))
 RSI_N = int(os.getenv("RSI_N", "14"))
 RSI_BLOCK = float(os.getenv("RSI_BLOCK", "20"))   # UP held if RSI < this, DOWN held if RSI > 100 minus this
@@ -59,6 +59,20 @@ LOGO_PATH = os.getenv("LOGO_PATH", "eth_logo.png")
 LIVE_SCALE = float(os.getenv("LIVE_SCALE", "1.0"))
 FINAL_SCALE = float(os.getenv("FINAL_SCALE", "3"))
 MAX_BYTES = int(float(os.getenv("MAX_MB", "7.5")) * 1024 * 1024)
+
+# ---- combined call settings ----
+CALL_MODE = os.getenv("CALL_MODE", "combined")      # "kalshi" restores the old trigger only
+W_CORE = float(os.getenv("W_CORE", "0.5"))          # weight of the existing composite score
+W_VOTE = float(os.getenv("W_VOTE", "0.5"))          # weight of the indicator vote average
+COMBO_MIN = float(os.getenv("COMBO_MIN", "0.30"))   # combined score needed to call
+COMBO_OPP = int(os.getenv("COMBO_OPP", "1"))        # max indicators allowed to vote against
+CONF_MIN = int(os.getenv("CONF_MIN", "3"))          # tally display only
+EMA_DEAD = float(os.getenv("EMA_DEAD", "0.00005"))  # EMA gap as a fraction of price
+MACD_DEAD = float(os.getenv("MACD_DEAD", "0.00002"))
+BB_UP = float(os.getenv("BB_UP", "0.65"))
+BB_DN = float(os.getenv("BB_DN", "0.35"))
+ATR_N = int(os.getenv("ATR_N", "14"))
+ATR_Z = float(os.getenv("ATR_Z", "0.5"))
 
 
 # ---------- state ----------
@@ -322,6 +336,63 @@ def rsi_ok(side, r):
     if r is None:
         return True
     return r >= RSI_BLOCK if side == "UP" else r <= 100 - RSI_BLOCK
+
+
+# ---------- indicator votes (EMA 9/21, Bollinger, ATR, MACD) ----------
+# Each returns (vote, text). vote is +1 (UP), -1 (DOWN), 0 (NEUTRAL) or None while warming up.
+def vote_ema(p):
+    if len(p) < 21:
+        return None, "warming up"
+    e9, e21 = _ema(p, 9)[-1], _ema(p, 21)[-1]
+    gap = (e9 - e21) / p[-1]
+    v = 1 if gap > EMA_DEAD else -1 if gap < -EMA_DEAD else 0
+    return v, f"EMA9 {'above' if e9 > e21 else 'below'} EMA21 ({gap * 1e4:+.1f}bp)"
+
+
+def vote_boll(p, n=20, k=2.0):
+    if len(p) < n:
+        return None, "warming up"
+    w = p[-n:]
+    m, sd = statistics.fmean(w), statistics.pstdev(w)
+    if sd == 0:
+        return 0, "flat"
+    pb = (p[-1] - (m - k * sd)) / (2 * k * sd)   # 0 = lower band, 1 = upper band
+    v = 1 if pb >= BB_UP else -1 if pb <= BB_DN else 0
+    return v, f"%B {pb:.2f}"
+
+
+def atr(p, n=None):
+    n = n or ATR_N
+    if len(p) < n + 1:
+        return None
+    tr = [abs(b - a) for a, b in zip(p, p[1:])]
+    a = sum(tr[:n]) / n
+    for t in tr[n:]:
+        a = (a * (n - 1) + t) / n
+    return a
+
+
+def vote_atr(p, price, strike, secs_left):
+    """ATR has no direction, so it is tied to the strike: how far is price from the strike
+    compared with the distance ATR says it can still travel before close."""
+    a = atr(p)
+    if a is None or not price or not strike or a <= 0:
+        return None, "warming up"
+    reach = a * math.sqrt(max(secs_left, 10) / 10)
+    z = (price - strike) / reach
+    v = 1 if z >= ATR_Z else -1 if z <= -ATR_Z else 0
+    return v, f"ATR ${a:.2f}, {z:+.1f}x reach from strike"
+
+
+def vote_macd(p):
+    if len(p) < 35:
+        return None, "warming up"
+    line = [a - b for a, b in zip(_ema(p, 12), _ema(p, 26))]
+    sig = _ema(line, 9)
+    hist, prev = line[-1] - sig[-1], line[-2] - sig[-2]
+    dead = p[-1] * MACD_DEAD
+    v = 1 if hist > dead else -1 if hist < -dead else 0
+    return v, f"hist {hist:+.2f} ({'rising' if hist > prev else 'falling'})"
 
 
 def _pressure(p):
@@ -896,6 +967,26 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         rs = c.get("rsi")
         rsi_part = f" | RSI {rs:.0f}" if rs is not None else " | RSI warming up"
         lines.append(f"**Signals** {fib_part}{rsi_part}")
+
+    # Public indicator vote panel (EMA 9/21, Bollinger, ATR, MACD) plus confluence and combined score.
+    # On the settled post it shows the votes frozen at entry.
+    done = outcome in ("win", "loss")
+    vt = (c.get("votes_call") if done else None) or c.get("votes")
+    tally = (c.get("tally_call") if done else None) or c.get("tally")
+    if vt and tally:
+        names = {"ema": "EMA 9/21", "boll": "Bollinger", "atr": "ATR", "macd": "MACD"}
+        lab = lambda v: "⚪ WARMING" if v is None else "🟢 UP" if v > 0 else "🔴 DOWN" if v < 0 else "⚪ NEUTRAL"
+        lines.append("**Indicators at entry**" if done and c.get("votes_call") else "**Indicators**")
+        for key, nm in names.items():
+            v, txt = vt[key]
+            lines.append(f"{lab(v)} · **{nm}** {txt}")
+        u, d_, n_ = tally
+        cb = c.get("comb_call") if done and c.get("comb_call") is not None else c.get("comb")
+        verdict = f" → **{side}**" if side else " → no call yet"
+        lines.append(f"**Confluence** UP {u} / DOWN {d_} / NEUTRAL {n_}{verdict}")
+        if cb is not None:
+            lines.append(f"**Combined score** {cb:+.2f} (call at ±{COMBO_MIN:.2f})")
+
     if side is None and c.get("rsi_block"):
         why = c.get("hold_why") or ""
         cap = "" if "Fibonacci" in why else f" (max {RSI_GRACE:.0f}s)"
@@ -1086,9 +1177,37 @@ def tick(state):
 
     prev_side, prev_flip = cur["side"], cur.get("flipped")
 
-    # first side to reach TRIGGER_PCT on Kalshi owns the call.
+    # ---- indicator votes + combined call ----
+    votes = {"ema": vote_ema(series), "boll": vote_boll(series),
+             "atr": vote_atr(series, price, strike, secs_left), "macd": vote_macd(series)}
+    ready = [v for v, _ in votes.values() if v is not None]
+    all_ready = len(ready) == 4
+    c_up, c_dn = ready.count(1), ready.count(-1)
+    vscore = sum(ready) / len(ready) if ready else 0.0
+    comb = W_CORE * score + W_VOTE * vscore
+    cur["votes"] = {k: [v, t] for k, (v, t) in votes.items()}
+    cur["tally"] = [c_up, c_dn, len(ready) - c_up - c_dn]
+    cur["comb"] = round(comb, 3)
+
+    if CALL_MODE == "combined" and all_ready and cur["side"] is None and secs_left > CALL_CUTOFF:
+        sgn = 1 if comb > 0 else -1
+        cside = "UP" if sgn > 0 else "DOWN"
+        against = sum(1 for v in ready if v == -sgn)
+        good = (abs(comb) >= COMBO_MIN and against <= COMBO_OPP
+                and fib * sgn >= -0.5 and rsi_ok(cside, r))
+        if not good:
+            cur.pop("comb_dir", None)
+        elif cur.get("comb_dir") != cside:
+            cur["comb_dir"], cur["comb_t"] = cside, now
+        elif now - cur["comb_t"] >= CONFIRM_SECONDS:
+            cur.update(side=cside, conf=side_pct(cside, yes), locked=True,
+                       called_at=round(elapsed), src="COMBINED",
+                       votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
+                       comb_call=cur["comb"])
+
+    # first side to reach TRIGGER_PCT on Kalshi owns the call (Kalshi mode, or while indicators warm up).
     # Fibonacci must agree before the call fires (no timeout); RSI can delay it up to RSI_GRACE seconds.
-    if cur["side"] is None and secs_left > CALL_CUTOFF:
+    if cur["side"] is None and secs_left > CALL_CUTOFF and (CALL_MODE == "kalshi" or not all_ready):
         if not cur.get("first_side"):
             fs0 = pct_trigger(yes)
             if fs0:
@@ -1106,7 +1225,9 @@ def tick(state):
                 cur.update(side=fs, conf=side_pct(fs, yes), locked=True,
                            called_at=round(elapsed), src="KALSHI",
                            rsi_call=cur["rsi"], fib_call=round(fib, 2),
-                           rsi_over=not rsi_agree, fib_over=not fib_agree)
+                           rsi_over=not rsi_agree, fib_over=not fib_agree,
+                           votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
+                           comb_call=cur["comb"])
             else:
                 cur["rsi_block"] = fs
                 cur["hold_why"] = " and ".join(
