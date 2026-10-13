@@ -24,33 +24,35 @@ except Exception:
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 SERIES = os.getenv("KALSHI_SERIES", "KXETH15M")
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
-POLL = float(os.getenv("POLL_SECONDS", "0.5"))                # sampling interval
-EDIT_SECONDS = float(os.getenv("EDIT_SECONDS", "0"))          # 0 = refresh whenever the sender is free
-IMG_SECONDS = float(os.getenv("IMG_SECONDS", "3"))            # how often the chart image re-renders
-NEW_MSG_SECONDS = float(os.getenv("NEW_MSG_SECONDS", "30"))   # post a fresh message
-MIN_GAP = float(os.getenv("MIN_GAP", "10"))                   # min secs between momentum-shift posts
+POLL = float(os.getenv("POLL_SECONDS", "0.5"))
+EDIT_SECONDS = float(os.getenv("EDIT_SECONDS", "0"))
+IMG_SECONDS = float(os.getenv("IMG_SECONDS", "3"))
+NEW_MSG_SECONDS = float(os.getenv("NEW_MSG_SECONDS", "30"))
+MIN_GAP = float(os.getenv("MIN_GAP", "99999"))          # momentum-shift posts off by default
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", str(345 * 60)))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
 
 W_MARKET = float(os.getenv("W_MARKET", "0.5"))
 CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "60"))
-TILT_W = float(os.getenv("TILT_W", "0.25"))   # max pull of the basket, in sigmas (x3 clip)
-
-MIN_SCORE = float(os.getenv("MIN_SCORE", "0.22"))    # kept for reference, no longer gates the first call
-MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))        # momentum needed to take the first-mover slot
-FLIP_SCORE = float(os.getenv("FLIP_SCORE", "0.15"))  # opposing score that triggers SELL
-CALL_AFTER = int(os.getenv("CALL_AFTER", "15"))      # secs into window before calling
-CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "1.5"))  # momentum must hold this long
+TILT_W = float(os.getenv("TILT_W", "0.25"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.22"))
+MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))
+FLIP_SCORE = float(os.getenv("FLIP_SCORE", "99"))       # old flip trigger off by default
+CALL_AFTER = int(os.getenv("CALL_AFTER", "99999"))      # old momentum trigger off by default
+CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "1.5"))
 W_MOM = float(os.getenv("W_MOM", "0.60"))
 W_FIB = float(os.getenv("W_FIB", "0.15"))
 W_TREND = float(os.getenv("W_TREND", "0.15"))
 W_PROB = float(os.getenv("W_PROB", "0.10"))
 FIB_LEVELS = (0.236, 0.382, 0.5, 0.618, 0.786)
-
+TRIGGER_PCT = float(os.getenv("TRIGGER_PCT", "50.1"))
+FLIP_HARD = float(os.getenv("FLIP_HARD", "0.45"))
+FLIP_HOLD = float(os.getenv("FLIP_HOLD", "8"))
+FLIP_MIN_AGE = float(os.getenv("FLIP_MIN_AGE", "20"))
 LOGO_PATH = os.getenv("LOGO_PATH", "eth_logo.png")
-LIVE_SCALE = float(os.getenv("LIVE_SCALE", "1.0"))     # 1.0 = 720x800 GIF
-FINAL_SCALE = float(os.getenv("FINAL_SCALE", "3"))     # 3 = 2160x2400 PNG
+LIVE_SCALE = float(os.getenv("LIVE_SCALE", "1.0"))
+FINAL_SCALE = float(os.getenv("FINAL_SCALE", "3"))
 MAX_BYTES = int(float(os.getenv("MAX_MB", "7.5")) * 1024 * 1024)
 
 
@@ -90,7 +92,8 @@ def ts(iso):
 
 
 def open_market():
-    r = requests.get(f"{KALSHI}/markets", params={"series_ticker": SERIES, "status": "open", "limit": 20}, timeout=10)
+    r = requests.get(f"{KALSHI}/markets",
+                     params={"series_ticker": SERIES, "status": "open", "limit": 20}, timeout=10)
     r.raise_for_status()
     now = time.time()
     ms = [m for m in r.json().get("markets", []) if ts(m["close_time"]) > now]
@@ -110,16 +113,19 @@ PRICES = {s: deque(maxlen=1200) for s in WEIGHTS}
 
 
 def _cb(pair):
-    return float(requests.get(f"https://api.coinbase.com/v2/prices/{pair}/spot", timeout=5).json()["data"]["amount"])
+    return float(requests.get(f"https://api.coinbase.com/v2/prices/{pair}/spot",
+                              timeout=5).json()["data"]["amount"])
 
 
 def _kr(pair):
-    r = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair": pair}, timeout=5).json()["result"]
+    r = requests.get("https://api.kraken.com/0/public/Ticker",
+                     params={"pair": pair}, timeout=5).json()["result"]
     return float(next(iter(r.values()))["c"][0])
 
 
 def _bs(pair):
-    return float(requests.get(f"https://www.bitstamp.net/api/v2/ticker/{pair}/", timeout=5).json()["last"])
+    return float(requests.get(f"https://www.bitstamp.net/api/v2/ticker/{pair}/",
+                              timeout=5).json()["last"])
 
 
 SOURCES = {
@@ -252,7 +258,7 @@ def _fib_score(d):
         return 0.2
     if d < 0.786:
         return -0.3
-    return -0.8   # swing failed, reversal
+    return -0.8  # swing failed, reversal
 
 
 def fib_signal(prices):
@@ -323,6 +329,17 @@ def side_pct(side, yes):
     return max(1.0, pct - 5)
 
 
+def pct_trigger(yes):
+    """First side to reach TRIGGER_PCT on Kalshi wins the call. UP = YES %, DOWN = NO %."""
+    up = min(max(yes, 1), 99)
+    dn = 100 - up
+    if up >= TRIGGER_PCT:
+        return "UP"
+    if dn >= TRIGGER_PCT:
+        return "DOWN"
+    return None
+
+
 # ---------- stats ----------
 def stats(history):
     n = len(history)
@@ -361,8 +378,8 @@ _FONT_DIRS = ["", "/usr/share/fonts/truetype/inter/", "/usr/share/fonts/truetype
               "C:/Windows/Fonts/", "/Library/Fonts/", "/System/Library/Fonts/Supplemental/"]
 _FONTS_B = ["Inter-Bold.ttf", "Roboto-Bold.ttf", "LiberationSans-Bold.ttf", "NotoSans-Bold.ttf",
             "arialbd.ttf", "Arial Bold.ttf", "DejaVuSans-Bold.ttf"]
-_FONTS_R = ["Inter-Regular.ttf", "Roboto-Regular.ttf", "LiberationSans-Regular.ttf", "NotoSans-Regular.ttf",
-            "arial.ttf", "Arial.ttf", "DejaVuSans.ttf"]
+_FONTS_R = ["Inter-Regular.ttf", "Roboto-Regular.ttf", "LiberationSans-Regular.ttf",
+            "NotoSans-Regular.ttf", "arial.ttf", "Arial.ttf", "DejaVuSans.ttf"]
 
 
 @functools.lru_cache(maxsize=128)
@@ -489,7 +506,6 @@ def render_frames(cur, outcome, S, n):
     strike = cur.get("strike") or (eth[0][1] if eth else 0)
     now_px = eth[-1][1] if eth else (cur.get("price") or strike)
     close_ts = cur.get("close_ts") or (now + 900)
-
     accent = {"win": C_UP, "loss": C_DN, "settling": AMBER}.get(outcome)
     col = C_UP if is_up else C_DN
 
@@ -506,7 +522,6 @@ def render_frames(cur, outcome, S, n):
     base.paste(_logo(lg), (int(k(24)), int(k(24))), _logo(lg))
     d.ellipse([k(24), k(24), k(24) + lg, k(24) + lg], outline=(255, 255, 255, 80), width=lw(1.5))
     d.text((k(98), k(54)), "ETH 15 min", font=F(30), fill=WHITE, anchor="lm")
-
     ring = outcome in (None, "settling")
     if outcome == "win":
         btxt, bcol = "WIN", C_UP
@@ -562,7 +577,6 @@ def render_frames(cur, outcome, S, n):
 
     base.paste(_logo(int(k(24))), (int(k(26)), int(k(203))), _logo(int(k(24))))
     d.text((k(58), k(215)), "ETH / USD · 30s", font=F(12, False), fill=MUTED, anchor="lm")
-
     for i in range(5):
         v = lo + (hi - lo) * i / 4
         _dots(d, PX0, Y(v), PX1, Y(v), (150, 165, 200, 40), lw(1), k(2), k(5))
@@ -607,6 +621,7 @@ def render_frames(cur, outcome, S, n):
     _glow(base, ema_fn(e3), CYAN, k(3), 0.6)
     _glow(base, ema_fn(e8), ORG, k(3), 0.6)
     d = ImageDraw.Draw(base, "RGBA")
+
     for (i, o, h, l, c) in cs:
         cc = C_UP if c >= o else C_DN
         x = cx_(i)
@@ -621,8 +636,10 @@ def render_frames(cur, outcome, S, n):
 
     # high / low markers
     hc, lc_ = max(cs, key=lambda c: c[2]), min(cs, key=lambda c: c[3])
-    d.text((cx_(hc[0]), max(PY0 + k(18), Y(hc[2]) - k(9))), f"H {hc[2]:,.1f}", font=F(10), fill=C_UP + (230,), anchor="mm")
-    d.text((cx_(lc_[0]), min(PY1 - k(6), Y(lc_[3]) + k(9))), f"L {lc_[3]:,.1f}", font=F(10), fill=C_DN + (230,), anchor="mm")
+    d.text((cx_(hc[0]), max(PY0 + k(18), Y(hc[2]) - k(9))), f"H {hc[2]:,.1f}", font=F(10),
+           fill=C_UP + (230,), anchor="mm")
+    d.text((cx_(lc_[0]), min(PY1 - k(6), Y(lc_[3]) + k(9))), f"L {lc_[3]:,.1f}", font=F(10),
+           fill=C_DN + (230,), anchor="mm")
 
     # delta labels (left of plot)
     fmt = ".0f" if (hi - lo) >= 20 else ".1f"
@@ -630,7 +647,8 @@ def render_frames(cur, outcome, S, n):
         v = lo + (hi - lo) * fr
         dd = v - (strike or v)
         c = C_UP if dd >= 0 else C_DN
-        d.text((k(24), Y(v)), f"{'+' if dd >= 0 else '-'} ${abs(dd):{fmt}}", font=F(13), fill=c + (255,), anchor="lm")
+        d.text((k(24), Y(v)), f"{'+' if dd >= 0 else '-'} ${abs(dd):{fmt}}", font=F(13),
+               fill=c + (255,), anchor="lm")
 
     # entry marker
     ca = cur.get("called_at")
@@ -692,8 +710,8 @@ def render_frames(cur, outcome, S, n):
     base.paste(_logo(int(k(40))), (int(k(36)), int(k(598))), _logo(int(k(40))))
     tx = k(92)
     if waiting:
-        l1 = "Scanning, no call yet"
-        l2 = f"Momentum {abs((cur.get('sig') or {}).get('mom', 0)) * 100:.0f}, needs {MOM_MIN * 100:.0f}+"
+        l1 = "Watching the market"
+        l2 = "Waiting for a call"
     else:
         live = cur.get("live_conf") if outcome is None else None
         shown = live if live is not None else conf
@@ -718,7 +736,8 @@ def render_frames(cur, outcome, S, n):
                             outline=(ocol + (255,)) if ocol else None, width=lw(3))
         ta = 150 if dim else 255
         _arrow(d, x0 + k(44), (by0 + by1) / 2, up_btn, k(15), (255, 255, 255, ta))
-        d.text(((x0 + x1) / 2 + k(14), by0 + k(38)), f"{name} · {pct:.0f}%", font=F(24), fill=(255, 255, 255, ta), anchor="mm")
+        d.text(((x0 + x1) / 2 + k(14), by0 + k(38)), f"{name} · {pct:.0f}%", font=F(24),
+               fill=(255, 255, 255, ta), anchor="mm")
         d.text(((x0 + x1) / 2 + k(14), by0 + k(74)), f"{100 / max(pct, 1):.2f}x", font=F(16, False),
                fill=(255, 255, 255, 120 if dim else 225), anchor="mm")
 
@@ -759,7 +778,8 @@ def chart_file(cur, outcome=None):
             frames[0].save(buf, format="PNG", optimize=True)
             res = (buf.getvalue(), "chart.png", "image/png")
         else:
-            frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], duration=90, loop=0)
+            frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:],
+                           duration=90, loop=0)
             res = (buf.getvalue(), "chart.gif", "image/gif")
         if len(res[0]) <= MAX_BYTES or S <= 1:
             return res
@@ -840,6 +860,25 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
     }
 
 
+_build_embed_raw = build_embed
+
+
+def build_embed(*a, **kw):
+    """Same embed, minus anything that hints at how a call is triggered."""
+    e = _build_embed_raw(*a, **kw)
+    out = []
+    for ln in e["description"].split("\n"):
+        if ln.startswith("**Call:** ⚪ NO CALL"):
+            ln = "**Call:** ⚪ NO CALL yet"
+        elif ln.startswith("**Call:**"):
+            ln = ln.split(" | ")[0]
+        elif ln.startswith("**Signals**"):
+            continue
+        out.append(ln)
+    e["description"] = "\n".join(out)
+    return e
+
+
 def send(embed, message_id=None, cur=None, outcome=None, text_only=False):
     payload = {"embeds": [embed]}
     f_data = None
@@ -850,7 +889,7 @@ def send(embed, message_id=None, cur=None, outcome=None, text_only=False):
         f_data = chart_file(cur, outcome)
         embed["image"] = {"url": f"attachment://{f_data[1]}"}
         if message_id:
-            payload["attachments"] = []
+            payload["attachments"] = []   # replace the old image only when uploading a new one
     for _ in range(3):
         kw = {"timeout": 60}
         if f_data:
@@ -877,7 +916,7 @@ def send_sync(embed, message_id=None, cur=None, outcome=None):
     """Blocking send used for window-end and settlement. Waits for any background send first."""
     with SEND_LOCK:
         if cur is not None and cur.get("message_id"):
-            message_id = cur["message_id"]   # the newest message, even if a background post just landed
+            message_id = cur["message_id"]  # the newest message, even if a background post just landed
         return send(embed, message_id, cur=cur, outcome=outcome)
 
 
@@ -916,8 +955,7 @@ def settle_pending(state):
                 res = "yes" if price >= p["strike"] else "no"
             win = (res == "yes") == (p["side"] == "UP")
             state["history"].append({"ticker": p["ticker"], "side": p["side"], "win": win,
-                                     "tilt": (p.get("mkt") or {}).get("tilt"),
-                                     "sig": p.get("sig")})
+                                     "tilt": (p.get("mkt") or {}).get("tilt"), "sig": p.get("sig")})
             state["pending"].remove(p)
             yes_final = 100.0 if res == "yes" else 0.0
             p.setdefault("pts", []).append([900, 100 if res == "yes" else 0])
@@ -933,7 +971,6 @@ def tick(state):
     m = open_market()
     cur = state["current"]
     now = time.time()
-
     if cur and (m is None or m["ticker"] != cur["ticker"]):
         state["current"] = None
         if cur["side"] is None:
@@ -941,7 +978,8 @@ def tick(state):
             send_sync(build_embed(cur, state, last_yes, None, 0, 0), cur["message_id"], cur=cur)
         else:
             state["pending"].append(cur)
-            send_sync(build_embed(cur, state, 50, None, 0, 0, "settling"), cur["message_id"], cur=cur, outcome="settling")
+            send_sync(build_embed(cur, state, 50, None, 0, 0, "settling"), cur["message_id"],
+                      cur=cur, outcome="settling")
         cur = None
         save_state(state)
     if m is None:
@@ -966,14 +1004,13 @@ def tick(state):
     for s, (p, _) in px.items():
         if p:
             cur["open"].setdefault(s, p)
-
     now_px = {s: p for s, (p, _) in px.items()}
     tilt, breadth, zs = market_signal(now_px, cur["open"], now - cur["open_t"])
     blend, pm = predict(yes, price, strike, secs_left, tilt)
     cur["mkt"] = {"tilt": round(tilt, 2), "breadth": round(breadth, 2),
                   "z": {s: round(z, 2) for s, z in zs.items()}}
-
     cur["read"] = {"ETH": blend}
+
     series = series_10s("ETH")
     fib, fib_lvl = fib_signal(series)
     trend = trend_signal(series, tilt)
@@ -982,17 +1019,26 @@ def tick(state):
     score, prob = composite(mom, fib, trend, blend)
     cur["score"] = round(score, 3)
     cur["fib"] = fib_lvl
-    cur["sig"] = {"mom": round(mom, 2), "fib": round(fib, 2),
-                  "trend": round(trend, 2), "prob": round(prob, 2)}
+    cur["sig"] = {"mom": round(mom, 2), "fib": round(fib, 2), "trend": round(trend, 2),
+                  "prob": round(prob, 2)}
 
     prev_side, prev_flip = cur["side"], cur.get("flipped")
+
+    # new trigger: first side to reach TRIGGER_PCT on Kalshi gets the call
+    if cur["side"] is None and secs_left > CALL_CUTOFF:
+        side = pct_trigger(yes)
+        if side:
+            cur.update(side=side, conf=side_pct(side, yes), locked=True,
+                       called_at=round(elapsed), src="KALSHI")
+
+    # old momentum trigger (off while CALL_AFTER=99999)
     if cur["side"] is None and CALL_AFTER <= elapsed and secs_left > CALL_CUTOFF:
         lead = 1 if mom >= MOM_MIN else -1 if mom <= -MOM_MIN else 0
         fm = cur.get("first")
         if not lead:
-            fm = None                                  # momentum faded, slot resets
+            fm = None  # momentum faded, slot resets
         elif fm is None or fm["dir"] != lead:
-            fm = {"dir": lead, "t": now}               # a new side takes the first-mover slot
+            fm = {"dir": lead, "t": now}  # a new side takes the first-mover slot
         cur["first"] = fm
         if fm and now - fm["t"] >= CONFIRM_SECONDS:
             pick = pick_call(score, mom, fib, trend, prob)
@@ -1001,10 +1047,23 @@ def tick(state):
                 cur.update(side=side, conf=side_pct(side, yes), locked=True,
                            called_at=round(elapsed), src="ETH")
 
+    # old flip trigger (off while FLIP_SCORE=99)
     if cur["side"] and not cur.get("flipped"):
         sgn = 1 if cur["side"] == "UP" else -1
         if score * sgn < -FLIP_SCORE:
             cur["flipped"] = True
+
+    # harder SELL trigger
+    if cur["side"] and not cur.get("flipped"):
+        sgn = 1 if cur["side"] == "UP" else -1
+        aged = elapsed - cur.get("called_at", elapsed) >= FLIP_MIN_AGE
+        market_against = (yes - 50) * sgn < 0  # Kalshi has actually moved to the other side
+        if score * sgn < -FLIP_HARD and aged and market_against:
+            cur.setdefault("flip_since", now)
+            if now - cur["flip_since"] >= FLIP_HOLD:
+                cur["flipped"] = True
+        else:
+            cur.pop("flip_since", None)  # reversal broke, timer resets
 
     if cur["side"]:
         cur["live_conf"] = round(side_pct(cur["side"], yes), 1)
@@ -1044,7 +1103,7 @@ def tick(state):
             if cur["side"]:
                 cur["buy_shown"] = True
         elif ev:
-            cur["pending_ev"] = ev   # retry the event post on the next tick
+            cur["pending_ev"] = ev  # retry the event post on the next tick
     save_state(state)
 
 
