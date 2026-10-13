@@ -48,7 +48,8 @@ W_TREND = float(os.getenv("W_TREND", "0.15"))
 W_PROB = float(os.getenv("W_PROB", "0.10"))
 RSI_N = int(os.getenv("RSI_N", "14"))
 RSI_BLOCK = float(os.getenv("RSI_BLOCK", "20"))   # UP held if RSI < this, DOWN held if RSI > 100 minus this
-RSI_GRACE = float(os.getenv("RSI_GRACE", "10"))   # max secs RSI can delay the first-to-cross call
+RSI_GRACE = float(os.getenv("RSI_GRACE", "10"))   # max secs RSI/Fibonacci can delay the first-to-cross call
+FIB_BLOCK = float(os.getenv("FIB_BLOCK", "0.5"))  # call held if Fibonacci score fights the side harder than this
 FIB_LEVELS = (0.236, 0.382, 0.5, 0.618, 0.786)
 TRIGGER_PCT = float(os.getenv("TRIGGER_PCT", "50.1"))
 FLIP_HARD = float(os.getenv("FLIP_HARD", "0.45"))
@@ -277,6 +278,20 @@ def fib_signal(prices):
     d = max(0.0, min(1.0, d))
     lvl = min(FIB_LEVELS, key=lambda r: abs(r - d))
     return (1 if up_swing else -1) * _fib_score(d), f"{lvl * 100:.1f}".rstrip("0").rstrip(".")
+
+
+def fib_ok(side, f):
+    """True unless the Fibonacci score strongly fights the side."""
+    sgn = 1 if side == "UP" else -1
+    return f * sgn >= -FIB_BLOCK
+
+
+def fib_bias(f):
+    if f >= 0.15:
+        return "bullish"
+    if f <= -0.15:
+        return "bearish"
+    return "neutral"
 
 
 def trend_signal(prices, tilt):
@@ -868,22 +883,29 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
     if mk:
         arrows = " / ".join(f"{sym} {'▲' if z >= 0 else '▼'}" for sym, z in mk["z"].items())
         lines.append(f"**Basket** {arrows} (agreement {mk['breadth'] * 100:.0f}%)")
+
+    # Signals line: Fibonacci (level, score, bias) plus RSI. Momentum stays out of it.
     sg = c.get("sig")
     if sg:
-        who = c.get("who") or "even"
-        lines.append(f"**Signals** Momentum {sg.get('mom', 0):+.2f} ({who}) | Fibonacci {sg['fib']:+.2f}")
-    rs = c.get("rsi")
-    if rs is not None:
-        if side is None and c.get("rsi_block"):
-            note = f"holding the {c['rsi_block']} call, max {RSI_GRACE:.0f}s"
-        elif side is not None:
-            rc = c.get("rsi_call")
-            rc_txt = f"RSI {rc:.0f}" if rc is not None else "no RSI yet"
-            tail = ", called despite RSI" if c.get("rsi_over") else (", RSI agreed" if rc is not None else "")
-            note = f"{side} at entry, {rc_txt}{tail}"
+        fl = c.get("fib")
+        fscore = sg.get("fib", 0.0)
+        if fl:
+            fib_part = f"Fibonacci retracement {fl}% (score {fscore:+.2f}, {fib_bias(fscore)})"
         else:
-            note = "a factor in every call"
-        lines.append(f"**RSI** {rs:.0f} ({note})")
+            fib_part = "Fibonacci forming (not enough swing yet)"
+        rs = c.get("rsi")
+        rsi_part = f" | RSI {rs:.0f}" if rs is not None else " | RSI warming up"
+        lines.append(f"**Signals** {fib_part}{rsi_part}")
+    if side is None and c.get("rsi_block"):
+        lines.append(f"**Hold** {c['rsi_block']} call waiting on {c.get('hold_why')} (max {RSI_GRACE:.0f}s)")
+    elif side is not None and c.get("fib_call") is not None:
+        over = [n for n, f in (("RSI", c.get("rsi_over")), ("Fibonacci", c.get("fib_over"))) if f]
+        if over:
+            lines.append(f"**Entry** called despite {' and '.join(over)}")
+        elif c.get("rsi_call") is None:
+            lines.append("**Entry** Fibonacci agreed (RSI warming up)")
+        else:
+            lines.append("**Entry** RSI and Fibonacci agreed")
     if price:
         lines.append(f"**Price** ${price:,.2f} (median of {n_ex} exch)")
     lines.append(f"**Strike** {c['strike']:,.2f} | {max(int(secs_left), 0)}s left")
@@ -908,9 +930,7 @@ def build_embed(*a, **kw):
         if ln.startswith("**Call:** ⚪ NO CALL"):
             ln = "**Call:** ⚪ NO CALL yet"
         elif ln.startswith("**Call:**"):
-            ln = ln.split(" | ")[0]
-        elif ln.startswith("**Signals**"):
-            continue
+            ln = ln.split(" | ")[0]   # trims the tail; Fibonacci shows in the Signals line instead
         out.append(ln)
     e["description"] = "\n".join(out)
     return e
@@ -1064,22 +1084,27 @@ def tick(state):
 
     prev_side, prev_flip = cur["side"], cur.get("flipped")
 
-    # first side to reach TRIGGER_PCT on Kalshi owns the call; RSI can only delay it briefly
+    # first side to reach TRIGGER_PCT on Kalshi owns the call; RSI and Fibonacci can only delay it briefly
     if cur["side"] is None and secs_left > CALL_CUTOFF:
         if not cur.get("first_side"):
-            fs = pct_trigger(yes)
-            if fs:
-                cur["first_side"], cur["first_t"] = fs, now
+            fs0 = pct_trigger(yes)
+            if fs0:
+                cur["first_side"], cur["first_t"] = fs0, now
         fs = cur.get("first_side")
         if fs:
-            agrees = rsi_ok(fs, r)
-            if agrees or now - cur["first_t"] >= RSI_GRACE:
+            rsi_agree = rsi_ok(fs, r)
+            fib_agree = fib_ok(fs, fib)
+            if (rsi_agree and fib_agree) or now - cur["first_t"] >= RSI_GRACE:
                 cur.pop("rsi_block", None)
+                cur.pop("hold_why", None)
                 cur.update(side=fs, conf=side_pct(fs, yes), locked=True,
                            called_at=round(elapsed), src="KALSHI",
-                           rsi_call=cur["rsi"], rsi_over=not agrees)
+                           rsi_call=cur["rsi"], fib_call=round(fib, 2),
+                           rsi_over=not rsi_agree, fib_over=not fib_agree)
             else:
                 cur["rsi_block"] = fs
+                cur["hold_why"] = " and ".join(
+                    n for n, ok in (("RSI", rsi_agree), ("Fibonacci", fib_agree)) if not ok)
 
     # old momentum trigger (off while CALL_AFTER=99999)
     if cur["side"] is None and CALL_AFTER <= elapsed and secs_left > CALL_CUTOFF:
