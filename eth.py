@@ -41,15 +41,16 @@ MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))
 FLIP_SCORE = float(os.getenv("FLIP_SCORE", "99"))       # old flip trigger off by default
 CALL_AFTER = int(os.getenv("CALL_AFTER", "99999"))      # old momentum trigger off by default
 CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "1.5"))
-W_MOM = float(os.getenv("W_MOM", "0.50"))
+W_MOM = float(os.getenv("W_MOM", "0.35"))         # was 0.50
 W_RSI = float(os.getenv("W_RSI", "0.10"))
-W_FIB = float(os.getenv("W_FIB", "0.15"))
-W_TREND = float(os.getenv("W_TREND", "0.15"))
+W_FIB = float(os.getenv("W_FIB", "0.35"))         # was 0.15
+W_TREND = float(os.getenv("W_TREND", "0.10"))     # was 0.15
 W_PROB = float(os.getenv("W_PROB", "0.10"))
 RSI_N = int(os.getenv("RSI_N", "14"))
 RSI_BLOCK = float(os.getenv("RSI_BLOCK", "20"))   # UP held if RSI < this, DOWN held if RSI > 100 minus this
-RSI_GRACE = float(os.getenv("RSI_GRACE", "10"))   # max secs RSI/Fibonacci can delay the first-to-cross call
-FIB_BLOCK = float(os.getenv("FIB_BLOCK", "0.5"))  # call held if Fibonacci score fights the side harder than this
+RSI_GRACE = float(os.getenv("RSI_GRACE", "10"))   # max secs RSI can delay the first-to-cross call
+FIB_GRACE = float(os.getenv("FIB_GRACE", "25"))   # max secs Fibonacci can delay the first-to-cross call
+FIB_BLOCK = float(os.getenv("FIB_BLOCK", "0.3"))  # call held if Fibonacci score fights the side harder than this (was 0.5)
 FIB_LEVELS = (0.236, 0.382, 0.5, 0.618, 0.786)
 TRIGGER_PCT = float(os.getenv("TRIGGER_PCT", "50.1"))
 FLIP_HARD = float(os.getenv("FLIP_HARD", "0.45"))
@@ -897,7 +898,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         rsi_part = f" | RSI {rs:.0f}" if rs is not None else " | RSI warming up"
         lines.append(f"**Signals** {fib_part}{rsi_part}")
     if side is None and c.get("rsi_block"):
-        lines.append(f"**Hold** {c['rsi_block']} call waiting on {c.get('hold_why')} (max {RSI_GRACE:.0f}s)")
+        lines.append(f"**Hold** {c['rsi_block']} call waiting on {c.get('hold_why')} (max {max(RSI_GRACE, FIB_GRACE):.0f}s)")
     elif side is not None and c.get("fib_call") is not None:
         over = [n for n, f in (("RSI", c.get("rsi_over")), ("Fibonacci", c.get("fib_over"))) if f]
         if over:
@@ -1084,7 +1085,8 @@ def tick(state):
 
     prev_side, prev_flip = cur["side"], cur.get("flipped")
 
-    # first side to reach TRIGGER_PCT on Kalshi owns the call; RSI and Fibonacci can only delay it briefly
+    # first side to reach TRIGGER_PCT on Kalshi owns the call; RSI and Fibonacci can only delay it
+    # (RSI up to RSI_GRACE seconds, Fibonacci up to FIB_GRACE seconds)
     if cur["side"] is None and secs_left > CALL_CUTOFF:
         if not cur.get("first_side"):
             fs0 = pct_trigger(yes)
@@ -1094,7 +1096,10 @@ def tick(state):
         if fs:
             rsi_agree = rsi_ok(fs, r)
             fib_agree = fib_ok(fs, fib)
-            if (rsi_agree and fib_agree) or now - cur["first_t"] >= RSI_GRACE:
+            waited = now - cur["first_t"]
+            rsi_pass = rsi_agree or waited >= RSI_GRACE
+            fib_pass = fib_agree or waited >= FIB_GRACE
+            if rsi_pass and fib_pass:
                 cur.pop("rsi_block", None)
                 cur.pop("hold_why", None)
                 cur.update(side=fs, conf=side_pct(fs, yes), locked=True,
@@ -1104,7 +1109,7 @@ def tick(state):
             else:
                 cur["rsi_block"] = fs
                 cur["hold_why"] = " and ".join(
-                    n for n, ok in (("RSI", rsi_agree), ("Fibonacci", fib_agree)) if not ok)
+                    n for n, ok in (("RSI", rsi_pass), ("Fibonacci", fib_pass)) if not ok)
 
     # old momentum trigger (off while CALL_AFTER=99999)
     if cur["side"] is None and CALL_AFTER <= elapsed and secs_left > CALL_CUTOFF:
@@ -1139,6 +1144,13 @@ def tick(state):
                 cur["flipped"] = True
         else:
             cur.pop("flip_since", None)  # reversal broke, timer resets
+
+    # Fibonacci failed-swing SELL: a deep retrace against the call, with Kalshi also on the other side
+    if cur["side"] and not cur.get("flipped"):
+        sgn = 1 if cur["side"] == "UP" else -1
+        aged = elapsed - cur.get("called_at", elapsed) >= FLIP_MIN_AGE
+        if aged and fib * sgn < -0.7 and (yes - 50) * sgn < 0:
+            cur["flipped"] = True
 
     if cur["side"]:
         cur["live_conf"] = round(side_pct(cur["side"], yes), 1)
