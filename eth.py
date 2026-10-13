@@ -41,10 +41,14 @@ MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))
 FLIP_SCORE = float(os.getenv("FLIP_SCORE", "99"))       # old flip trigger off by default
 CALL_AFTER = int(os.getenv("CALL_AFTER", "99999"))      # old momentum trigger off by default
 CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "1.5"))
-W_MOM = float(os.getenv("W_MOM", "0.60"))
+W_MOM = float(os.getenv("W_MOM", "0.50"))
+W_RSI = float(os.getenv("W_RSI", "0.10"))
 W_FIB = float(os.getenv("W_FIB", "0.15"))
 W_TREND = float(os.getenv("W_TREND", "0.15"))
 W_PROB = float(os.getenv("W_PROB", "0.10"))
+RSI_N = int(os.getenv("RSI_N", "14"))
+RSI_BLOCK = float(os.getenv("RSI_BLOCK", "20"))   # UP held if RSI < this, DOWN held if RSI > 100 minus this
+RSI_GRACE = float(os.getenv("RSI_GRACE", "10"))   # max secs RSI can delay the first-to-cross call
 FIB_LEVELS = (0.236, 0.382, 0.5, 0.618, 0.786)
 TRIGGER_PCT = float(os.getenv("TRIGGER_PCT", "50.1"))
 FLIP_HARD = float(os.getenv("FLIP_HARD", "0.45"))
@@ -284,6 +288,27 @@ def trend_signal(prices, tilt):
     return 0.5 * ema + 0.5 * math.tanh(tilt / 1.5)
 
 
+def rsi(prices, n=None):
+    """Wilder RSI, 0-100. None until there are enough points."""
+    n = n or RSI_N
+    if len(prices) < n + 1:
+        return None
+    ch = [b - a for a, b in zip(prices, prices[1:])]
+    ag = sum(max(c, 0) for c in ch[:n]) / n
+    al = sum(max(-c, 0) for c in ch[:n]) / n
+    for c in ch[n:]:
+        ag = (ag * (n - 1) + max(c, 0)) / n
+        al = (al * (n - 1) + max(-c, 0)) / n
+    return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+
+
+def rsi_ok(side, r):
+    """True if RSI doesn't strongly fight the side. No RSI data yet means no hold."""
+    if r is None:
+        return True
+    return r >= RSI_BLOCK if side == "UP" else r <= 100 - RSI_BLOCK
+
+
 def _pressure(p):
     """Buyer vs seller share of price movement, -1 (all sellers) to +1 (all buyers)."""
     ups = sum(max(b - a, 0) for a, b in zip(p, p[1:]))
@@ -307,9 +332,9 @@ def momentum_fast(sym="ETH", win=10):
     return max(-1.0, min(1.0, 0.65 * now + 0.35 * gain))
 
 
-def composite(mom, fib, trend, blend):
+def composite(mom, fib, trend, blend, rsi_s=0.0):
     prob = max(-1.0, min(1.0, (blend - 50) / 50))
-    return W_MOM * mom + W_FIB * fib + W_TREND * trend + W_PROB * prob, prob
+    return (W_MOM * mom + W_FIB * fib + W_TREND * trend + W_PROB * prob + W_RSI * rsi_s), prob
 
 
 def pick_call(score, mom, fib, trend, prob):
@@ -847,6 +872,18 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
     if sg:
         who = c.get("who") or "even"
         lines.append(f"**Signals** Momentum {sg.get('mom', 0):+.2f} ({who}) | Fibonacci {sg['fib']:+.2f}")
+    rs = c.get("rsi")
+    if rs is not None:
+        if side is None and c.get("rsi_block"):
+            note = f"holding the {c['rsi_block']} call, max {RSI_GRACE:.0f}s"
+        elif side is not None:
+            rc = c.get("rsi_call")
+            rc_txt = f"RSI {rc:.0f}" if rc is not None else "no RSI yet"
+            tail = ", called despite RSI" if c.get("rsi_over") else (", RSI agreed" if rc is not None else "")
+            note = f"{side} at entry, {rc_txt}{tail}"
+        else:
+            note = "a factor in every call"
+        lines.append(f"**RSI** {rs:.0f} ({note})")
     if price:
         lines.append(f"**Price** ${price:,.2f} (median of {n_ex} exch)")
     lines.append(f"**Strike** {c['strike']:,.2f} | {max(int(secs_left), 0)}s left")
@@ -1014,9 +1051,12 @@ def tick(state):
     series = series_10s("ETH")
     fib, fib_lvl = fib_signal(series)
     trend = trend_signal(series, tilt)
+    r = rsi(series)
+    cur["rsi"] = round(r, 1) if r is not None else None
+    rsi_s = max(-1.0, min(1.0, (r - 50) / 50)) if r is not None else 0.0
     mom = 0.7 * momentum_fast("ETH") + 0.3 * math.tanh(tilt / 1.5)
     who = "buyers" if mom > 0.1 else "sellers" if mom < -0.1 else "even"
-    score, prob = composite(mom, fib, trend, blend)
+    score, prob = composite(mom, fib, trend, blend, rsi_s)
     cur["score"] = round(score, 3)
     cur["fib"] = fib_lvl
     cur["sig"] = {"mom": round(mom, 2), "fib": round(fib, 2), "trend": round(trend, 2),
@@ -1024,12 +1064,22 @@ def tick(state):
 
     prev_side, prev_flip = cur["side"], cur.get("flipped")
 
-    # new trigger: first side to reach TRIGGER_PCT on Kalshi gets the call
+    # first side to reach TRIGGER_PCT on Kalshi owns the call; RSI can only delay it briefly
     if cur["side"] is None and secs_left > CALL_CUTOFF:
-        side = pct_trigger(yes)
-        if side:
-            cur.update(side=side, conf=side_pct(side, yes), locked=True,
-                       called_at=round(elapsed), src="KALSHI")
+        if not cur.get("first_side"):
+            fs = pct_trigger(yes)
+            if fs:
+                cur["first_side"], cur["first_t"] = fs, now
+        fs = cur.get("first_side")
+        if fs:
+            agrees = rsi_ok(fs, r)
+            if agrees or now - cur["first_t"] >= RSI_GRACE:
+                cur.pop("rsi_block", None)
+                cur.update(side=fs, conf=side_pct(fs, yes), locked=True,
+                           called_at=round(elapsed), src="KALSHI",
+                           rsi_call=cur["rsi"], rsi_over=not agrees)
+            else:
+                cur["rsi_block"] = fs
 
     # old momentum trigger (off while CALL_AFTER=99999)
     if cur["side"] is None and CALL_AFTER <= elapsed and secs_left > CALL_CUTOFF:
