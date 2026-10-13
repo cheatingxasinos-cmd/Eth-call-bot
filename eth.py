@@ -28,18 +28,17 @@ POLL = float(os.getenv("POLL_SECONDS", "0.5"))
 EDIT_SECONDS = float(os.getenv("EDIT_SECONDS", "0"))
 IMG_SECONDS = float(os.getenv("IMG_SECONDS", "3"))
 NEW_MSG_SECONDS = float(os.getenv("NEW_MSG_SECONDS", "30"))
-MIN_GAP = float(os.getenv("MIN_GAP", "99999"))          # momentum-shift posts off by default
+MIN_GAP = float(os.getenv("MIN_GAP", "99999"))  # momentum-shift posts off by default
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", str(345 * 60)))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
-
 W_MARKET = float(os.getenv("W_MARKET", "0.5"))
 CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "60"))
 TILT_W = float(os.getenv("TILT_W", "0.25"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "0.22"))
 MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))
-FLIP_SCORE = float(os.getenv("FLIP_SCORE", "99"))       # old flip trigger off by default
-CALL_AFTER = int(os.getenv("CALL_AFTER", "99999"))      # old momentum trigger off by default
+FLIP_SCORE = float(os.getenv("FLIP_SCORE", "99"))  # old flip trigger off by default
+CALL_AFTER = int(os.getenv("CALL_AFTER", "99999"))  # old momentum trigger off by default
 CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "1.5"))
 W_MOM = float(os.getenv("W_MOM", "0.35"))
 W_RSI = float(os.getenv("W_RSI", "0.10"))
@@ -47,9 +46,9 @@ W_FIB = float(os.getenv("W_FIB", "0.35"))
 W_TREND = float(os.getenv("W_TREND", "0.10"))
 W_PROB = float(os.getenv("W_PROB", "0.10"))
 RSI_N = int(os.getenv("RSI_N", "14"))
-RSI_BLOCK = float(os.getenv("RSI_BLOCK", "20"))   # UP held if RSI < this, DOWN held if RSI > 100 minus this
-RSI_GRACE = float(os.getenv("RSI_GRACE", "10"))   # max secs RSI can delay the first-to-cross call
-FIB_AGREE = float(os.getenv("FIB_AGREE", "0.15")) # Fibonacci score must be at least this far in the call's direction
+RSI_BLOCK = float(os.getenv("RSI_BLOCK", "20"))  # UP held if RSI < this, DOWN held if RSI > 100 minus this
+RSI_GRACE = float(os.getenv("RSI_GRACE", "10"))  # max secs RSI can delay the first-to-cross call
+FIB_AGREE = float(os.getenv("FIB_AGREE", "0.15"))  # Fibonacci score must be at least this far in the call's direction
 FIB_LEVELS = (0.236, 0.382, 0.5, 0.618, 0.786)
 TRIGGER_PCT = float(os.getenv("TRIGGER_PCT", "50.1"))
 FLIP_HARD = float(os.getenv("FLIP_HARD", "0.45"))
@@ -61,36 +60,36 @@ FINAL_SCALE = float(os.getenv("FINAL_SCALE", "3"))
 MAX_BYTES = int(float(os.getenv("MAX_MB", "7.5")) * 1024 * 1024)
 
 # ---- combined call settings ----
-CALL_MODE = os.getenv("CALL_MODE", "combined")      # "kalshi" restores the old trigger only
-W_CORE = float(os.getenv("W_CORE", "0.5"))          # weight of the existing composite score
-W_VOTE = float(os.getenv("W_VOTE", "0.5"))          # weight of the indicator vote average
-COMBO_MIN = float(os.getenv("COMBO_MIN", "0.30"))   # combined score needed to call
-COMBO_OPP = int(os.getenv("COMBO_OPP", "1"))        # max indicators allowed to vote against
-CONF_MIN = int(os.getenv("CONF_MIN", "3"))          # tally display only
+CALL_MODE = os.getenv("CALL_MODE", "combined")  # "kalshi" restores the old trigger only
+W_CORE = float(os.getenv("W_CORE", "0.5"))  # weight of the existing composite score
+W_VOTE = float(os.getenv("W_VOTE", "0.5"))  # weight of the indicator vote average
+COMBO_MIN = float(os.getenv("COMBO_MIN", "0.30"))  # combined score needed to call
+COMBO_OPP = int(os.getenv("COMBO_OPP", "1"))  # max indicators allowed to vote against
+CONF_MIN = int(os.getenv("CONF_MIN", "3"))  # tally display only
 EMA_DEAD = float(os.getenv("EMA_DEAD", "0.00005"))  # EMA gap as a fraction of price
 MACD_DEAD = float(os.getenv("MACD_DEAD", "0.00002"))
 BB_UP = float(os.getenv("BB_UP", "0.65"))
 BB_DN = float(os.getenv("BB_DN", "0.35"))
 ATR_N = int(os.getenv("ATR_N", "14"))
 ATR_Z = float(os.getenv("ATR_Z", "0.5"))
-CONF_FULL = float(os.getenv("CONF_FULL", "0.6"))      # combined score that counts as full strength
+CONF_FULL = float(os.getenv("CONF_FULL", "0.6"))  # combined score that counts as full strength
 CONF_VOTE_W = float(os.getenv("CONF_VOTE_W", "0.4"))  # weight of badge agreement in confidence
 
 # ---- fast flip settings ----
-FAST_FLIP = int(os.getenv("FAST_FLIP", "1"))                  # 0 turns flips off
-FAST_FLIP_COMB = float(os.getenv("FAST_FLIP_COMB", "0.50"))   # combined score toward the new side
-FAST_FLIP_MOM = float(os.getenv("FAST_FLIP_MOM", "0.60"))     # momentum toward the new side
-FAST_FLIP_CONF = float(os.getenv("FAST_FLIP_CONF", "85"))     # confidence of the new side
-FAST_FLIP_OPP = int(os.getenv("FAST_FLIP_OPP", "0"))          # votes still backing the old call
-FAST_FLIP_HOLD = float(os.getenv("FAST_FLIP_HOLD", "2.0"))    # secs the setup must hold
-FAST_FLIP_AGE = float(os.getenv("FAST_FLIP_AGE", "10"))       # min secs since the last call
-FAST_FLIP_CUTOFF = int(os.getenv("FAST_FLIP_CUTOFF", "30"))   # no flips this close to expiry
-FAST_FLIP_MAX = int(os.getenv("FAST_FLIP_MAX", "2"))          # max flips per window
+FAST_FLIP = int(os.getenv("FAST_FLIP", "1"))  # 0 turns flips off
+FAST_FLIP_COMB = float(os.getenv("FAST_FLIP_COMB", "0.50"))  # combined score toward the new side
+FAST_FLIP_MOM = float(os.getenv("FAST_FLIP_MOM", "0.60"))  # momentum toward the new side
+FAST_FLIP_CONF = float(os.getenv("FAST_FLIP_CONF", "85"))  # confidence of the new side
+FAST_FLIP_OPP = int(os.getenv("FAST_FLIP_OPP", "0"))  # votes still backing the old call
+FAST_FLIP_HOLD = float(os.getenv("FAST_FLIP_HOLD", "2.0"))  # secs the setup must hold
+FAST_FLIP_AGE = float(os.getenv("FAST_FLIP_AGE", "10"))  # min secs since the last call
+FAST_FLIP_CUTOFF = int(os.getenv("FAST_FLIP_CUTOFF", "30"))  # no flips this close to expiry
+FAST_FLIP_MAX = int(os.getenv("FAST_FLIP_MAX", "2"))  # max flips per window
 FAST_FLIP_NEED_MKT = int(os.getenv("FAST_FLIP_NEED_MKT", "0"))  # 1 = Kalshi must also lean the new way
+SELL_FLIP = int(os.getenv("SELL_FLIP", "1"))  # 1 = a SELL signal flips the call to the other side and BUYs it
 
 
 # ---------- state ----------
-
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
@@ -105,7 +104,6 @@ def save_state(s):
 
 
 # ---------- kalshi data ----------
-
 def cents(m, key):
     if m.get(key) is not None:
         return float(m[key])
@@ -142,7 +140,6 @@ def get_market(ticker):
 
 
 # ---------- crypto prices (ETH, BTC) ----------
-
 WEIGHTS = {"ETH": 0.5, "BTC": 0.5}
 DEF_SIG = {"ETH": 1.1e-4, "BTC": 0.9e-4}
 PRICES = {s: deque(maxlen=1200) for s in WEIGHTS}
@@ -194,7 +191,6 @@ def eth_price():
 
 
 # ---------- prediction ----------
-
 def record_price(sym, price):
     if price:
         PRICES[sym].append((time.time(), price))
@@ -358,7 +354,6 @@ def rsi_ok(side, r):
 
 # ---------- indicator votes (EMA 9/21, Bollinger, ATR, MACD) ----------
 # Each returns (vote, text). vote is +1 (UP), -1 (DOWN), 0 (NEUTRAL) or None while warming up.
-
 def vote_ema(p):
     if len(p) < 21:
         return None, "warming up"
@@ -375,7 +370,7 @@ def vote_boll(p, n=20, k=2.0):
     m, sd = statistics.fmean(w), statistics.pstdev(w)
     if sd == 0:
         return 0, "flat"
-    pb = (p[-1] - (m - k * sd)) / (2 * k * sd)   # 0 = lower band, 1 = upper band
+    pb = (p[-1] - (m - k * sd)) / (2 * k * sd)  # 0 = lower band, 1 = upper band
     v = 1 if pb >= BB_UP else -1 if pb <= BB_DN else 0
     return v, f"%B {pb:.2f}"
 
@@ -460,7 +455,8 @@ def side_pct(side, yes):
 
 
 def combo_conf(side, comb, votes):
-    """Confidence 1-99 from the combined score and badge agreement. votes = {name: [vote, text]}."""
+    """Confidence 1-99 from the combined score and badge agreement.
+    votes = {name: [vote, text]}."""
     sgn = 1 if side == "UP" else -1
     vs = [v[0] for v in votes.values() if v[0] is not None]
     agree = sum(v * sgn for v in vs) / len(vs) if vs else 0.0
@@ -481,7 +477,6 @@ def pct_trigger(yes):
 
 
 # ---------- stats ----------
-
 def stats(history):
     n = len(history)
     w = sum(1 for h in history if h["win"])
@@ -489,7 +484,6 @@ def stats(history):
 
 
 # ---------- call labels ----------
-
 def momentum_level(c):
     sg = c.get("sig")
     if not sg:
@@ -507,7 +501,6 @@ def fib_level(c):
 
 
 # ---------- chart ----------
-
 CW, CH = 720, 860
 WHITE = (255, 255, 255, 255)
 MUTED = (160, 168, 178, 255)
@@ -665,6 +658,7 @@ def render_frames(cur, outcome, S, n):
     base.paste(_logo(lg), (int(k(24)), int(k(24))), _logo(lg))
     d.ellipse([k(24), k(24), k(24) + lg, k(24) + lg], outline=(255, 255, 255, 80), width=lw(1.5))
     d.text((k(98), k(54)), "ETH 15 min", font=F(30), fill=WHITE, anchor="lm")
+
     ring = outcome in (None, "settling")
     if outcome == "win":
         btxt, bcol = "WIN", C_UP
@@ -685,7 +679,8 @@ def render_frames(cur, outcome, S, n):
         left = (close_ts - now) if outcome is None else (close_ts + 900 - now)
         frac = max(0.0, min(1.0, left / 900))
         if frac > 0.003:
-            d.arc([cx - r, cy - r, cx + r, cy + r], -90, -90 + 360 * frac, fill=bcol + (255,), width=lw(3))
+            d.arc([cx - r, cy - r, cx + r, cy + r], -90, -90 + 360 * frac,
+                  fill=bcol + (255,), width=lw(3))
         d.text((k(bx0 + 50), k(54)), btxt, font=fb, fill=bcol + (255,), anchor="lm")
     else:
         d.text((k(bx0 + bw / 2), k(54)), btxt, font=fb, fill=bcol + (255,), anchor="mm")
@@ -874,8 +869,8 @@ def render_frames(cur, outcome, S, n):
     cshown = cv if cv is not None else conf
     grey = (90, 96, 108)
     badges = []
-    for key, nm in (("mom", "MOM"), ("fib", "FIB"), ("ema", "EMA"),
-                    ("boll", "BOLL"), ("atr", "ATR"), ("macd", "MACD")):
+    for key, nm in (("mom", "MOM"), ("fib", "FIB"), ("ema", "EMA"), ("boll", "BOLL"),
+                    ("atr", "ATR"), ("macd", "MACD")):
         v = (vt.get(key) or [None])[0]
         bc = C_UP if v == 1 else C_DN if v == -1 else grey
         lab = "UP" if v == 1 else "DOWN" if v == -1 else ("NEUTRAL" if v == 0 else "WAIT")
@@ -972,7 +967,6 @@ def chart_file(cur, outcome=None):
 
 
 # ---------- discord ----------
-
 def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None, pm=None):
     side = c["side"]
     p_up = blend if blend is not None else yes
@@ -980,6 +974,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
     fields = [
         {"name": "All-time", "value": s["all"], "inline": True},
     ]
+
     if side is None:
         mom_now = abs((c.get("sig") or {}).get("mom", 0))
         lines = [
@@ -1002,7 +997,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         if outcome:
             action = tag
         elif c.get("flip_t") and time.time() - c["flip_t"] < 30:
-            action = f"FLIP to {side}"
+            action = f"SELL {c.get('flip_from')} → BUY {side}"
         elif c.get("flipped"):
             action = "SELL"
         elif not c.get("buy_shown"):
@@ -1051,8 +1046,8 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
     vt = (c.get("votes_call") if done else None) or c.get("votes")
     tally = (c.get("tally_call") if done else None) or c.get("tally")
     if vt and tally:
-        names = {"mom": "Momentum", "fib": "Fibonacci", "ema": "EMA 9/21",
-                 "boll": "Bollinger", "atr": "ATR", "macd": "MACD"}
+        names = {"mom": "Momentum", "fib": "Fibonacci", "ema": "EMA 9/21", "boll": "Bollinger",
+                 "atr": "ATR", "macd": "MACD"}
         lab = lambda v: "⚪ WARMING" if v is None else "🟢 UP" if v > 0 else "🔴 DOWN" if v < 0 else "⚪ NEUTRAL"
         lines.append("**Indicators at entry**" if done and c.get("votes_call") else "**Indicators**")
         for key, nm in names.items():
@@ -1084,6 +1079,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
     if price:
         lines.append(f"**Price** ${price:,.2f} (median of {n_ex} exch)")
     lines.append(f"**Strike** {c['strike']:,.2f} | {max(int(secs_left), 0)}s left")
+
     return {
         "title": title,
         "description": "\n".join(lines),
@@ -1105,7 +1101,7 @@ def build_embed(*a, **kw):
         if ln.startswith("**Call:** ⚪ NO CALL"):
             ln = "**Call:** ⚪ NO CALL yet"
         elif ln.startswith("**Call:**"):
-            ln = ln.split(" | ")[0]   # trims the tail; Fibonacci shows in the Signals line instead
+            ln = ln.split(" | ")[0]  # trims the tail; Fibonacci shows in the Signals line instead
         out.append(ln)
     e["description"] = "\n".join(out)
     return e
@@ -1121,7 +1117,7 @@ def send(embed, message_id=None, cur=None, outcome=None, text_only=False):
         f_data = chart_file(cur, outcome)
         embed["image"] = {"url": f"attachment://{f_data[1]}"}
         if message_id:
-            payload["attachments"] = []   # replace the old image only when uploading a new one
+            payload["attachments"] = []  # replace the old image only when uploading a new one
     for _ in range(3):
         kw = {"timeout": 60}
         if f_data:
@@ -1173,7 +1169,6 @@ def send_async(embed, message_id, cur, store=None, text_only=False):
 
 
 # ---------- core ----------
-
 def settle_pending(state):
     for p in list(state["pending"]):
         try:
@@ -1189,7 +1184,8 @@ def settle_pending(state):
             win = (res == "yes") == (p["side"] == "UP")
             state["history"].append({"ticker": p["ticker"], "side": p["side"], "win": win,
                                      "flips": p.get("flips", 0),
-                                     "tilt": (p.get("mkt") or {}).get("tilt"), "sig": p.get("sig")})
+                                     "tilt": (p.get("mkt") or {}).get("tilt"),
+                                     "sig": p.get("sig")})
             state["pending"].remove(p)
             yes_final = 100.0 if res == "yes" else 0.0
             p.setdefault("pts", []).append([900, 100 if res == "yes" else 0])
@@ -1200,11 +1196,29 @@ def settle_pending(state):
             print("settle error", e)
 
 
+def flip_call(cur, new_side, comb, r, fib, elapsed, now, src):
+    """Switch the whole call to new_side and restart it in BUY mode."""
+    cur.setdefault("calls", []).append(
+        {"side": cur["side"], "conf": cur.get("conf"), "at": cur.get("called_at")})
+    cur.update(flip_from=cur["side"], side=new_side,
+               conf=combo_conf(new_side, comb, cur["votes"]),
+               called_at=round(elapsed), src=src,
+               flips=cur.get("flips", 0) + 1, flip_t=now,
+               flipped=False, buy_shown=False,
+               fib_call=round(fib, 2), rsi_call=cur["rsi"],
+               rsi_over=False, fib_over=False,
+               votes_call=copy.deepcopy(cur["votes"]),
+               tally_call=list(cur["tally"]), comb_call=cur["comb"])
+    cur.pop("flip_since", None)
+    cur.pop("ff_t", None)
+
+
 def tick(state):
     settle_pending(state)
     m = open_market()
     cur = state["current"]
     now = time.time()
+
     if cur and (m is None or m["ticker"] != cur["ticker"]):
         state["current"] = None
         if cur["side"] is None:
@@ -1258,7 +1272,6 @@ def tick(state):
     cur["fib"] = fib_lvl
     cur["sig"] = {"mom": round(mom, 2), "fib": round(fib, 2), "trend": round(trend, 2),
                   "prob": round(prob, 2)}
-
     prev_side, prev_flip = cur["side"], cur.get("flipped")
 
     # ---- indicator votes + combined call ----
@@ -1274,8 +1287,7 @@ def tick(state):
     # Momentum and Fibonacci badges: shown and used in confidence, not in the tally or the ready gate
     cur["votes"]["mom"] = [1 if mom >= MOM_MIN else -1 if mom <= -MOM_MIN else 0,
                            f"{mom:+.2f}, {momentum_level(cur)} ({who})"]
-    cur["votes"]["fib"] = [None if fib_lvl is None else
-                           1 if fib >= FIB_AGREE else -1 if fib <= -FIB_AGREE else 0,
+    cur["votes"]["fib"] = [None if fib_lvl is None else 1 if fib >= FIB_AGREE else -1 if fib <= -FIB_AGREE else 0,
                            f"retrace {fib_lvl}% ({fib:+.2f})" if fib_lvl else "forming"]
     cur["comb"] = round(comb, 3)
 
@@ -1283,8 +1295,8 @@ def tick(state):
         sgn = 1 if comb > 0 else -1
         cside = "UP" if sgn > 0 else "DOWN"
         against = sum(1 for v in ready if v == -sgn)
-        good = (abs(comb) >= COMBO_MIN and against <= COMBO_OPP
-                and fib * sgn >= -0.5 and rsi_ok(cside, r))
+        good = (abs(comb) >= COMBO_MIN and against <= COMBO_OPP and fib * sgn >= -0.5
+                and rsi_ok(cside, r))
         if not good:
             cur.pop("comb_dir", None)
         elif cur.get("comb_dir") != cside:
@@ -1308,7 +1320,7 @@ def tick(state):
             fib_agree = fib_ok(fs, fib)
             waited = now - cur["first_t"]
             rsi_pass = rsi_agree or waited >= RSI_GRACE
-            fib_pass = fib_agree   # no timeout: Fibonacci must agree
+            fib_pass = fib_agree  # no timeout: Fibonacci must agree
             if rsi_pass and fib_pass:
                 cur.pop("rsi_block", None)
                 cur.pop("hold_why", None)
@@ -1343,60 +1355,45 @@ def tick(state):
 
     # ---- fast flip: change the call only on very high confidence AND momentum ----
     if (FAST_FLIP and cur["side"] and cur["side"] == prev_side and all_ready
-            and secs_left > FAST_FLIP_CUTOFF
-            and cur.get("flips", 0) < FAST_FLIP_MAX
+            and secs_left > FAST_FLIP_CUTOFF and cur.get("flips", 0) < FAST_FLIP_MAX
             and elapsed - cur.get("called_at", elapsed) >= FAST_FLIP_AGE):
         new_side = "DOWN" if cur["side"] == "UP" else "UP"
         ns = 1 if new_side == "UP" else -1
         backing_old = sum(1 for v in ready if v == -ns)
         new_conf = combo_conf(new_side, comb, cur["votes"])
-        ok = (comb * ns >= FAST_FLIP_COMB
-              and mom * ns >= FAST_FLIP_MOM
-              and new_conf >= FAST_FLIP_CONF
-              and backing_old <= FAST_FLIP_OPP
-              and fib * ns >= FIB_AGREE
-              and rsi_ok(new_side, r)
+        ok = (comb * ns >= FAST_FLIP_COMB and mom * ns >= FAST_FLIP_MOM
+              and new_conf >= FAST_FLIP_CONF and backing_old <= FAST_FLIP_OPP
+              and fib * ns >= FIB_AGREE and rsi_ok(new_side, r)
               and (not FAST_FLIP_NEED_MKT or (yes - 50) * ns > 0))
         if not ok:
             cur.pop("ff_t", None)
         else:
             cur.setdefault("ff_t", now)
             if now - cur["ff_t"] >= FAST_FLIP_HOLD:
-                cur.setdefault("calls", []).append(
-                    {"side": cur["side"], "conf": cur.get("conf"), "at": cur.get("called_at")})
-                cur.update(side=new_side, conf=new_conf, called_at=round(elapsed),
-                           src="FAST_FLIP", flips=cur.get("flips", 0) + 1, flip_t=now,
-                           flipped=False, fib_call=round(fib, 2), rsi_call=cur["rsi"],
-                           rsi_over=False, fib_over=False,
-                           votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
-                           comb_call=cur["comb"])
-                cur.pop("flip_since", None)
-                cur.pop("ff_t", None)
+                flip_call(cur, new_side, comb, r, fib, elapsed, now, "FAST_FLIP")
 
-    # old flip trigger (off while FLIP_SCORE=99)
-    if cur["side"] and not cur.get("flipped"):
-        sgn = 1 if cur["side"] == "UP" else -1
-        if score * sgn < -FLIP_SCORE:
-            cur["flipped"] = True
-
-    # harder SELL trigger
-    if cur["side"] and not cur.get("flipped"):
+    # ---- SELL signals: flip the whole call to the other side and BUY it ----
+    if cur["side"] and cur["side"] == prev_side and not cur.get("flipped"):
         sgn = 1 if cur["side"] == "UP" else -1
         aged = elapsed - cur.get("called_at", elapsed) >= FLIP_MIN_AGE
         market_against = (yes - 50) * sgn < 0  # Kalshi has actually moved to the other side
+        sell = FLIP_SCORE < 99 and score * sgn < -FLIP_SCORE  # old flip trigger (off while FLIP_SCORE=99)
+        # harder SELL trigger: a held reversal in the composite score
         if score * sgn < -FLIP_HARD and aged and market_against:
             cur.setdefault("flip_since", now)
             if now - cur["flip_since"] >= FLIP_HOLD:
-                cur["flipped"] = True
+                sell = True
         else:
             cur.pop("flip_since", None)  # reversal broke, timer resets
-
-    # Fibonacci failed-swing SELL: a deep retrace against the call, with Kalshi also on the other side
-    if cur["side"] and not cur.get("flipped"):
-        sgn = 1 if cur["side"] == "UP" else -1
-        aged = elapsed - cur.get("called_at", elapsed) >= FLIP_MIN_AGE
-        if aged and fib * sgn < -0.7 and (yes - 50) * sgn < 0:
-            cur["flipped"] = True
+        # Fibonacci failed-swing SELL: a deep retrace against the call, with Kalshi also on the other side
+        if aged and fib * sgn < -0.7 and market_against:
+            sell = True
+        if sell:
+            if SELL_FLIP and secs_left > FAST_FLIP_CUTOFF:
+                flip_call(cur, "DOWN" if cur["side"] == "UP" else "UP",
+                          comb, r, fib, elapsed, now, "SELL_FLIP")
+            else:
+                cur["flipped"] = True  # too close to expiry (or SELL_FLIP=0): plain SELL
 
     if cur["side"]:
         cur["live_conf"] = round(combo_conf(cur["side"], comb, cur["votes"]), 1)
@@ -1413,13 +1410,13 @@ def tick(state):
     if cur["side"] and not prev_side:
         ev = f"New call: {cur['side']}"
     elif prev_side and cur["side"] != prev_side:
-        ev = f"Fast flip: {prev_side} → {cur['side']} (call changed, confidence {cur['conf']:.0f}%)"
+        label = "Sell flip" if cur.get("src") == "SELL_FLIP" else "Fast flip"
+        ev = f"{label}: SELL {prev_side} → BUY {cur['side']} (confidence {cur['conf']:.0f}%)"
     elif cur.get("flipped") and not prev_flip:
         ev = "Signal flipped against the call"
     elif old_who and who != old_who and who != "even" and since_post >= MIN_GAP:
         ev = f"Momentum shift: {who} gaining"
     ev = ev or cur.get("pending_ev")
-
     new_due = cur["message_id"] is None or ev is not None or since_post >= NEW_MSG_SECONDS
     edit_due = now - cur.get("last_edit", 0) >= EDIT_SECONDS
     if new_due or edit_due:
