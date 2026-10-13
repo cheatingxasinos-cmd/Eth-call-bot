@@ -73,6 +73,8 @@ BB_UP = float(os.getenv("BB_UP", "0.65"))
 BB_DN = float(os.getenv("BB_DN", "0.35"))
 ATR_N = int(os.getenv("ATR_N", "14"))
 ATR_Z = float(os.getenv("ATR_Z", "0.5"))
+CONF_FULL = float(os.getenv("CONF_FULL", "0.6"))      # combined score that counts as full strength
+CONF_VOTE_W = float(os.getenv("CONF_VOTE_W", "0.4"))  # weight of badge agreement in confidence
 
 
 # ---------- state ----------
@@ -440,6 +442,16 @@ def side_pct(side, yes):
     return max(1.0, pct - 5)
 
 
+def combo_conf(side, comb, votes):
+    """Confidence 1-99 from the combined score and badge agreement. votes = {name: [vote, text]}."""
+    sgn = 1 if side == "UP" else -1
+    vs = [v[0] for v in votes.values() if v[0] is not None]
+    agree = sum(v * sgn for v in vs) / len(vs) if vs else 0.0
+    strength = max(-1.0, min(1.0, comb * sgn / CONF_FULL))
+    x = (1 - CONF_VOTE_W) * strength + CONF_VOTE_W * agree
+    return max(1.0, min(99.0, 50 + 49 * x))
+
+
 def pct_trigger(yes):
     """First side to reach TRIGGER_PCT on Kalshi wins the call. UP = YES %, DOWN = NO %."""
     up = min(max(yes, 1), 99)
@@ -476,7 +488,7 @@ def fib_level(c):
 
 
 # ---------- chart ----------
-CW, CH = 720, 800
+CW, CH = 720, 860
 WHITE = (255, 255, 255, 255)
 MUTED = (160, 168, 178, 255)
 C_UP, C_DN, ORG = (0, 217, 142), (255, 87, 87), (255, 140, 58)
@@ -834,8 +846,49 @@ def render_frames(cur, outcome, S, n):
     d.text((tx, k(610)), l1, font=F(17), fill=WHITE, anchor="lm")
     d.text((k(92), k(634)), l2, font=F(13, False), fill=MUTED, anchor="lm")
 
+    # ---- indicator vote badges + confluence tally + confidence ----
+    done = outcome in ("win", "loss")
+    vt = (cur.get("votes_call") if done else None) or cur.get("votes") or {}
+    tl = (cur.get("tally_call") if done else None) or cur.get("tally")
+    cv = cur.get("live_conf") if outcome is None else None
+    cshown = cv if cv is not None else conf
+    grey = (90, 96, 108)
+    badges = []
+    for key, nm in (("mom", "MOM"), ("fib", "FIB"), ("ema", "EMA"),
+                    ("boll", "BOLL"), ("atr", "ATR"), ("macd", "MACD")):
+        v = (vt.get(key) or [None])[0]
+        bc = C_UP if v == 1 else C_DN if v == -1 else grey
+        lab = "UP" if v == 1 else "DOWN" if v == -1 else ("NEUTRAL" if v == 0 else "WAIT")
+        badges.append((nm, lab, bc, v, bool(v)))
+    if tl and sum(tl) > 0:
+        tu, td = tl[0], tl[1]
+        tv = 1 if tu > td else -1 if td > tu else 0
+        badges.append(("TALLY", f"{tu}U {td}D", C_UP if tv == 1 else C_DN if tv == -1 else grey,
+                       tv, bool(tv)))
+    else:
+        badges.append(("TALLY", "WAIT", grey, None, False))
+    if waiting:
+        badges.append(("CONF", "--", grey, None, False))
+    else:
+        badges.append(("CONF", f"{cshown:.0f}%", col, 1 if is_up else -1, True))
+    gap = 5
+    nb = len(badges)
+    bwn = (720 - 48 - (nb - 1) * gap) / nb
+    for i, (nm, lab, bc, v, solid) in enumerate(badges):
+        x0 = k(24 + i * (bwn + gap))
+        x1 = x0 + k(bwn)
+        y0, y1 = k(662), k(716)
+        d.rounded_rectangle([x0, y0, x1, y1], radius=k(11), fill=bc + (255 if solid else 150,),
+                            outline=(255, 255, 255, 70), width=lw(1.5))
+        if v:
+            _arrow(d, x0 + k(10), (y0 + y1) / 2, v == 1, k(6), (255, 255, 255, 255))
+        d.text(((x0 + x1) / 2 + k(5), y0 + k(18)), nm, font=F(10, False),
+               fill=(255, 255, 255, 215), anchor="mm")
+        d.text(((x0 + x1) / 2 + k(5), y0 + k(38)), lab, font=F(12),
+               fill=(255, 255, 255, 255), anchor="mm")
+
     # ---- buttons ----
-    by0, by1 = k(668), k(772)
+    by0, by1 = k(730), k(834)
     bwd = (720 - 48 - 14) / 2
     for i, (name, pct, bc, up_btn) in enumerate((("Up", up_pct, C_UP, True), ("Down", dn_pct, C_DN, False))):
         x0 = k(24 + i * (bwd + 14))
@@ -847,7 +900,8 @@ def render_frames(cur, outcome, S, n):
                             outline=(ocol + (255,)) if ocol else None, width=lw(3))
         ta = 150 if dim else 255
         _arrow(d, x0 + k(44), (by0 + by1) / 2, up_btn, k(15), (255, 255, 255, ta))
-        d.text(((x0 + x1) / 2 + k(14), by0 + k(38)), f"{name} · {pct:.0f}%", font=F(24),
+        shown_pct = pct if waiting else (cshown if up_btn == is_up else 100 - cshown)
+        d.text(((x0 + x1) / 2 + k(14), by0 + k(38)), f"{name} · {shown_pct:.0f}%", font=F(24),
                fill=(255, 255, 255, ta), anchor="mm")
         d.text(((x0 + x1) / 2 + k(14), by0 + k(74)), f"{100 / max(pct, 1):.2f}x", font=F(16, False),
                fill=(255, 255, 255, 120 if dim else 225), anchor="mm")
@@ -955,7 +1009,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         arrows = " / ".join(f"{sym} {'▲' if z >= 0 else '▼'}" for sym, z in mk["z"].items())
         lines.append(f"**Basket** {arrows} (agreement {mk['breadth'] * 100:.0f}%)")
 
-    # Signals line: Fibonacci (level, score, bias) plus RSI. Momentum stays out of it.
+    # Signals line: Fibonacci (level, score, bias) plus RSI.
     sg = c.get("sig")
     if sg:
         fl = c.get("fib")
@@ -968,16 +1022,19 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         rsi_part = f" | RSI {rs:.0f}" if rs is not None else " | RSI warming up"
         lines.append(f"**Signals** {fib_part}{rsi_part}")
 
-    # Public indicator vote panel (EMA 9/21, Bollinger, ATR, MACD) plus confluence and combined score.
-    # On the settled post it shows the votes frozen at entry.
+    # Public vote panel (Momentum, Fibonacci, EMA 9/21, Bollinger, ATR, MACD) plus confluence
+    # and combined score. On the settled post it shows the votes frozen at entry.
     done = outcome in ("win", "loss")
     vt = (c.get("votes_call") if done else None) or c.get("votes")
     tally = (c.get("tally_call") if done else None) or c.get("tally")
     if vt and tally:
-        names = {"ema": "EMA 9/21", "boll": "Bollinger", "atr": "ATR", "macd": "MACD"}
+        names = {"mom": "Momentum", "fib": "Fibonacci", "ema": "EMA 9/21",
+                 "boll": "Bollinger", "atr": "ATR", "macd": "MACD"}
         lab = lambda v: "⚪ WARMING" if v is None else "🟢 UP" if v > 0 else "🔴 DOWN" if v < 0 else "⚪ NEUTRAL"
         lines.append("**Indicators at entry**" if done and c.get("votes_call") else "**Indicators**")
         for key, nm in names.items():
+            if key not in vt:
+                continue
             v, txt = vt[key]
             lines.append(f"{lab(v)} · **{nm}** {txt}")
         u, d_, n_ = tally
@@ -1187,6 +1244,12 @@ def tick(state):
     comb = W_CORE * score + W_VOTE * vscore
     cur["votes"] = {k: [v, t] for k, (v, t) in votes.items()}
     cur["tally"] = [c_up, c_dn, len(ready) - c_up - c_dn]
+    # Momentum and Fibonacci badges: shown and used in confidence, not in the tally or the ready gate
+    cur["votes"]["mom"] = [1 if mom >= MOM_MIN else -1 if mom <= -MOM_MIN else 0,
+                           f"{mom:+.2f}, {momentum_level(cur)} ({who})"]
+    cur["votes"]["fib"] = [None if fib_lvl is None else
+                           1 if fib >= FIB_AGREE else -1 if fib <= -FIB_AGREE else 0,
+                           f"retrace {fib_lvl}% ({fib:+.2f})" if fib_lvl else "forming"]
     cur["comb"] = round(comb, 3)
 
     if CALL_MODE == "combined" and all_ready and cur["side"] is None and secs_left > CALL_CUTOFF:
@@ -1200,7 +1263,7 @@ def tick(state):
         elif cur.get("comb_dir") != cside:
             cur["comb_dir"], cur["comb_t"] = cside, now
         elif now - cur["comb_t"] >= CONFIRM_SECONDS:
-            cur.update(side=cside, conf=side_pct(cside, yes), locked=True,
+            cur.update(side=cside, conf=combo_conf(cside, comb, cur["votes"]), locked=True,
                        called_at=round(elapsed), src="COMBINED",
                        votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
                        comb_call=cur["comb"])
@@ -1222,7 +1285,7 @@ def tick(state):
             if rsi_pass and fib_pass:
                 cur.pop("rsi_block", None)
                 cur.pop("hold_why", None)
-                cur.update(side=fs, conf=side_pct(fs, yes), locked=True,
+                cur.update(side=fs, conf=combo_conf(fs, comb, cur["votes"]), locked=True,
                            called_at=round(elapsed), src="KALSHI",
                            rsi_call=cur["rsi"], fib_call=round(fib, 2),
                            rsi_over=not rsi_agree, fib_over=not fib_agree,
@@ -1246,8 +1309,10 @@ def tick(state):
             pick = pick_call(score, mom, fib, trend, prob)
             if pick:
                 side, _ = pick
-                cur.update(side=side, conf=side_pct(side, yes), locked=True,
-                           called_at=round(elapsed), src="ETH")
+                cur.update(side=side, conf=combo_conf(side, comb, cur["votes"]), locked=True,
+                           called_at=round(elapsed), src="ETH",
+                           votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
+                           comb_call=cur["comb"])
 
     # old flip trigger (off while FLIP_SCORE=99)
     if cur["side"] and not cur.get("flipped"):
@@ -1275,7 +1340,7 @@ def tick(state):
             cur["flipped"] = True
 
     if cur["side"]:
-        cur["live_conf"] = round(side_pct(cur["side"], yes), 1)
+        cur["live_conf"] = round(combo_conf(cur["side"], comb, cur["votes"]), 1)
 
     cur["price"] = price
     if price:
