@@ -316,6 +316,13 @@ def pick_call(score, mom, fib, trend, prob):
     return ("UP" if sgn > 0 else "DOWN"), 50 + 50 * min(1.0, abs(mom))
 
 
+def side_pct(side, yes):
+    """Button % of the called side (same clamp as the chart), minus 5 points."""
+    up = min(max(yes, 1), 99)
+    pct = up if side == "UP" else 100 - up
+    return max(1.0, pct - 5)
+
+
 # ---------- stats ----------
 def stats(history):
     n = len(history)
@@ -990,8 +997,9 @@ def tick(state):
         if fm and now - fm["t"] >= CONFIRM_SECONDS:
             pick = pick_call(score, mom, fib, trend, prob)
             if pick:
-                side, conf = pick
-                cur.update(side=side, conf=conf, locked=True, called_at=round(elapsed), src="ETH")
+                side, _ = pick
+                cur.update(side=side, conf=side_pct(side, yes), locked=True,
+                           called_at=round(elapsed), src="ETH")
 
     if cur["side"] and not cur.get("flipped"):
         sgn = 1 if cur["side"] == "UP" else -1
@@ -999,10 +1007,7 @@ def tick(state):
             cur["flipped"] = True
 
     if cur["side"]:
-        sgn = 1 if cur["side"] == "UP" else -1
-        # same formula as the entry confidence, but recalculated every tick.
-        # drops below 50 if momentum turns against the call
-        cur["live_conf"] = round(50 + 50 * max(-1.0, min(1.0, mom * sgn)), 1)
+        cur["live_conf"] = round(side_pct(cur["side"], yes), 1)
 
     cur["price"] = price
     if price:
