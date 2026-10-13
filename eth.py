@@ -49,8 +49,7 @@ W_PROB = float(os.getenv("W_PROB", "0.10"))
 RSI_N = int(os.getenv("RSI_N", "14"))
 RSI_BLOCK = float(os.getenv("RSI_BLOCK", "20"))   # UP held if RSI < this, DOWN held if RSI > 100 minus this
 RSI_GRACE = float(os.getenv("RSI_GRACE", "10"))   # max secs RSI can delay the first-to-cross call
-FIB_GRACE = float(os.getenv("FIB_GRACE", "25"))   # max secs Fibonacci can delay the first-to-cross call
-FIB_BLOCK = float(os.getenv("FIB_BLOCK", "0.3"))  # call held if Fibonacci score fights the side harder than this (was 0.5)
+FIB_AGREE = float(os.getenv("FIB_AGREE", "0.15")) # Fibonacci score must be at least this far in the call's direction
 FIB_LEVELS = (0.236, 0.382, 0.5, 0.618, 0.786)
 TRIGGER_PCT = float(os.getenv("TRIGGER_PCT", "50.1"))
 FLIP_HARD = float(os.getenv("FLIP_HARD", "0.45"))
@@ -282,9 +281,9 @@ def fib_signal(prices):
 
 
 def fib_ok(side, f):
-    """True unless the Fibonacci score strongly fights the side."""
+    """True only if the Fibonacci score points the same way as the side."""
     sgn = 1 if side == "UP" else -1
-    return f * sgn >= -FIB_BLOCK
+    return f * sgn >= FIB_AGREE
 
 
 def fib_bias(f):
@@ -898,7 +897,9 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         rsi_part = f" | RSI {rs:.0f}" if rs is not None else " | RSI warming up"
         lines.append(f"**Signals** {fib_part}{rsi_part}")
     if side is None and c.get("rsi_block"):
-        lines.append(f"**Hold** {c['rsi_block']} call waiting on {c.get('hold_why')} (max {max(RSI_GRACE, FIB_GRACE):.0f}s)")
+        why = c.get("hold_why") or ""
+        cap = "" if "Fibonacci" in why else f" (max {RSI_GRACE:.0f}s)"
+        lines.append(f"**Hold** {c['rsi_block']} call waiting on {why}{cap}")
     elif side is not None and c.get("fib_call") is not None:
         over = [n for n, f in (("RSI", c.get("rsi_over")), ("Fibonacci", c.get("fib_over"))) if f]
         if over:
@@ -1085,8 +1086,8 @@ def tick(state):
 
     prev_side, prev_flip = cur["side"], cur.get("flipped")
 
-    # first side to reach TRIGGER_PCT on Kalshi owns the call; RSI and Fibonacci can only delay it
-    # (RSI up to RSI_GRACE seconds, Fibonacci up to FIB_GRACE seconds)
+    # first side to reach TRIGGER_PCT on Kalshi owns the call.
+    # Fibonacci must agree before the call fires (no timeout); RSI can delay it up to RSI_GRACE seconds.
     if cur["side"] is None and secs_left > CALL_CUTOFF:
         if not cur.get("first_side"):
             fs0 = pct_trigger(yes)
@@ -1098,7 +1099,7 @@ def tick(state):
             fib_agree = fib_ok(fs, fib)
             waited = now - cur["first_t"]
             rsi_pass = rsi_agree or waited >= RSI_GRACE
-            fib_pass = fib_agree or waited >= FIB_GRACE
+            fib_pass = fib_agree   # no timeout: Fibonacci must agree
             if rsi_pass and fib_pass:
                 cur.pop("rsi_block", None)
                 cur.pop("hold_why", None)
