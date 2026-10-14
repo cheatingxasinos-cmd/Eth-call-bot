@@ -23,13 +23,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install requests pillow
+      - run: pip install requests pillow websocket-client cryptography
 
       - name: Run bot
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RUN_SECONDS: "20700"
-          POLL_SECONDS: "10"
+          POLL_SECONDS: "1"
         run: python eth.py
 
       - name: Save stats
