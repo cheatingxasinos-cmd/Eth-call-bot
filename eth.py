@@ -1,17 +1,11 @@
-import base64
-import copy
-import functools
-import io
-import json
-import math
-import os
-import random
-import statistics
-import sys
-import threading
-import time
+"""Kalshi ETH 15m signal bot v2 (single file).
+  python bot.py                 live
+  python bot.py replay FILE     backtest recorded ticks (no Discord)
+  python bot.py report [STATE]  ROI, calibration, baselines
+"""
+import base64, functools, io, json, logging, math, multiprocessing, os, random, statistics, sys, threading, time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -21,7 +15,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 try:
     import websocket
 except ImportError:
-    sys.exit("Missing package. Run: pip install websocket-client cryptography requests pillow")
+    websocket = None
 
 try:
     from zoneinfo import ZoneInfo
@@ -29,120 +23,127 @@ try:
 except Exception:
     CHART_TZ = timezone.utc
 
-WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
-SERIES = os.getenv("KALSHI_SERIES", "KXETH15M")
+log = logging.getLogger("bot")
+
+
+# ======================================================================
+# CONFIG (every value overridable by env var)
+# ======================================================================
+def _e(name, default):
+    v = os.getenv(name)
+    if v is None:
+        return default
+    if isinstance(default, int):
+        return int(float(v))
+    if isinstance(default, float):
+        return float(v)
+    return v
+
+
+class C:
+    webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
+    series = _e("KALSHI_SERIES", "KXETH15M")
+    poll = _e("POLL_SECONDS", 0.5)
+    edit_s = _e("EDIT_SECONDS", 1.0)
+    img_s = _e("IMG_SECONDS", 1.0)
+    new_msg_s = _e("NEW_MSG_SECONDS", 30.0)
+    run_s = _e("RUN_SECONDS", 345 * 60)
+    save_s = _e("SAVE_SECONDS", 2.0)
+    state_file = _e("STATE_FILE", "state.json")
+    windows_file = _e("WINDOWS_FILE", "windows.jsonl")
+    tick_file = _e("TICK_FILE", "ticks.jsonl")
+    record = _e("RECORD", 1)
+    stale_s = _e("STALE_SECONDS", 5.0)
+    wide_spread = _e("WIDE_SPREAD", 10.0)
+    abstain = _e("ABSTAIN", 0.04)
+    instant = _e("INSTANT_CALL", 1)
+    call_cutoff = max(_e("CALL_CUTOFF", 60), 60)
+    confirm_s = _e("CONFIRM_SECONDS", 3.0)
+    lock_pm = _e("LOCK_PM", 55.0)
+    tilt_w = _e("TILT_W", 0.25)
+    mom_min = _e("MOM_MIN", 0.10)
+    fib_agree = _e("FIB_AGREE", 0.15)
+    rsi_n = _e("RSI_N", 14)
+    rsi_block = _e("RSI_BLOCK", 20.0)
+    combo_min = _e("COMBO_MIN", 0.40)
+    combo_opp = _e("COMBO_OPP", 0)
+    conf_full = _e("CONF_FULL", 0.6)
+    conf_vote_w = _e("CONF_VOTE_W", 0.4)
+    ema_dead = _e("EMA_DEAD", 0.00005)
+    macd_dead = _e("MACD_DEAD", 0.00002)
+    bb_up = _e("BB_UP", 0.65)
+    bb_dn = _e("BB_DN", 0.35)
+    atr_n = _e("ATR_N", 14)
+    atr_z = _e("ATR_Z", 0.5)
+    w_market = _e("W_MARKET", 0.5)
+    w_market_final = _e("W_MARKET_FINAL", 0.35)
+    w_core = _e("W_CORE", 0.5)
+    w_vote = _e("W_VOTE", 0.5)
+    w_mom, w_rsi = _e("W_MOM", 0.35), _e("W_RSI", 0.10)
+    w_fib, w_trend, w_prob = _e("W_FIB", 0.35), _e("W_TREND", 0.10), _e("W_PROB", 0.10)
+    w_i_pm, w_i_mkt, w_i_mom = _e("W_I_PM", 0.25), _e("W_I_MKT", 0.25), _e("W_I_MOM", 0.20)
+    w_i_trend, w_i_fib, w_i_comb = _e("W_I_TREND", 0.15), _e("W_I_FIB", 0.10), _e("W_I_COMB", 0.05)
+    final_call_pct = _e("FINAL_CALL_PCT", 70.0)
+    final_hold = _e("FINAL_HOLD", 2.0)
+    final_cutoff = _e("FINAL_CUTOFF", 5)
+    dash_port = _e("DASH_PORT", 8000)
+    dash_hz = _e("DASH_HZ", 30.0)
+    kalshi_poll = _e("KALSHI_POLL", 0.5)
+    key_id = os.getenv("KALSHI_KEY_ID")
+    key_path = os.getenv("KALSHI_KEY_PATH")
+    logo_path = os.getenv("LOGO_PATH", "eth_logo.png")
+    live_scale = _e("LIVE_SCALE", 1.0)
+    final_scale = _e("FINAL_SCALE", 3.0)
+    max_bytes = int(_e("MAX_MB", 7.5) * 1024 * 1024)
+    live_frames = _e("LIVE_FRAMES", 4)
+    timer_lead = _e("TIMER_LEAD", 0.7)
+
+
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
-POLL = float(os.getenv("POLL_SECONDS", "0.5"))
-EDIT_SECONDS = float(os.getenv("EDIT_SECONDS", "1"))
-IMG_SECONDS = float(os.getenv("IMG_SECONDS", "1"))
-NEW_MSG_SECONDS = float(os.getenv("NEW_MSG_SECONDS", "30"))
-MIN_GAP = float(os.getenv("MIN_GAP", "99999"))  # momentum-shift posts off by default
-RUN_SECONDS = int(os.getenv("RUN_SECONDS", str(345 * 60)))
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
-GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
-W_MARKET = float(os.getenv("W_MARKET", "0.5"))
-FINAL_SECONDS = 60  # Kalshi settles on the average of the last 60s
-CALL_CUTOFF = max(int(os.getenv("CALL_CUTOFF", "60")), FINAL_SECONDS)
-TILT_W = float(os.getenv("TILT_W", "0.25"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "0.22"))
-MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))
-FLIP_SCORE = float(os.getenv("FLIP_SCORE", "99"))
-CALL_AFTER = int(os.getenv("CALL_AFTER", "99999"))
-CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "3"))   # LOCK: was 1.5
-W_MOM = float(os.getenv("W_MOM", "0.35"))
-W_RSI = float(os.getenv("W_RSI", "0.10"))
-W_FIB = float(os.getenv("W_FIB", "0.35"))
-W_TREND = float(os.getenv("W_TREND", "0.10"))
-W_PROB = float(os.getenv("W_PROB", "0.10"))
-RSI_N = int(os.getenv("RSI_N", "14"))
-RSI_BLOCK = float(os.getenv("RSI_BLOCK", "20"))
-RSI_GRACE = float(os.getenv("RSI_GRACE", "10"))
-FIB_AGREE = float(os.getenv("FIB_AGREE", "0.15"))
+FINAL_SECONDS = 60
 FIB_LEVELS = (0.236, 0.382, 0.5, 0.618, 0.786)
-TRIGGER_PCT = float(os.getenv("TRIGGER_PCT", "50.1"))
-FLIP_HARD = float(os.getenv("FLIP_HARD", "0.45"))
-FLIP_HOLD = float(os.getenv("FLIP_HOLD", "8"))
-FLIP_MIN_AGE = float(os.getenv("FLIP_MIN_AGE", "20"))
-LOGO_PATH = os.getenv("LOGO_PATH", "eth_logo.png")
-LIVE_SCALE = float(os.getenv("LIVE_SCALE", "1.0"))
-FINAL_SCALE = float(os.getenv("FINAL_SCALE", "3"))
-MAX_BYTES = int(float(os.getenv("MAX_MB", "7.5")) * 1024 * 1024)
-LIVE_FRAMES = int(os.getenv("LIVE_FRAMES", "4"))      # LIVE: fewer frames, faster render
-TIMER_LEAD = float(os.getenv("TIMER_LEAD", "0.7"))    # LIVE: clock shows the time Discord will display
+GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
 
-# ---- combined call settings ----
-CALL_MODE = os.getenv("CALL_MODE", "combined")
-W_CORE = float(os.getenv("W_CORE", "0.5"))
-W_VOTE = float(os.getenv("W_VOTE", "0.5"))
-COMBO_MIN = float(os.getenv("COMBO_MIN", "0.40"))            # LOCK: was 0.30
-COMBO_OPP = int(os.getenv("COMBO_OPP", "0"))                 # LOCK: was 1
-CONF_MIN = int(os.getenv("CONF_MIN", "3"))
-EMA_DEAD = float(os.getenv("EMA_DEAD", "0.00005"))
-MACD_DEAD = float(os.getenv("MACD_DEAD", "0.00002"))
-BB_UP = float(os.getenv("BB_UP", "0.65"))
-BB_DN = float(os.getenv("BB_DN", "0.35"))
-ATR_N = int(os.getenv("ATR_N", "14"))
-ATR_Z = float(os.getenv("ATR_Z", "0.5"))
-CONF_FULL = float(os.getenv("CONF_FULL", "0.6"))
-CONF_VOTE_W = float(os.getenv("CONF_VOTE_W", "0.4"))
-
-# ---- fast flip settings (now unused: SELL uses the call trigger) ----
-FAST_FLIP = int(os.getenv("FAST_FLIP", "1"))
-FAST_FLIP_COMB = float(os.getenv("FAST_FLIP_COMB", "0.50"))
-FAST_FLIP_MOM = float(os.getenv("FAST_FLIP_MOM", "0.60"))
-FAST_FLIP_CONF = float(os.getenv("FAST_FLIP_CONF", "85"))
-FAST_FLIP_OPP = int(os.getenv("FAST_FLIP_OPP", "0"))
-FAST_FLIP_HOLD = float(os.getenv("FAST_FLIP_HOLD", "2.0"))
-FAST_FLIP_AGE = float(os.getenv("FAST_FLIP_AGE", "10"))
-FAST_FLIP_CUTOFF = int(os.getenv("FAST_FLIP_CUTOFF", "30"))
-FAST_FLIP_MAX = int(os.getenv("FAST_FLIP_MAX", "2"))
-FAST_FLIP_NEED_MKT = int(os.getenv("FAST_FLIP_NEED_MKT", "0"))
-SELL_FLIP = int(os.getenv("SELL_FLIP", "1"))
-SELL_CUTOFF = int(os.getenv("SELL_CUTOFF", "10"))
-
-# ---- reversal flip settings ----
-REV_FLIP = int(os.getenv("REV_FLIP", "1"))
-REV_MKT = float(os.getenv("REV_MKT", "60"))
-REV_PM = float(os.getenv("REV_PM", "65"))
-REV_HOLD = float(os.getenv("REV_HOLD", "3"))
-REV_MAX = int(os.getenv("REV_MAX", "0"))                     # LOCK: was 3 (0 = no flips)
-
-# ---- lock settings ----
-LOCK_CALL = int(os.getenv("LOCK_CALL", "1"))                 # LOCK: 1 = call is final, no flips
-LOCK_PM = float(os.getenv("LOCK_PM", "55"))                  # LOCK: strike model must back the side by this %
-
-# ---- instant call settings ----
-INSTANT_CALL = int(os.getenv("INSTANT_CALL", "1"))           # INSTANT: 1 = call on the first tick of every window
-W_I_PM = float(os.getenv("W_I_PM", "0.25"))                  # INSTANT: strike/settlement model
-W_I_MKT = float(os.getenv("W_I_MKT", "0.25"))                # INSTANT: Kalshi YES price
-W_I_MOM = float(os.getenv("W_I_MOM", "0.20"))                # INSTANT: tape momentum
-W_I_TREND = float(os.getenv("W_I_TREND", "0.15"))            # INSTANT: EMA3/8 + BTC/ETH basket tilt
-W_I_FIB = float(os.getenv("W_I_FIB", "0.10"))                # INSTANT: fib swing
-W_I_COMB = float(os.getenv("W_I_COMB", "0.05"))              # INSTANT: combined indicator score
-
-# ---- last-minute settlement settings ----
-W_MARKET_FINAL = float(os.getenv("W_MARKET_FINAL", "0.35"))
-FINAL_CALL_PCT = float(os.getenv("FINAL_CALL_PCT", "70"))
-FINAL_FLIP_PCT = float(os.getenv("FINAL_FLIP_PCT", "80"))
-FINAL_HOLD = float(os.getenv("FINAL_HOLD", "2.0"))
-FINAL_CUTOFF = int(os.getenv("FINAL_CUTOFF", "5"))
+LOCK = threading.RLock()
+SEND_LOCK = threading.Lock()
+CLOCK = {"t": None}
 
 
-# ---------- state ----------
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"history": [], "current": None, "pending": []}
+def now():
+    return CLOCK["t"] if CLOCK["t"] is not None else time.time()
 
 
-def save_state(s):
-    s["history"] = s["history"][-500:]
-    with open(STATE_FILE, "w") as f:
-        json.dump(s, f, indent=1)
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
 
-# ---------- kalshi data ----------
+# ======================================================================
+# KALSHI HELPERS
+# ======================================================================
+SESSION = requests.Session()
+
+
+def kget(path, **params):
+    r = SESSION.get(KALSHI + path, params=params or None, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def ts(iso):
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def fetch_open_market():
+    ms = kget("/markets", series_ticker=C.series, status="open", limit=20).get("markets", [])
+    t = time.time()
+    ms = [m for m in ms if ts(m["close_time"]) > t]
+    return min(ms, key=lambda m: ts(m["close_time"])) if ms else None
+
+
+def fetch_market(ticker):
+    return kget(f"/markets/{ticker}")["market"]
+
+
 def cents(m, key):
     if m.get(key) is not None:
         return float(m[key])
@@ -151,99 +152,299 @@ def cents(m, key):
     return None
 
 
-def yes_pct(m):
-    bid, ask = cents(m, "yes_bid"), cents(m, "yes_ask")
+def quote(m):
+    """Mid price, falling back to the last trade when the spread is wide."""
+    bid, ask, last = cents(m, "yes_bid"), cents(m, "yes_ask"), cents(m, "last_price")
     if bid is not None and ask is not None and ask > 0:
-        return (bid + ask) / 2
-    last = cents(m, "last_price")
-    return last if last is not None else 50.0
+        mid, spread = (bid + ask) / 2, ask - bid
+        if spread > C.wide_spread and last is not None:
+            mid = clamp(last, bid, ask)
+        return {"yes": mid, "bid": bid, "ask": ask, "spread": spread}
+    return {"yes": last if last is not None else 50.0, "bid": None, "ask": None, "spread": None}
 
 
-def ts(iso):
-    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+def entry_price(q, side):
+    """What a buyer actually pays, in cents."""
+    if side == "UP":
+        return q["ask"] if q["ask"] is not None else q["yes"]
+    return 100 - q["bid"] if q["bid"] is not None else 100 - q["yes"]
 
 
-def open_market():
-    r = requests.get(f"{KALSHI}/markets",
-                     params={"series_ticker": SERIES, "status": "open", "limit": 20}, timeout=10)
-    r.raise_for_status()
-    now = time.time()
-    ms = [m for m in r.json().get("markets", []) if ts(m["close_time"]) > now]
-    return min(ms, key=lambda m: ts(m["close_time"])) if ms else None
+# ======================================================================
+# LIVE FEEDS
+# ======================================================================
+QUOTE_KEYS = ("yes_bid", "yes_ask", "yes_bid_dollars", "yes_ask_dollars",
+              "last_price", "last_price_dollars")
 
 
-def get_market(ticker):
-    r = requests.get(f"{KALSHI}/markets/{ticker}", timeout=10)
-    r.raise_for_status()
-    return r.json()["market"]
+def run_ws(name, url, on_open, on_msg, headers=None, holder=None):
+    def loop():
+        backoff = 1
+        while True:
+            t0 = time.time()
+            try:
+                ws = websocket.WebSocketApp(
+                    url, header=headers() if headers else None, on_open=on_open,
+                    on_message=on_msg, on_error=lambda w, e: log.warning("%s error: %s", name, e))
+                if holder is not None:
+                    holder["ws"] = ws
+                ws.run_forever(ping_interval=15, ping_timeout=8)
+            except Exception:
+                log.exception("%s crashed", name)
+            backoff = 1 if time.time() - t0 > 30 else min(backoff * 2, 30)
+            time.sleep(backoff)
+    threading.Thread(target=loop, daemon=True).start()
 
 
-# ---------- crypto prices (ETH, BTC) ----------
+class LiveFeed:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.m, self.t, self.ws_t = None, 0.0, 0.0
+        self.latest = {}
+
+    def market(self):
+        with self.lock:
+            m, t = self.m, self.t
+        if m and ts(m["close_time"]) > time.time():
+            return m, time.time() - t
+        return None, 0.0
+
+    def ticker(self):
+        with self.lock:
+            return self.m["ticker"] if self.m else None
+
+    def result(self, ticker):
+        r = fetch_market(ticker).get("result")
+        return r if r in ("yes", "no") else None
+
+    def apply_rest(self, m):
+        with self.lock:
+            old = self.m
+            if old and old["ticker"] == m["ticker"] and time.time() - self.ws_t < 3:
+                for k in QUOTE_KEYS:       # websocket is fresher: keep its quotes
+                    if k in old:
+                        m[k] = old[k]
+                    else:
+                        m.pop(k, None)
+            self.m, self.t = m, time.time()
+
+    def apply_ws(self, d):
+        with self.lock:
+            if not self.m:
+                return
+            cur = dict(self.m)
+            for base in ("yes_bid", "yes_ask"):
+                if base in d or base + "_dollars" in d:
+                    cur.pop(base, None)
+                    cur.pop(base + "_dollars", None)
+                    for k in (base, base + "_dollars"):
+                        if k in d:
+                            cur[k] = d[k]
+            if "price" in d:
+                cur["last_price"] = d["price"]
+                cur.pop("last_price_dollars", None)
+            self.m, self.t, self.ws_t = cur, time.time(), time.time()
+
+    def rest_loop(self):
+        m, fails = None, 0
+        while True:
+            t0 = time.time()
+            try:
+                if m is None or ts(m["close_time"]) <= t0:
+                    m = fetch_open_market()
+                if m:
+                    m = {**m, **fetch_market(m["ticker"])}
+                    self.apply_rest(dict(m))
+                fails = 0
+            except Exception as e:
+                fails += 1
+                log.warning("kalshi rest error: %s", e)
+            period = 1.0 if C.key_id else C.kalshi_poll
+            wait = min(30.0, period * 2 ** fails) if fails else period
+            time.sleep(max(0.0, wait - (time.time() - t0)))
+
+    def prices(self):
+        t, out = time.time(), {}
+        for sym in ("ETH", "BTC"):
+            v = [p for (s, _), (p, ts_) in list(self.latest.items()) if s == sym and t - ts_ < 5]
+            if len(v) >= 3:
+                med = statistics.median(v)
+                v = [p for p in v if abs(p / med - 1) < 0.005]   # drop outlier exchange
+            out[sym] = (statistics.median(v), len(v)) if v else (None, 0)
+        return out
+
+    def start_price_feeds(self):
+        L = self.latest
+
+        def cb_open(ws):
+            ws.send(json.dumps({"type": "subscribe", "product_ids": ["ETH-USD", "BTC-USD"],
+                                "channels": ["ticker"]}))
+
+        def cb_msg(ws, m):
+            try:
+                d = json.loads(m)
+                if d.get("type") == "ticker" and d.get("price"):
+                    L[(d["product_id"][:3], "cb")] = (float(d["price"]), time.time())
+            except Exception:
+                pass
+
+        def kr_open(ws):
+            ws.send(json.dumps({"method": "subscribe", "params": {
+                "channel": "ticker", "symbol": ["ETH/USD", "BTC/USD"]}}))
+
+        def kr_msg(ws, m):
+            try:
+                d = json.loads(m)
+                if d.get("channel") == "ticker":
+                    for x in d.get("data", []):
+                        L[(x["symbol"].split("/")[0], "kr")] = (float(x["last"]), time.time())
+            except Exception:
+                pass
+
+        def bs_open(ws):
+            for p in ("ethusd", "btcusd"):
+                ws.send(json.dumps({"event": "bts:subscribe", "data": {"channel": f"live_trades_{p}"}}))
+
+        def bs_msg(ws, m):
+            try:
+                d = json.loads(m)
+                if d.get("event") == "trade":
+                    sym = d["channel"].replace("live_trades_", "")[:3].upper()
+                    L[(sym, "bs")] = (float(d["data"]["price"]), time.time())
+            except Exception:
+                pass
+
+        run_ws("coinbase", "wss://ws-feed.exchange.coinbase.com", cb_open, cb_msg)
+        run_ws("kraken", "wss://ws.kraken.com/v2", kr_open, kr_msg)
+        run_ws("bitstamp", "wss://ws.bitstamp.net", bs_open, bs_msg)
+
+    def start_kalshi_ws(self):
+        sub, holder = {"tk": None}, {}
+
+        def headers():
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import padding
+            path = "/trade-api/ws/v2"
+            with open(C.key_path, "rb") as f:
+                key = serialization.load_pem_private_key(f.read(), password=None)
+            t = str(int(time.time() * 1000))
+            sig = key.sign((t + "GET" + path).encode(),
+                           padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                                       salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
+            return {"KALSHI-ACCESS-KEY": C.key_id, "KALSHI-ACCESS-TIMESTAMP": t,
+                    "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode()}
+
+        def on_open(ws):
+            tk = self.ticker()
+            if tk:
+                sub["tk"] = tk
+                ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": {
+                    "channels": ["ticker"], "market_tickers": [tk]}}))
+
+        def on_msg(ws, raw):
+            try:
+                msg = json.loads(raw)
+                if msg.get("type") == "ticker":
+                    self.apply_ws(msg.get("msg", {}))
+            except Exception:
+                log.exception("kalshi ws message")
+
+        def watcher():                      # resubscribe at window rollover
+            while True:
+                time.sleep(1)
+                ws, tk = holder.get("ws"), self.ticker()
+                if ws and tk and sub["tk"] and tk != sub["tk"]:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+
+        while self.ticker() is None:
+            time.sleep(0.2)
+        run_ws("kalshi", "wss://api.elections.kalshi.com/trade-api/ws/v2",
+               on_open, on_msg, headers=headers, holder=holder)
+        threading.Thread(target=watcher, daemon=True).start()
+
+
+class ReplayFeed:
+    def __init__(self, path):
+        with open(path) as f:
+            self.rows = [json.loads(x) for x in f if x.strip()]
+        self.row = None
+        self.results = {}
+        by = {}
+        for r in self.rows:
+            by.setdefault(r["m"]["ticker"], []).append(r)
+        for tk, rs in by.items():
+            m = rs[0]["m"]
+            close = ts(m["close_time"])
+            strike = float(m.get("floor_strike") or m.get("cap_strike") or 0)
+            v = [r["px"]["ETH"][0] for r in rs
+                 if close - 60 <= r["t"] <= close and r["px"].get("ETH") and r["px"]["ETH"][0]]
+            if v and strike:
+                self.results[tk] = "yes" if statistics.fmean(v) >= strike else "no"
+
+    def step(self, row):
+        self.row = row
+        CLOCK["t"] = row["t"]
+
+    def market(self):
+        m = self.row["m"]
+        return (m, 0.0) if ts(m["close_time"]) > now() else (None, 0.0)
+
+    def prices(self):
+        return {s: (v[0], v[1]) for s, v in self.row["px"].items()}
+
+    def result(self, ticker):
+        return self.results.get(ticker) if now() > ts(self.row["m"]["close_time"]) else None
+
+
+class Recorder:
+    KEYS = ("ticker", "close_time", "floor_strike", "cap_strike", "yes_bid", "yes_ask",
+            "yes_bid_dollars", "yes_ask_dollars", "last_price", "last_price_dollars")
+
+    def __init__(self, path):
+        self.f, self.last = open(path, "a", buffering=1 << 16), 0.0
+
+    def write(self, m, px):
+        row = {"t": round(now(), 3), "m": {k: m[k] for k in self.KEYS if k in m},
+               "px": {s: [p, n] for s, (p, n) in px.items()}}
+        self.f.write(json.dumps(row, separators=(",", ":")) + "\n")
+        if time.time() - self.last > 5:
+            self.f.flush()
+            self.last = time.time()
+
+
+REC = None
+
+
+# ======================================================================
+# PRICE HISTORY AND MATH
+# ======================================================================
+PRICES = {s: deque(maxlen=6000) for s in ("ETH", "BTC")}
 WEIGHTS = {"ETH": 0.5, "BTC": 0.5}
 DEF_SIG = {"ETH": 1.1e-4, "BTC": 0.9e-4}
-PRICES = {s: deque(maxlen=4000) for s in WEIGHTS}
 
 
-def _cb(pair):
-    return float(requests.get(f"https://api.coinbase.com/v2/prices/{pair}/spot",
-                              timeout=5).json()["data"]["amount"])
-
-
-def _kr(pair):
-    r = requests.get("https://api.kraken.com/0/public/Ticker",
-                     params={"pair": pair}, timeout=5).json()["result"]
-    return float(next(iter(r.values()))["c"][0])
-
-
-def _bs(pair):
-    return float(requests.get(f"https://www.bitstamp.net/api/v2/ticker/{pair}/",
-                              timeout=5).json()["last"])
-
-
-SOURCES = {
-    "ETH": [(_cb, "ETH-USD"), (_kr, "ETHUSD"), (_bs, "ethusd")],
-    "BTC": [(_cb, "BTC-USD"), (_kr, "XBTUSD"), (_bs, "btcusd")],
-}
-
-
-def _safe(job):
-    sym, fn, pair = job
-    try:
-        return sym, fn(pair)
-    except Exception:
-        return sym, None
-
-
-def all_prices():
-    """{sym: (median_price, n_exchanges)}; (None, 0) if every source failed."""
-    jobs = [(s, fn, pair) for s, srcs in SOURCES.items() for fn, pair in srcs]
-    got = {s: [] for s in SOURCES}
-    with ThreadPoolExecutor(len(jobs)) as ex:
-        for sym, p in ex.map(_safe, jobs):
-            if p:
-                got[sym].append(p)
-    return {s: ((statistics.median(v), len(v)) if v else (None, 0)) for s, v in got.items()}
-
-
-def eth_price():
-    return all_prices()["ETH"]
-
-
-# ---------- prediction ----------
 def record_price(sym, price):
-    if price:
-        PRICES[sym].append((time.time(), price))
+    """Store only changes, so held quotes do not fake zero returns."""
+    d = PRICES[sym]
+    if price and (not d or d[-1][1] != price):
+        d.append((now(), price))
+
+
+def norm_cdf(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 
 def series_10s(sym="ETH", n=90, step=10):
-    """Resample the price history to a 10s grid, so signal windows keep their meaning."""
     pts = list(PRICES[sym])
     if not pts:
         return []
-    now = pts[-1][0]
+    end = now()
     out, j, last = [], 0, None
     for i in range(n):
-        tgt = now - step * (n - 1 - i)
+        tgt = end - step * (n - 1 - i)
         while j < len(pts) and pts[j][0] <= tgt:
             last = pts[j][1]
             j += 1
@@ -252,29 +453,22 @@ def series_10s(sym="ETH", n=90, step=10):
     return out
 
 
-def norm_cdf(x):
-    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
-
-
 def vol(sym):
     pts = list(PRICES[sym])
-    rets = []
-    for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
-        dt = t1 - t0
-        if dt > 0.5:
-            rets.append(math.log(p1 / p0) / math.sqrt(dt))
+    rets = [math.log(p1 / p0) / math.sqrt(t1 - t0)
+            for (t0, p0), (t1, p1) in zip(pts, pts[1:]) if t1 - t0 > 0.05]
     base = DEF_SIG[sym]
     if len(rets) < 8:
         return base
     s = math.sqrt(sum(r * r for r in rets) / len(rets))
-    return max(base * 0.4, min(s, base * 4))
+    return clamp(s, base * 0.4, base * 4)
 
 
 def z60(sym):
     pts = list(PRICES[sym])
     if len(pts) < 2:
         return 0.0
-    t_now, p_now = pts[-1]
+    t_now, p_now = now(), pts[-1][1]
     old = [x for x in pts if t_now - x[0] >= 60]
     if not old:
         return 0.0
@@ -289,120 +483,108 @@ def z_open(sym, price, open_px, since_open):
 
 
 def market_signal(prices, opens, since_open):
-    """Returns (tilt, breadth, per-coin z). Positive tilt = basket pulling ETH up."""
     zs = {}
     for s in WEIGHTS:
         z = 0.6 * z60(s) + 0.4 * z_open(s, prices.get(s), opens.get(s), since_open)
-        zs[s] = max(-3.0, min(3.0, z))
+        zs[s] = clamp(z, -3.0, 3.0)
     basket = sum(WEIGHTS[s] * zs[s] for s in WEIGHTS)
     agree = sum(WEIGHTS[s] * (0 if abs(zs[s]) < 0.15 else (1 if zs[s] > 0 else -1)) for s in WEIGHTS)
     breadth = abs(agree) / sum(WEIGHTS.values())
     return basket * (0.5 + 0.5 * breadth), breadth, zs
 
 
-def window_avg(sym, close_ts, now):
-    """Time-weighted sum and seconds of price already inside the final 60s window."""
-    start, end = close_ts - FINAL_SECONDS, min(now, close_ts)
+def window_avg(sym, close_ts, t):
+    """Time-weighted sum and seconds already inside the final 60s window."""
+    start, end = close_ts - FINAL_SECONDS, min(t, close_ts)
     pts = list(PRICES[sym])
     if end <= start or not pts:
         return 0.0, 0.0
     px, inside = None, []
-    for t, p in pts:
-        if t <= start:
+    for tt, p in pts:
+        if tt <= start:
             px = p
-        elif t <= end:
-            inside.append((t, p))
+        elif tt <= end:
+            inside.append((tt, p))
     if px is None:
         px = inside[0][1] if inside else pts[-1][1]
     total, t0 = 0.0, start
-    for t, p in inside:
-        total += px * (t - t0)
-        t0, px = t, p
+    for tt, p in inside:
+        total += px * (tt - t0)
+        t0, px = tt, p
     total += px * (end - t0)
     return total, end - start
 
 
-def settle_stats(price, strike, close_ts, now, tilt=0.0):
-    """Odds that the 60s average finishes >= strike. Locked-in seconds carry no risk."""
+def settle_stats(price, strike, close_ts, t, tilt=0.0):
+    """Odds that the 60s average finishes at or above strike."""
     if not price or not strike:
         return None
-    tau0 = max(close_ts - now, 0.0)
-    total, e = window_avg("ETH", close_ts, now)
+    tau0 = max(close_ts - t, 0.0)
+    total, e = window_avg("ETH", close_ts, t)
     rem = min(tau0, float(FINAL_SECONDS))
     a, b = max(tau0 - FINAL_SECONDS, 0.0), tau0
     exp_avg = (total + price * rem) / FINAL_SECONDS
     V = -(b ** 3 - a ** 3) / 6 - a * a * (b - a) / 2 + b * (b * b - a * a) / 2
     std = price * vol("ETH") * math.sqrt(max(V, 0.0)) / FINAL_SECONDS
     fade = min(1.0, math.sqrt(tau0 / 300)) * rem / FINAL_SECONDS
-    shift = TILT_W * max(-3.0, min(3.0, tilt)) * fade
+    shift = C.tilt_w * clamp(tilt, -3.0, 3.0) * fade
     if std <= 1e-9:
         pm = 99.0 if exp_avg >= strike else 1.0
     else:
-        pm = max(1.0, min(99.0, norm_cdf((exp_avg - strike) / std + shift) * 100))
+        pm = clamp(norm_cdf((exp_avg - strike) / std + shift) * 100, 1.0, 99.0)
     return {"pm": pm, "exp_avg": exp_avg, "std": std, "rem": rem,
             "obs_avg": (total / e) if e > 1 else None,
             "need": ((strike * FINAL_SECONDS - total) / rem) if rem > 0.5 else None}
 
 
-def predict(yes_mkt, ss, secs_left):
+def predict(yes, ss, secs_left):
     if ss is None:
-        return yes_mkt, None
-    w = W_MARKET_FINAL if secs_left <= FINAL_SECONDS else W_MARKET
-    return w * yes_mkt + (1 - w) * ss["pm"], ss["pm"]
+        return yes, None
+    w = C.w_market_final if secs_left <= FINAL_SECONDS else C.w_market
+    return w * yes + (1 - w) * ss["pm"], ss["pm"]
+
+
+# ======================================================================
+# INDICATORS
+# ======================================================================
+def _ema(vals, n):
+    a = 2 / (n + 1)
+    out = [vals[0]]
+    for v in vals[1:]:
+        out.append(out[-1] + a * (v - out[-1]))
+    return out
 
 
 def _fib_score(d):
-    if d < 0.236:
-        return 1.0
-    if d < 0.382:
-        return 0.7
-    if d < 0.5:
-        return 0.5
-    if d < 0.618:
-        return 0.2
-    if d < 0.786:
-        return -0.3
+    for lim, s in ((0.236, 1.0), (0.382, 0.7), (0.5, 0.5), (0.618, 0.2), (0.786, -0.3)):
+        if d < lim:
+            return s
     return -0.8
 
 
 def fib_signal(prices):
-    """(score -1..1, nearest fib level string or None)"""
     if len(prices) < 8:
         return 0.0, None
-    hi, lo, now = max(prices), min(prices), prices[-1]
-    if hi - lo < now * 0.0003:
+    hi, lo, last = max(prices), min(prices), prices[-1]
+    if hi - lo < last * 0.0003:
         return 0.0, None
     up_swing = prices.index(lo) < len(prices) - 1 - prices[::-1].index(hi)
-    d = (hi - now) / (hi - lo) if up_swing else (now - lo) / (hi - lo)
-    d = max(0.0, min(1.0, d))
+    d = (hi - last) / (hi - lo) if up_swing else (last - lo) / (hi - lo)
+    d = clamp(d, 0.0, 1.0)
     lvl = min(FIB_LEVELS, key=lambda r: abs(r - d))
     return (1 if up_swing else -1) * _fib_score(d), f"{lvl * 100:.1f}".rstrip("0").rstrip(".")
 
 
-def fib_ok(side, f):
-    sgn = 1 if side == "UP" else -1
-    return f * sgn >= FIB_AGREE
-
-
-def fib_bias(f):
-    if f >= 0.15:
-        return "bullish"
-    if f <= -0.15:
-        return "bearish"
-    return "neutral"
-
-
 def trend_signal(prices, tilt):
-    if len(prices) < 8:
-        ema = 0.0
-    else:
+    ema = 0.0
+    if len(prices) >= 8:
         e3, e8 = _ema(prices, 3)[-1], _ema(prices, 8)[-1]
         ema = math.tanh(math.log(e3 / e8) / (vol("ETH") * math.sqrt(30)))
     return 0.5 * ema + 0.5 * math.tanh(tilt / 1.5)
 
 
 def rsi(prices, n=None):
-    n = n or RSI_N
+    n = n or C.rsi_n
     if len(prices) < n + 1:
         return None
     ch = [b - a for a, b in zip(prices, prices[1:])]
@@ -417,16 +599,15 @@ def rsi(prices, n=None):
 def rsi_ok(side, r):
     if r is None:
         return True
-    return r >= RSI_BLOCK if side == "UP" else r <= 100 - RSI_BLOCK
+    return r >= C.rsi_block if side == "UP" else r <= 100 - C.rsi_block
 
 
-# ---------- indicator votes (EMA 9/21, Bollinger, ATR, MACD) ----------
 def vote_ema(p):
     if len(p) < 21:
         return None, "warming up"
     e9, e21 = _ema(p, 9)[-1], _ema(p, 21)[-1]
     gap = (e9 - e21) / p[-1]
-    v = 1 if gap > EMA_DEAD else -1 if gap < -EMA_DEAD else 0
+    v = 1 if gap > C.ema_dead else -1 if gap < -C.ema_dead else 0
     return v, f"EMA9 {'above' if e9 > e21 else 'below'} EMA21 ({gap * 1e4:+.1f}bp)"
 
 
@@ -438,12 +619,11 @@ def vote_boll(p, n=20, k=2.0):
     if sd == 0:
         return 0, "flat"
     pb = (p[-1] - (m - k * sd)) / (2 * k * sd)
-    v = 1 if pb >= BB_UP else -1 if pb <= BB_DN else 0
-    return v, f"%B {pb:.2f}"
+    return (1 if pb >= C.bb_up else -1 if pb <= C.bb_dn else 0), f"%B {pb:.2f}"
 
 
 def atr(p, n=None):
-    n = n or ATR_N
+    n = n or C.atr_n
     if len(p) < n + 1:
         return None
     tr = [abs(b - a) for a, b in zip(p, p[1:])]
@@ -457,14 +637,13 @@ def vote_atr(p, price, strike, secs_left, ss=None):
     if secs_left <= FINAL_SECONDS and ss:
         gap = ss["exp_avg"] - strike
         z = gap / ss["std"] if ss["std"] > 1e-9 else (9.0 if gap >= 0 else -9.0)
-        v = 1 if z >= ATR_Z else -1 if z <= -ATR_Z else 0
+        v = 1 if z >= C.atr_z else -1 if z <= -C.atr_z else 0
         return v, f"60s avg proj ${ss['exp_avg']:,.2f}, {z:+.1f}σ from strike"
     a = atr(p)
     if a is None or not price or not strike or a <= 0:
         return None, "warming up"
-    reach = a * math.sqrt(max(secs_left, 10) / 10)
-    z = (price - strike) / reach
-    v = 1 if z >= ATR_Z else -1 if z <= -ATR_Z else 0
+    z = (price - strike) / (a * math.sqrt(max(secs_left, 10) / 10))
+    v = 1 if z >= C.atr_z else -1 if z <= -C.atr_z else 0
     return v, f"ATR ${a:.2f}, {z:+.1f}x reach from strike"
 
 
@@ -474,7 +653,7 @@ def vote_macd(p):
     line = [a - b for a, b in zip(_ema(p, 12), _ema(p, 26))]
     sig = _ema(line, 9)
     hist, prev = line[-1] - sig[-1], line[-2] - sig[-2]
-    dead = p[-1] * MACD_DEAD
+    dead = p[-1] * C.macd_dead
     v = 1 if hist > dead else -1 if hist < -dead else 0
     return v, f"hist {hist:+.2f} ({'rising' if hist > prev else 'falling'})"
 
@@ -482,97 +661,162 @@ def vote_macd(p):
 def _pressure(p):
     ups = sum(max(b - a, 0) for a, b in zip(p, p[1:]))
     dns = sum(max(a - b, 0) for a, b in zip(p, p[1:]))
-    t = ups + dns
-    return (ups - dns) / t if t > 0 else 0.0
+    return (ups - dns) / (ups + dns) if ups + dns > 0 else 0.0
 
 
 def momentum_fast(sym="ETH", win=10):
     pts = list(PRICES[sym])
     if len(pts) < 6:
         return 0.0
-    t_now = pts[-1][0]
+    t_now = now()
     cur = [p for t, p in pts if t_now - t <= win]
     prev = [p for t, p in pts if win < t_now - t <= 2 * win]
     if len(cur) < 4:
         return 0.0
-    now = _pressure(cur)
-    gain = (now - _pressure(prev)) / 2 if len(prev) >= 4 else 0.0
-    return max(-1.0, min(1.0, 0.65 * now + 0.35 * gain))
+    p_now = _pressure(cur)
+    gain = (p_now - _pressure(prev)) / 2 if len(prev) >= 4 else 0.0
+    return clamp(0.65 * p_now + 0.35 * gain, -1.0, 1.0)
 
 
 def composite(mom, fib, trend, blend, rsi_s=0.0):
-    prob = max(-1.0, min(1.0, (blend - 50) / 50))
-    return (W_MOM * mom + W_FIB * fib + W_TREND * trend + W_PROB * prob + W_RSI * rsi_s), prob
-
-
-def pick_call(score, mom, fib, trend, prob):
-    sgn = 1 if mom > 0 else -1
-    if abs(mom) < MOM_MIN or score * sgn <= 0:
-        return None
-    if fib * sgn < -0.5 or trend * sgn < -0.5:
-        return None
-    return ("UP" if sgn > 0 else "DOWN"), 50 + 50 * min(1.0, abs(mom))
-
-
-def side_pct(side, yes):
-    up = min(max(yes, 1), 99)
-    pct = up if side == "UP" else 100 - up
-    return max(1.0, pct - 5)
+    prob = clamp((blend - 50) / 50, -1.0, 1.0)
+    return (C.w_mom * mom + C.w_fib * fib + C.w_trend * trend + C.w_prob * prob + C.w_rsi * rsi_s), prob
 
 
 def combo_conf(side, comb, votes):
     sgn = 1 if side == "UP" else -1
     vs = [v[0] for v in votes.values() if v[0] is not None]
     agree = sum(v * sgn for v in vs) / len(vs) if vs else 0.0
-    strength = max(-1.0, min(1.0, comb * sgn / CONF_FULL))
-    x = (1 - CONF_VOTE_W) * strength + CONF_VOTE_W * agree
-    return max(1.0, min(99.0, 50 + 49 * x))
+    strength = clamp(comb * sgn / C.conf_full, -1.0, 1.0)
+    x = (1 - C.conf_vote_w) * strength + C.conf_vote_w * agree
+    return clamp(50 + 49 * x, 1.0, 99.0)
 
 
 def combo_side(comb, ready, fib, r):
     sgn = 1 if comb > 0 else -1
     cside = "UP" if sgn > 0 else "DOWN"
     against = sum(1 for v in ready if v == -sgn)
-    good = (abs(comb) >= COMBO_MIN and against <= COMBO_OPP
+    good = (abs(comb) >= C.combo_min and against <= C.combo_opp
             and fib * sgn >= -0.5 and rsi_ok(cside, r))
     return cside if good else None
 
 
-def pct_trigger(yes):
-    up = min(max(yes, 1), 99)
-    dn = 100 - up
-    if up >= TRIGGER_PCT:
-        return "UP"
-    if dn >= TRIGGER_PCT:
-        return "DOWN"
-    return None
+def instant_pick(yes, ss, mom, trend, fib, comb):
+    """Returns (side or None, score). None means the score is too close to zero."""
+    s = C.w_i_mkt * (yes - 50) / 50
+    if ss:
+        s += C.w_i_pm * (ss["pm"] - 50) / 50
+    s += C.w_i_mom * mom + C.w_i_trend * trend + C.w_i_fib * fib
+    s += C.w_i_comb * clamp(comb, -1.0, 1.0)
+    if abs(s) < C.abstain:
+        return None, s
+    return ("UP" if s > 0 else "DOWN"), s
 
 
-# ---------- stats ----------
-def stats(history):
+# ======================================================================
+# STATE, STATS, REPORT
+# ======================================================================
+LAST_SAVE = {"t": 0.0}
+
+
+def load_state():
+    for path in (C.state_file, C.state_file + ".tmp"):
+        try:
+            with open(path) as f:
+                s = json.load(f)
+            s.setdefault("history", [])
+            s.setdefault("pending", [])
+            s.setdefault("current", None)
+            return s
+        except FileNotFoundError:
+            continue
+        except Exception:
+            log.exception("could not read %s", path)
+    return {"history": [], "current": None, "pending": []}
+
+
+def _slim(c):
+    if not c:
+        return None
+    d = dict(c)
+    for k in ("eth", "pts"):
+        d[k] = c.get(k, [])[::4]
+    return d
+
+
+def save_state(state, force=False):
+    if not force and time.time() - LAST_SAVE["t"] < C.save_s:
+        return
+    LAST_SAVE["t"] = time.time()
+    with LOCK:
+        state["history"] = state["history"][-500:]
+        blob = json.dumps({"history": state["history"],
+                           "pending": [_slim(p) for p in state["pending"]],
+                           "current": _slim(state["current"])}, separators=(",", ":"), default=str)
+    tmp = C.state_file + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(blob)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, C.state_file)
+
+
+def log_window(row):
+    try:
+        with open(C.windows_file, "a") as f:
+            f.write(json.dumps(row, separators=(",", ":"), default=str) + "\n")
+    except Exception:
+        log.exception("window log")
+
+
+def snapshot(c):
+    s = dict(c)
+    s["eth"], s["pts"] = list(c.get("eth", [])), list(c.get("pts", []))
+    return s
+
+
+def stats(h):
+    def wl(xs):
+        n, w = len(xs), sum(1 for x in xs if x["win"])
+        return f"{w}W-{n - w}L ({w / n * 100:.0f}%)" if n else "n/a"
+    priced = [x for x in h if x.get("entry_px")]
+    cost = sum(x["entry_px"] for x in priced)
+    pnl = sum((100 - x["entry_px"]) if x["win"] else -x["entry_px"] for x in priced)
+    roi = f"{pnl / cost * 100:+.1f}% on {len(priced)}" if cost else "n/a"
+    return {"all": wl(h), "last": wl(h[-50:]), "roi": roi}
+
+
+def report(history):
     n = len(history)
-    w = sum(1 for h in history if h["win"])
-    return {"all": f"{w}W-{n - w}L ({w / n * 100:.0f}%)" if n else "n/a"}
+    if not n:
+        print("no history")
+        return
+    wins = sum(1 for h in history if h["win"])
+    print(f"calls {n}, win rate {wins / n * 100:.1f}%")
+    print("ROI per contract (before fees):", stats(history)["roi"])
+    conf = [h for h in history if h.get("conf") is not None]
+    if conf:
+        brier = statistics.fmean((h["conf"] / 100 - (1 if h["win"] else 0)) ** 2 for h in conf)
+        print(f"Brier score {brier:.3f} (0.250 = coin flip)")
+        print("confidence bucket: calls, claimed, actual")
+        for lo in range(50, 100, 10):
+            b = [h for h in conf if lo <= h["conf"] < lo + 10]
+            if b:
+                print(f"  {lo}-{lo + 9}%: {len(b):4d}  {statistics.fmean(h['conf'] for h in b):5.1f}%  "
+                      f"{sum(1 for h in b if h['win']) / len(b) * 100:5.1f}%")
+    base = [h for h in history if h.get("yes_entry") is not None]
+    if base:
+        def up_won(h):
+            return h["win"] == (h["side"] == "UP")
+        fav = sum(1 for h in base if (h["yes_entry"] >= 50) == up_won(h))
+        up = sum(1 for h in base if up_won(h))
+        print(f"baselines on {len(base)} calls: follow Kalshi favorite {fav / len(base) * 100:.1f}%, "
+              f"always UP {up / len(base) * 100:.1f}%")
 
 
-# ---------- call labels ----------
-def momentum_level(c):
-    sg = c.get("sig")
-    if not sg:
-        return "LOW"
-    m = abs(sg.get("mom", 0))
-    if m >= 0.6:
-        return "HIGH"
-    if m >= 0.3:
-        return "MODERATE"
-    return "LOW"
-
-
-def fib_level(c):
-    return c.get("fib")
-
-
-# ---------- chart ----------
+# ======================================================================
+# CHART RENDERER (runs in a separate process)
+# ======================================================================
 CW, CH = 720, 860
 WHITE = (255, 255, 255, 255)
 MUTED = (160, 168, 178, 255)
@@ -635,7 +879,7 @@ def _glow(base, fn, color, radius, strength=0.9):
 @functools.lru_cache(maxsize=8)
 def _logo(px):
     try:
-        im = ImageOps.fit(Image.open(LOGO_PATH).convert("RGBA"), (px, px), Image.LANCZOS)
+        im = ImageOps.fit(Image.open(C.logo_path).convert("RGBA"), (px, px), Image.LANCZOS)
     except Exception:
         im = Image.new("RGBA", (px, px), (15, 26, 61, 255))
         g = ImageDraw.Draw(im)
@@ -664,11 +908,20 @@ def _mmss(s):
     return f"{s // 60}:{s % 60:02d}"
 
 
-def _bg(Wd, Hd):
+@functools.lru_cache(maxsize=4)
+def _bg_cached(Wd, Hd):
     h = Image.linear_gradient("L").transpose(Image.Transpose.ROTATE_90).resize((Wd, Hd))
     top = ImageOps.colorize(h, (13, 31, 31), (45, 26, 31))
     v = Image.linear_gradient("L").resize((Wd, Hd)).point(lambda p: min(255, int(p * 1.5)))
-    return Image.composite(Image.new("RGB", (Wd, Hd), (10, 10, 10)), top, v)
+    base = Image.composite(Image.new("RGB", (Wd, Hd), (10, 10, 10)), top, v)
+    d = ImageDraw.Draw(base, "RGBA")
+    u = Wd / CW
+    rng = random.Random(7)
+    for _ in range(60):
+        sx, sy = rng.randint(0, Wd), rng.randint(0, int(Hd * 0.3))
+        r = u * rng.choice((0.6, 0.9, 1.2))
+        d.ellipse([sx - r, sy - r, sx + r, sy + r], fill=(255, 255, 255, rng.randint(40, 110)))
+    return base
 
 
 def _candles(eth, fallback):
@@ -684,14 +937,6 @@ def _candles(eth, fallback):
     return out or [(0, fallback, fallback, fallback, fallback)]
 
 
-def _ema(vals, n):
-    a = 2 / (n + 1)
-    out = [vals[0]]
-    for v in vals[1:]:
-        out.append(out[-1] + a * (v - out[-1]))
-    return out
-
-
 def render_frames(cur, outcome, S, n):
     SS = 2 if n > 1 else 1
     u = S * SS
@@ -700,46 +945,30 @@ def render_frames(cur, outcome, S, n):
     lw = lambda v: max(1, int(k(v)))
     Wd, Hd = int(CW * u), int(CH * u)
     outW, outH = int(CW * S), int(CH * S)
-    now = time.time() + TIMER_LEAD  # LIVE: show the time as Discord will display it
+    tnow = time.time() + C.timer_lead
 
     pts = cur.get("pts") or [[0, 50]]
     eth = cur.get("eth") or []
     side = cur.get("side")
     waiting = side is None
     is_up = side == "UP"
-    yes_last = pts[-1][1]
-    up_pct = min(max(yes_last, 1), 99)
+    up_pct = min(max(pts[-1][1], 1), 99)
     dn_pct = 100 - up_pct
     conf = cur.get("conf") or max(up_pct, dn_pct)
     strike = cur.get("strike") or (eth[0][1] if eth else 0)
     now_px = eth[-1][1] if eth else (cur.get("price") or strike)
-    close_ts = cur.get("close_ts") or (now + 900)
+    close_ts = cur.get("close_ts") or (tnow + 900)
     accent = {"win": C_UP, "loss": C_DN, "settling": AMBER}.get(outcome)
     col = C_UP if is_up else C_DN
 
-    base = _bg(Wd, Hd)
+    base = _bg_cached(Wd, Hd).copy()
     d = ImageDraw.Draw(base, "RGBA")
-    rng = random.Random(7)
-    for _ in range(60):
-        sx, sy = rng.randint(0, Wd), rng.randint(0, int(Hd * 0.3))
-        r = k(rng.choice((0.6, 0.9, 1.2)))
-        d.ellipse([sx - r, sy - r, sx + r, sy + r], fill=(255, 255, 255, rng.randint(40, 110)))
 
-    # ---- header ----
+    # header
     lg = int(k(60))
     base.paste(_logo(lg), (int(k(24)), int(k(24))), _logo(lg))
     d.ellipse([k(24), k(24), k(24) + lg, k(24) + lg], outline=(255, 255, 255, 80), width=lw(1.5))
     d.text((k(98), k(54)), "ETH 15 min", font=F(30), fill=WHITE, anchor="lm")
-
-    nflips = cur.get("flips", 0)
-    if nflips and not waiting:
-        tw0 = d.textlength("ETH 15 min", font=F(30)) / u
-        ftxt = f"FLIP x{nflips}"
-        fw = d.textlength(ftxt, font=F(14)) / u + 18
-        fx0 = 98 + tw0 + 12
-        d.rounded_rectangle([k(fx0), k(42), k(fx0 + fw), k(66)], radius=k(10),
-                            fill=AMBER + (60,), outline=AMBER + (255,), width=lw(1.5))
-        d.text((k(fx0 + fw / 2), k(54)), ftxt, font=F(14), fill=AMBER + (255,), anchor="mm")
 
     ring = outcome in (None, "settling")
     if outcome == "win":
@@ -747,9 +976,9 @@ def render_frames(cur, outcome, S, n):
     elif outcome == "loss":
         btxt, bcol = "LOSS", C_DN
     elif outcome == "settling":
-        btxt, bcol = "NEXT " + _mmss(close_ts + 900 - now), AMBER
+        btxt, bcol = "NEXT " + _mmss(close_ts + 900 - tnow), AMBER
     else:
-        btxt, bcol = _mmss(close_ts - now), (255, 255, 255)
+        btxt, bcol = _mmss(close_ts - tnow), (255, 255, 255)
     fb = F(22)
     bw = d.textlength(btxt, font=fb) / u + (68 if ring else 40)
     bx0 = 696 - bw
@@ -758,7 +987,7 @@ def render_frames(cur, outcome, S, n):
     if ring:
         cx, cy, r = k(bx0 + 28), k(54), k(12)
         d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(255, 255, 255, 40), width=lw(3))
-        left = (close_ts - now) if outcome is None else (close_ts + 900 - now)
+        left = (close_ts - tnow) if outcome is None else (close_ts + 900 - tnow)
         frac = max(0.0, min(1.0, left / 900))
         if frac > 0.003:
             d.arc([cx - r, cy - r, cx + r, cy + r], -90, -90 + 360 * frac,
@@ -767,7 +996,7 @@ def render_frames(cur, outcome, S, n):
     else:
         d.text((k(bx0 + bw / 2), k(54)), btxt, font=fb, fill=bcol + (255,), anchor="mm")
 
-    # ---- price row ----
+    # price row
     d.text((k(24), k(124)), f"Target · {_clock(close_ts - 900)}", font=F(15, False), fill=MUTED, anchor="ls")
     d.text((k(24), k(166)), f"${strike:,.2f}" if strike else "--", font=F(32), fill=WHITE, anchor="ls")
     diff = (now_px - strike) if strike else 0
@@ -780,7 +1009,7 @@ def render_frames(cur, outcome, S, n):
     d.ellipse([k(673), k(136), k(695), k(158)], outline=MUTED, width=lw(2))
     d.text((k(684), k(147)), "i", font=F(15), fill=MUTED, anchor="mm")
 
-    # ---- chart panel ----
+    # chart panel
     d.rounded_rectangle([k(12), k(196), k(708), k(568)], radius=k(18), fill=(255, 255, 255, 14),
                         outline=(255, 255, 255, 28), width=lw(1))
     PX0, PX1, PY0, PY1 = k(84), k(650), k(238), k(452)
@@ -802,11 +1031,11 @@ def render_frames(cur, outcome, S, n):
         v = lo + (hi - lo) * i / 4
         _dots(d, PX0, Y(v), PX1, Y(v), (150, 165, 200, 40), lw(1), k(2), k(5))
         d.text((PX1 + k(8), Y(v)), f"{v:,.1f}", font=F(11, False), fill=MUTED, anchor="lm")
-    for m in (0, 5, 10, 15):
-        x = PX0 + (PX1 - PX0) * m / 15
-        if 0 < m < 15:
+    for mm in (0, 5, 10, 15):
+        x = PX0 + (PX1 - PX0) * mm / 15
+        if 0 < mm < 15:
             _dots(d, x, PY0, x, IY1, (150, 165, 200, 28), lw(1), k(2), k(6))
-        d.text((x, k(558)), f"{m}m", font=F(10, False), fill=MUTED, anchor="mm")
+        d.text((x, k(558)), f"{mm}m", font=F(10, False), fill=MUTED, anchor="mm")
 
     wmpx = int(k(230))
     wm = _logo(wmpx).copy()
@@ -927,13 +1156,12 @@ def render_frames(cur, outcome, S, n):
                             outline=accent + (255,), width=lw(1.5))
         d.text((k(700 - tw / 2), k(215)), tag, font=F(12), fill=accent + (255,), anchor="mm")
 
-    # ---- status row ----
+    # status row
     d.rounded_rectangle([k(24), k(586), k(696), k(650)], radius=k(18), fill=(255, 255, 255, 14))
     base.paste(_logo(int(k(40))), (int(k(36)), int(k(598))), _logo(int(k(40))))
     tx = k(92)
     if waiting:
-        l1 = "Watching the market"
-        l2 = "Waiting for a call"
+        l1, l2 = "Watching the market", "Waiting for a call"
     else:
         live = cur.get("live_conf") if outcome is None else None
         shown = live if live is not None else conf
@@ -945,7 +1173,7 @@ def render_frames(cur, outcome, S, n):
     d.text((tx, k(610)), l1, font=F(17), fill=WHITE, anchor="lm")
     d.text((k(92), k(634)), l2, font=F(13, False), fill=MUTED, anchor="lm")
 
-    # ---- indicator vote badges + confluence tally + confidence ----
+    # vote badges
     done = outcome in ("win", "loss")
     vt = (cur.get("votes_call") if done else None) or cur.get("votes") or {}
     tl = (cur.get("tally_call") if done else None) or cur.get("tally")
@@ -986,7 +1214,7 @@ def render_frames(cur, outcome, S, n):
         d.text(((x0 + x1) / 2 + k(5), y0 + k(38)), lab, font=F(12),
                fill=(255, 255, 255, 255), anchor="mm")
 
-    # ---- buttons ----
+    # buttons
     by0, by1 = k(730), k(834)
     bwd = (720 - 48 - 14) / 2
     for i, (name, pct, bc, up_btn) in enumerate((("Up", up_pct, C_UP, True), ("Down", dn_pct, C_DN, False))):
@@ -1005,7 +1233,7 @@ def render_frames(cur, outcome, S, n):
         d.text(((x0 + x1) / 2 + k(14), by0 + k(74)), f"{100 / max(pct, 1):.2f}x", font=F(16, False),
                fill=(255, 255, 255, 120 if dim else 225), anchor="mm")
 
-    # ---- animated frames ----
+    # animated frames
     ty = Y(strike) if strike else (PY0 + PY1) / 2
     frames = []
     for f in range(n):
@@ -1034,9 +1262,9 @@ def render_frames(cur, outcome, S, n):
 def chart_file(cur, outcome=None):
     """(bytes, filename, mime). Live = animated GIF, win/loss = PNG. Shrinks if too big."""
     animated = outcome not in ("win", "loss")
-    S = LIVE_SCALE if animated else FINAL_SCALE
+    S = C.live_scale if animated else C.final_scale
     while True:
-        frames = render_frames(cur, outcome, S, LIVE_FRAMES if animated else 1)
+        frames = render_frames(cur, outcome, S, C.live_frames if animated else 1)
         buf = io.BytesIO()
         if not animated:
             frames[0].save(buf, format="PNG", optimize=True)
@@ -1045,63 +1273,37 @@ def chart_file(cur, outcome=None):
             frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:],
                            duration=150, loop=0)
             res = (buf.getvalue(), "chart.gif", "image/gif")
-        if len(res[0]) <= MAX_BYTES or S <= 1:
+        if len(res[0]) <= C.max_bytes or S <= 1:
             return res
         S *= 0.75
 
 
-# ---------- discord ----------
-def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None, pm=None):
+# ======================================================================
+# DISCORD
+# ======================================================================
+def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, stale=None):
     side = c["side"]
-    p_up = blend if blend is not None else yes
     s = stats(state["history"])
-    fields = [
-        {"name": "All-time", "value": s["all"], "inline": True},
-    ]
-
+    fields = [{"name": "All-time", "value": s["all"], "inline": True},
+              {"name": "Last 50", "value": s["last"], "inline": True},
+              {"name": "ROI", "value": s["roi"], "inline": True}]
     if side is None:
-        mom_now = abs((c.get("sig") or {}).get("mom", 0))
-        lines = [
-            f"**Call:** ⚪ NO CALL (momentum {mom_now * 100:.0f}, needs {MOM_MIN * 100:.0f}+ held for {CONFIRM_SECONDS:.1f}s)",
-            "**Action:** WAIT, no position",
-            f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%",
-        ]
         title, color = "⚪ KALSHI ETH 15m: NO CALL", GREY
+        lines = ["**Call:** ⚪ NO CALL yet", "**Action:** WAIT, no position",
+                 f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%"]
     else:
         arrow = "🆙" if side == "UP" else "⬇️"
-        conf = c.get("conf") or (p_up if side == "UP" else 100 - p_up)
-        if outcome == "win":
-            tag, color = "✅ WIN", GREEN
-        elif outcome == "loss":
-            tag, color = "❌ LOSS", RED
-        elif outcome == "settling":
-            tag, color = "⏳ SETTLING", GREY
-        else:
-            tag, color = "HOLD", GREEN if side == "UP" else RED
-        if outcome:
-            action = tag
-        elif c.get("flip_t") and time.time() - c["flip_t"] < 30:
-            action = f"SELL {c.get('flip_from')} → BUY {side}"
-        elif c.get("flipped"):
-            action = "SELL"
-        elif not c.get("buy_shown"):
-            action = "BUY"
-        else:
-            action = "HOLD"
-        fl = fib_level(c)
-        fib_txt = f" | Fibonacci retracement at {fl}% + trend" if fl and not outcome else ""
-        lines = [
-            f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry){fib_txt} | momentum is {momentum_level(c)}",
-        ]
+        conf = c.get("conf") or 50
+        tag, color = {"win": ("✅ WIN", GREEN), "loss": ("❌ LOSS", RED),
+                      "settling": ("⏳ SETTLING", GREY)}.get(outcome, (None, GREEN if side == "UP" else RED))
+        action = tag or ("HOLD" if c.get("buy_shown") else "BUY")
+        lines = [f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry)"]
         if not outcome:
-            live_conf = c.get("live_conf")
-            if live_conf is None:
-                live_conf = conf
-            lines.append(f"**Updated confidence:** {live_conf:.0f}% ({live_conf - conf:+.0f} vs entry)")
-        lines += [
-            f"**Action:** {action}",
-            f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%",
-        ]
+            lc = c.get("live_conf", conf)
+            lines.append(f"**Updated confidence:** {lc:.0f}% ({lc - conf:+.0f} vs entry)")
+        lines += [f"**Action:** {action}", f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%"]
+        if c.get("entry_px") is not None:
+            lines.append(f"**Entry price** {c['entry_px']:.0f}¢")
         title = f"{arrow} KALSHI ETH 15m: {side} | {action}"
     if pm is not None:
         lines.append(f"**Strike model** UP {pm:.0f}% / DOWN {100 - pm:.0f}%")
@@ -1111,634 +1313,377 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
             lines.append(f"**60s average so far** ${c['avg60']:,.2f} | projected ${c['avg_exp']:,.2f} "
                          f"vs strike ${c['strike']:,.2f}")
         if c.get("avg_need") is not None and (c.get("avg_rem") or 0) >= 1:
-            lines.append(f"**To finish UP** the last {c['avg_rem']:.0f}s must average "
-                         f"${c['avg_need']:,.2f}+")
+            lines.append(f"**To finish UP** the last {c['avg_rem']:.0f}s must average ${c['avg_need']:,.2f}+")
     mk = c.get("mkt")
     if mk:
-        arrows = " / ".join(f"{sym} {'▲' if z >= 0 else '▼'}" for sym, z in mk["z"].items())
+        arrows = " / ".join(f"{k} {'▲' if z >= 0 else '▼'}" for k, z in mk["z"].items())
         lines.append(f"**Basket** {arrows} (agreement {mk['breadth'] * 100:.0f}%)")
-
-    sg = c.get("sig")
-    if sg:
-        fl = c.get("fib")
-        fscore = sg.get("fib", 0.0)
-        if fl:
-            fib_part = f"Fibonacci retracement {fl}% (score {fscore:+.2f}, {fib_bias(fscore)})"
-        else:
-            fib_part = "Fibonacci forming (not enough swing yet)"
-        rs = c.get("rsi")
-        rsi_part = f" | RSI {rs:.0f}" if rs is not None else " | RSI warming up"
-        lines.append(f"**Signals** {fib_part}{rsi_part}")
-
+    if c.get("fib") or c.get("rsi") is not None:
+        rs = f"{c['rsi']:.0f}" if c.get("rsi") is not None else "warming up"
+        lines.append(f"**Signals** Fibonacci {c.get('fib') or 'forming'}% | RSI {rs}")
     done = outcome in ("win", "loss")
     vt = (c.get("votes_call") if done else None) or c.get("votes")
     tally = (c.get("tally_call") if done else None) or c.get("tally")
     if vt and tally:
-        names = {"mom": "Momentum", "fib": "Fibonacci", "ema": "EMA 9/21", "boll": "Bollinger",
-                 "atr": "ATR", "macd": "MACD"}
+        names = {"mom": "Momentum", "fib": "Fibonacci", "ema": "EMA 9/21",
+                 "boll": "Bollinger", "atr": "ATR", "macd": "MACD"}
         lab = lambda v: "⚪ WARMING" if v is None else "🟢 UP" if v > 0 else "🔴 DOWN" if v < 0 else "⚪ NEUTRAL"
         lines.append("**Indicators at entry**" if done and c.get("votes_call") else "**Indicators**")
-        for key, nm in names.items():
-            if key not in vt:
-                continue
-            v, txt = vt[key]
-            lines.append(f"{lab(v)} · **{nm}** {txt}")
-        u, d_, n_ = tally
+        for k, nm in names.items():
+            if k in vt:
+                lines.append(f"{lab(vt[k][0])} · **{nm}** {vt[k][1]}")
         cb = c.get("comb_call") if done and c.get("comb_call") is not None else c.get("comb")
-        verdict = f" → **{side}**" if side else " → no call yet"
-        lines.append(f"**Confluence** UP {u} / DOWN {d_} / NEUTRAL {n_}{verdict}")
+        lines.append(f"**Confluence** UP {tally[0]} / DOWN {tally[1]} / NEUTRAL {tally[2]}"
+                     + (f" → **{side}**" if side else " → no call yet"))
         if cb is not None:
-            lines.append(f"**Combined score** {cb:+.2f} (call at ±{COMBO_MIN:.2f})")
-
-    if side is None and c.get("rsi_block"):
-        why = c.get("hold_why") or ""
-        cap = "" if "Fibonacci" in why else f" (max {RSI_GRACE:.0f}s)"
-        lines.append(f"**Hold** {c['rsi_block']} call waiting on {why}{cap}")
-    elif side is not None and c.get("fib_call") is not None:
-        over = [n for n, f in (("RSI", c.get("rsi_over")), ("Fibonacci", c.get("fib_over"))) if f]
-        if over:
-            lines.append(f"**Entry** called despite {' and '.join(over)}")
-        elif c.get("rsi_call") is None:
-            lines.append("**Entry** Fibonacci agreed (RSI warming up)")
-        else:
-            lines.append("**Entry** RSI and Fibonacci agreed")
-    if c.get("flips"):
-        lines.append(f"**Flips** {c['flips']} this window")
+            lines.append(f"**Combined score** {cb:+.2f} (indicator call at ±{C.combo_min:.2f})")
+    if stale:
+        lines.append(f"**Warning** data is {stale:.0f}s old, new calls paused")
     if price:
         lines.append(f"**Price** ${price:,.2f} (median of {n_ex} exch)")
     lines.append(f"**Strike** {c['strike']:,.2f} | {max(int(secs_left), 0)}s left")
-
-    return {
-        "title": title,
-        "description": "\n".join(lines),
-        "color": color,
-        "fields": fields,
-        "footer": {"text": "Signals only, not financial advice"},
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    return {"title": title, "description": "\n".join(lines), "color": color, "fields": fields,
+            "footer": {"text": "Signals only, not financial advice"},
+            "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-_build_embed_raw = build_embed
+HTTP = requests.Session()
+IO = ThreadPoolExecutor(4)
+RENDER_POOL = None
 
 
-def build_embed(*a, **kw):
-    """Same embed, minus anything that hints at how a call is triggered."""
-    e = _build_embed_raw(*a, **kw)
-    out = []
-    for ln in e["description"].split("\n"):
-        if ln.startswith("**Call:** ⚪ NO CALL"):
-            ln = "**Call:** ⚪ NO CALL yet"
-        elif ln.startswith("**Call:**"):
-            ln = ln.split(" | ")[0]
-        out.append(ln)
-    e["description"] = "\n".join(out)
-    return e
+def render_chart(snap, outcome):
+    if RENDER_POOL is not None:
+        try:
+            return RENDER_POOL.submit(chart_file, snap, outcome).result(timeout=30)
+        except Exception:
+            log.exception("render pool failed, rendering inline")
+    return chart_file(snap, outcome)
 
 
-HTTP = requests.Session()  # LIVE: reuse connections for Discord
-
-
-def send(embed, message_id=None, cur=None, outcome=None, text_only=False):
-    payload = {"embeds": [embed]}
-    f_data = None
+def send(embed, message_id=None, snap=None, outcome=None, text_only=False):
+    payload, f = {"embeds": [embed]}, None
     if text_only and message_id:
         embed["image"] = {"url": "attachment://chart.gif"}
-    elif cur is not None:
-        f_data = chart_file(cur, outcome)
-        embed["image"] = {"url": f"attachment://{f_data[1]}"}
+    elif snap is not None:
+        f = render_chart(snap, outcome)
+        embed["image"] = {"url": f"attachment://{f[1]}"}
         if message_id:
             payload["attachments"] = []
-    for _ in range(3):
+    for attempt in range(4):
         kw = {"timeout": 60}
-        if f_data:
-            kw["files"] = {"files[0]": (f_data[1], f_data[0], f_data[2])}
+        if f:
+            kw["files"] = {"files[0]": (f[1], f[0], f[2])}
             kw["data"] = {"payload_json": json.dumps(payload)}
         else:
             kw["json"] = payload
         if message_id:
-            r = HTTP.patch(f"{WEBHOOK}/messages/{message_id}", **kw)
+            r = HTTP.patch(f"{C.webhook}/messages/{message_id}", **kw)
         else:
-            r = HTTP.post(WEBHOOK, params={"wait": "true"}, **kw)
+            r = HTTP.post(C.webhook, params={"wait": "true"}, **kw)
         if r.status_code == 429:
-            time.sleep(r.json().get("retry_after", 1) + 0.1)
+            time.sleep(float(r.json().get("retry_after", 1)) + 0.1)
+            continue
+        if r.status_code == 404 and message_id:     # message deleted: post a new one
+            message_id = None
+            continue
+        if r.status_code >= 500:
+            time.sleep(1 + attempt)
             continue
         r.raise_for_status()
         return r.json()["id"]
-    raise RuntimeError("discord rate limited")
+    raise RuntimeError("discord send failed")
 
 
-SEND_LOCK = threading.Lock()
+class LiveSink:
+    def live(self, embed, cur, new_due, text_only):
+        if not SEND_LOCK.acquire(blocking=False):
+            return False
+        snap = None if text_only else snapshot(cur)
+        mid = None if new_due else cur["message_id"]
+
+        def run():
+            try:
+                new_id = send(embed, mid, snap, None, text_only)
+                if new_due:
+                    with LOCK:
+                        cur["message_id"] = new_id
+            except Exception:
+                log.exception("send error")
+            finally:
+                SEND_LOCK.release()
+        IO.submit(run)
+        return True
+
+    def final(self, embed, ref, outcome):
+        snap = snapshot(ref)
+
+        def run():
+            try:
+                with SEND_LOCK:
+                    with LOCK:
+                        mid = ref.get("message_id")
+                    send(embed, mid, snap, outcome)
+            except Exception:
+                log.exception("final send error")
+        IO.submit(run)
 
 
-def send_sync(embed, message_id=None, cur=None, outcome=None):
-    with SEND_LOCK:
-        if cur is not None and cur.get("message_id"):
-            message_id = cur["message_id"]
-        return send(embed, message_id, cur=cur, outcome=outcome)
+class NullSink:
+    def live(self, embed, cur, new_due, text_only):
+        if new_due:
+            cur["message_id"] = "replay"
+        return True
+
+    def final(self, embed, ref, outcome):
+        pass
 
 
-def send_async(embed, message_id, cur, store=None, text_only=False):
-    if not SEND_LOCK.acquire(blocking=False):
-        return False
-    snap = None if text_only else copy.deepcopy(cur)
-
-    def run():
-        try:
-            mid = send(embed, message_id, cur=snap, text_only=text_only)
-            if store is not None:
-                store["message_id"] = mid
-        except Exception as e:
-            print("send error", e)
-        finally:
-            SEND_LOCK.release()
-
-    threading.Thread(target=run, daemon=True).start()
-    return True
-
-
-# ---------- core ----------
-def settle_pending(state):
-    for p in list(state["pending"]):
-        try:
-            m = get_market(p["ticker"])
-            res = m.get("result")
-            if res not in ("yes", "no"):
-                if time.time() < p["close_ts"] + 300:
-                    continue
-                if (p.get("avg_exp") is not None and p.get("avg_rem") is not None
-                        and p["avg_rem"] <= 5):
-                    res = "yes" if p["avg_exp"] >= p["strike"] else "no"
-                else:
-                    price, _ = eth_price()
-                    if price is None:
-                        continue
-                    res = "yes" if price >= p["strike"] else "no"
-            win = (res == "yes") == (p["side"] == "UP")
-            state["history"].append({"ticker": p["ticker"], "side": p["side"], "win": win,
-                                     "flips": p.get("flips", 0),
-                                     "calls": p.get("calls"),
-                                     "tilt": (p.get("mkt") or {}).get("tilt"),
-                                     "sig": p.get("sig")})
-            state["pending"].remove(p)
-            yes_final = 100.0 if res == "yes" else 0.0
-            p.setdefault("pts", []).append([900, 100 if res == "yes" else 0])
-            send_sync(build_embed(p, state, yes_final, None, 0, 0, "win" if win else "loss"),
-                      p["message_id"], cur=p, outcome="win" if win else "loss")
-            _save_now(state)  # LIVE: always persist a settled result immediately
-        except Exception as e:
-            print("settle error", e)
-
-
-def flip_call(cur, new_side, comb, r, fib, elapsed, now, src):
-    cur.setdefault("calls", []).append(
-        {"side": cur["side"], "conf": cur.get("conf"), "at": cur.get("called_at")})
-    cur.update(flip_from=cur["side"], side=new_side,
-               conf=combo_conf(new_side, comb, cur["votes"]),
-               called_at=round(elapsed), src=src,
-               flips=cur.get("flips", 0) + 1, flip_t=now,
-               flipped=False, buy_shown=False,
-               fib_call=round(fib, 2), rsi_call=cur["rsi"],
-               rsi_over=False, fib_over=False,
-               votes_call=copy.deepcopy(cur["votes"]),
-               tally_call=list(cur["tally"]), comb_call=cur["comb"])
-    cur.pop("flip_since", None)
-    cur.pop("ff_t", None)
-    cur.pop("rev_t", None)
-
-
-def instant_pick(price, strike, yes, ss, mom, trend, fib, comb):
-    """INSTANT: always returns (side, score). Positive score = UP."""
-    s = W_I_MKT * (yes - 50) / 50
-    if ss:
-        s += W_I_PM * (ss["pm"] - 50) / 50
-    s += W_I_MOM * mom + W_I_TREND * trend + W_I_FIB * fib
-    s += W_I_COMB * max(-1.0, min(1.0, comb))
-    if abs(s) < 1e-6:                      # dead tie: price vs strike, then Kalshi
-        s = (price - strike) or (yes - 50) or 1.0
-    return ("UP" if s > 0 else "DOWN"), s
-
-
-def tick(state):
-    settle_pending(state)
-    m = open_market()
-    cur = state["current"]
-    now = time.time()
-
-    if cur and (m is None or m["ticker"] != cur["ticker"]):
-        state["current"] = None
-        if cur["side"] is None:
-            last_yes = cur["pts"][-1][1] if cur["pts"] else 50
-            send_sync(build_embed(cur, state, last_yes, None, 0, 0), cur["message_id"], cur=cur)
-        else:
-            state["pending"].append(cur)
-            send_sync(build_embed(cur, state, 50, None, 0, 0, "settling"), cur["message_id"],
-                      cur=cur, outcome="settling")
-        cur = None
-        _save_now(state)
-    if m is None:
-        return
-
-    close_ts = ts(m["close_time"])
-    secs_left = close_ts - now
-    elapsed = 900 - secs_left
-    yes = yes_pct(m)
-    px = all_prices()
-    for s, (p, _) in px.items():
-        record_price(s, p)
-    price, n_ex = px["ETH"]
+# ======================================================================
+# WINDOW LIFECYCLE
+# ======================================================================
+def new_window(state, m):
     strike = float(m.get("floor_strike") or m.get("cap_strike") or 0)
+    cur = {"ticker": m["ticker"], "side": None, "strike": strike, "close_ts": ts(m["close_time"]),
+           "message_id": None, "pts": [], "eth": [], "locked": False, "conf": None,
+           "open": {}, "open_t": now()}
+    state["current"] = cur
+    return cur
 
-    if cur is None:
-        cur = {"ticker": m["ticker"], "side": None, "strike": strike, "close_ts": close_ts,
-               "message_id": None, "pts": [], "eth": [], "locked": False, "conf": None}
-        state["current"] = cur
-    cur.setdefault("open", {})
-    cur.setdefault("open_t", now)
+
+def roll_window(state, m, sink):
+    cur = state["current"]
+    if not cur or (m and m["ticker"] == cur["ticker"]):
+        return
+    state["current"] = None
+    state["pending"].append(cur)
+    if cur["side"] is None:
+        last = cur["pts"][-1][1] if cur["pts"] else 50
+        sink.final(build_embed(cur, state, last, None, 0, 0), cur, None)
+    else:
+        sink.final(build_embed(cur, state, 50, None, 0, 0, "settling"), cur, "settling")
+    save_state(state, force=True)
+
+
+def make_call(cur, side, conf, src, elapsed, q):
+    cur.update(side=side, conf=conf, locked=True, called_at=round(elapsed), src=src,
+               votes_call=dict(cur["votes"]), tally_call=list(cur["tally"]),
+               comb_call=cur["comb"], rsi_call=cur["rsi"],
+               entry_px=round(entry_price(q, side), 1), yes_entry=round(q["yes"], 1),
+               feat_call=dict(cur["feat"]))
+
+
+def update_signals(cur, px, strike, yes, close_ts, t):
+    secs_left = close_ts - t
+    price = px["ETH"][0]
     for s, (p, _) in px.items():
         if p:
             cur["open"].setdefault(s, p)
-    now_px = {s: p for s, (p, _) in px.items()}
-    tilt, breadth, zs = market_signal(now_px, cur["open"], now - cur["open_t"])
-    final = secs_left <= FINAL_SECONDS
-    ss = settle_stats(price, strike, close_ts, now, tilt)
+    tilt, breadth, zs = market_signal({s: p for s, (p, _) in px.items()}, cur["open"], t - cur["open_t"])
+    ss = settle_stats(price, strike, close_ts, t, tilt)
     blend, pm = predict(yes, ss, secs_left)
     if ss:
-        cur["avg60"] = round(ss["obs_avg"], 2) if ss["obs_avg"] else None
-        cur["avg_exp"] = round(ss["exp_avg"], 2)
-        cur["avg_rem"] = round(ss["rem"], 1)
-        cur["avg_need"] = round(ss["need"], 2) if ss["need"] is not None else None
+        cur.update(avg60=round(ss["obs_avg"], 2) if ss["obs_avg"] else None,
+                   avg_exp=round(ss["exp_avg"], 2), avg_rem=round(ss["rem"], 1),
+                   avg_need=round(ss["need"], 2) if ss["need"] is not None else None)
     cur["mkt"] = {"tilt": round(tilt, 2), "breadth": round(breadth, 2),
                   "z": {s: round(z, 2) for s, z in zs.items()}}
-    cur["read"] = {"ETH": blend}
-
     series = series_10s("ETH")
     fib, fib_lvl = fib_signal(series)
     trend = trend_signal(series, tilt)
     r = rsi(series)
-    cur["rsi"] = round(r, 1) if r is not None else None
-    rsi_s = max(-1.0, min(1.0, (r - 50) / 50)) if r is not None else 0.0
+    rsi_s = clamp((r - 50) / 50, -1.0, 1.0) if r is not None else 0.0
     mom = 0.7 * momentum_fast("ETH") + 0.3 * math.tanh(tilt / 1.5)
-    who = "buyers" if mom > 0.1 else "sellers" if mom < -0.1 else "even"
     score, prob = composite(mom, fib, trend, blend, rsi_s)
-    if final and ss:
-        lock = max(0.0, min(1.0, (FINAL_SECONDS - secs_left) / FINAL_SECONDS))
-        score = (1 - lock) * score + lock * max(-1.0, min(1.0, (ss["pm"] - 50) / 50))
-    cur["score"] = round(score, 3)
-    cur["fib"] = fib_lvl
-    cur["sig"] = {"mom": round(mom, 2), "fib": round(fib, 2), "trend": round(trend, 2),
-                  "prob": round(prob, 2)}
-    prev_side, prev_flip = cur["side"], cur.get("flipped")
-
-    # ---- indicator votes + combined call ----
+    if secs_left <= FINAL_SECONDS and ss:
+        lock = clamp((FINAL_SECONDS - secs_left) / FINAL_SECONDS, 0.0, 1.0)
+        score = (1 - lock) * score + lock * clamp((ss["pm"] - 50) / 50, -1.0, 1.0)
     votes = {"ema": vote_ema(series), "boll": vote_boll(series),
              "atr": vote_atr(series, price, strike, secs_left, ss), "macd": vote_macd(series)}
     ready = [v for v, _ in votes.values() if v is not None]
-    all_ready = len(ready) == 4
-    c_up, c_dn = ready.count(1), ready.count(-1)
     vscore = sum(ready) / len(ready) if ready else 0.0
-    comb = W_CORE * score + W_VOTE * vscore
-    cur["votes"] = {k: [v, t] for k, (v, t) in votes.items()}
-    cur["tally"] = [c_up, c_dn, len(ready) - c_up - c_dn]
-    cur["votes"]["mom"] = [1 if mom >= MOM_MIN else -1 if mom <= -MOM_MIN else 0,
-                           f"{mom:+.2f}, {momentum_level(cur)} ({who})"]
-    cur["votes"]["fib"] = [None if fib_lvl is None else 1 if fib >= FIB_AGREE else -1 if fib <= -FIB_AGREE else 0,
+    comb = C.w_core * score + C.w_vote * vscore
+    cur["votes"] = {k: [v, tx] for k, (v, tx) in votes.items()}
+    cur["votes"]["mom"] = [1 if mom >= C.mom_min else -1 if mom <= -C.mom_min else 0, f"{mom:+.2f}"]
+    cur["votes"]["fib"] = [None if fib_lvl is None else 1 if fib >= C.fib_agree
+                           else -1 if fib <= -C.fib_agree else 0,
                            f"retrace {fib_lvl}% ({fib:+.2f})" if fib_lvl else "forming"]
-    cur["comb"] = round(comb, 3)
+    cur["tally"] = [ready.count(1), ready.count(-1), len(ready) - ready.count(1) - ready.count(-1)]
+    cur.update(comb=round(comb, 3), score=round(score, 3), fib=fib_lvl,
+               rsi=round(r, 1) if r is not None else None,
+               sig={"mom": round(mom, 2), "fib": round(fib, 2), "trend": round(trend, 2), "prob": round(prob, 2)})
+    cur["feat"] = {"mom": round(mom, 3), "fib": round(fib, 3), "trend": round(trend, 3),
+                   "pm": round(pm, 1) if pm is not None else None, "yes": round(yes, 1),
+                   "comb": round(comb, 3), "rsi": cur["rsi"], "tilt": round(tilt, 2),
+                   "votes": {k: v[0] for k, v in cur["votes"].items()}}
+    return {"ss": ss, "blend": blend, "pm": pm, "mom": mom, "fib": fib, "trend": trend,
+            "r": r, "comb": comb, "ready": ready, "all_ready": len(ready) == 4}
 
-    # ---- INSTANT: decide on the first tick, then lock ----
-    if (INSTANT_CALL and cur["side"] is None and secs_left > CALL_CUTOFF
-            and price and strike):
-        isd, iscore = instant_pick(price, strike, yes, ss, mom, trend, fib, comb)
-        cur.update(side=isd, conf=combo_conf(isd, iscore, cur["votes"]), locked=True,
-                   called_at=round(elapsed), src="INSTANT",
-                   rsi_call=cur["rsi"], fib_call=round(fib, 2),
-                   rsi_over=False, fib_over=False,
-                   votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
-                   comb_call=cur["comb"])
 
-    # ---- initial call ----
-    if CALL_MODE == "combined" and all_ready and cur["side"] is None and secs_left > CALL_CUTOFF:
-        cside = combo_side(comb, ready, fib, r)
-        # LOCK: the call is final, so the settlement model must back the same side
-        if cside and LOCK_CALL and ss:
-            agree_pct = ss["pm"] if cside == "UP" else 100 - ss["pm"]
-            if agree_pct < LOCK_PM:
+def maybe_call(cur, ctx, q, secs_left, elapsed, t):
+    ss = ctx["ss"]
+    if C.instant:
+        side, s = instant_pick(q["yes"], ss, ctx["mom"], ctx["trend"], ctx["fib"], ctx["comb"])
+        if side:
+            make_call(cur, side, combo_conf(side, s, cur["votes"]), "INSTANT", elapsed, q)
+            return
+    if ctx["all_ready"]:   # second chance: indicator confluence held for a few seconds
+        cside = combo_side(ctx["comb"], ctx["ready"], ctx["fib"], ctx["r"])
+        if cside and ss:
+            if (ss["pm"] if cside == "UP" else 100 - ss["pm"]) < C.lock_pm:
                 cside = None
         if cside is None:
             cur.pop("comb_dir", None)
         elif cur.get("comb_dir") != cside:
-            cur["comb_dir"], cur["comb_t"] = cside, now
-        elif now - cur["comb_t"] >= CONFIRM_SECONDS:
-            cur.update(side=cside, conf=combo_conf(cside, comb, cur["votes"]), locked=True,
-                       called_at=round(elapsed), src="COMBINED",
-                       votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
-                       comb_call=cur["comb"])
+            cur["comb_dir"], cur["comb_t"] = cside, t
+        elif t - cur["comb_t"] >= C.confirm_s:
+            make_call(cur, cside, combo_conf(cside, ctx["comb"], cur["votes"]), "COMBINED", elapsed, q)
 
-    if cur["side"] is None and secs_left > CALL_CUTOFF and (CALL_MODE == "kalshi" or not all_ready):
-        if not cur.get("first_side"):
-            fs0 = pct_trigger(yes)
-            if fs0:
-                cur["first_side"], cur["first_t"] = fs0, now
-        fs = cur.get("first_side")
-        if fs:
-            rsi_agree = rsi_ok(fs, r)
-            fib_agree = fib_ok(fs, fib)
-            waited = now - cur["first_t"]
-            rsi_pass = rsi_agree or waited >= RSI_GRACE
-            fib_pass = fib_agree
-            if rsi_pass and fib_pass:
-                cur.pop("rsi_block", None)
-                cur.pop("hold_why", None)
-                cur.update(side=fs, conf=combo_conf(fs, comb, cur["votes"]), locked=True,
-                           called_at=round(elapsed), src="KALSHI",
-                           rsi_call=cur["rsi"], fib_call=round(fib, 2),
-                           rsi_over=not rsi_agree, fib_over=not fib_agree,
-                           votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
-                           comb_call=cur["comb"])
-            else:
-                cur["rsi_block"] = fs
-                cur["hold_why"] = " and ".join(
-                    n for n, ok in (("RSI", rsi_pass), ("Fibonacci", fib_pass)) if not ok)
 
-    if cur["side"] is None and CALL_AFTER <= elapsed and secs_left > CALL_CUTOFF:
-        lead = 1 if mom >= MOM_MIN else -1 if mom <= -MOM_MIN else 0
-        fm = cur.get("first")
-        if not lead:
-            fm = None
-        elif fm is None or fm["dir"] != lead:
-            fm = {"dir": lead, "t": now}
-        cur["first"] = fm
-        if fm and now - fm["t"] >= CONFIRM_SECONDS:
-            pick = pick_call(score, mom, fib, trend, prob)
-            if pick:
-                side, _ = pick
-                cur.update(side=side, conf=combo_conf(side, comb, cur["votes"]), locked=True,
-                           called_at=round(elapsed), src="ETH",
-                           votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
-                           comb_call=cur["comb"])
+def maybe_final_call(cur, ctx, q, elapsed, t):
+    up_p = ctx["ss"]["pm"]
+    cand = "UP" if up_p >= C.final_call_pct else "DOWN" if 100 - up_p >= C.final_call_pct else None
+    if cand is None:
+        cur.pop("final_dir", None)
+    elif cur.get("final_dir") != cand:
+        cur["final_dir"], cur["final_t"] = cand, t
+    elif t - cur["final_t"] >= C.final_hold:
+        make_call(cur, cand, up_p if cand == "UP" else 100 - up_p, "FINAL_AVG", elapsed, q)
 
-    # ---- SELL = the call trigger, firing for the opposite side (disabled by LOCK_CALL) ----
-    if (CALL_MODE == "combined" and all_ready and cur["side"] and cur["side"] == prev_side
-            and secs_left > CALL_CUTOFF and cur.get("flips", 0) < REV_MAX
-            and not LOCK_CALL):                                  # LOCK
-        cside = combo_side(comb, ready, fib, r)
-        if cside is None or cside == cur["side"]:
-            cur.pop("sell_dir", None)
-        elif cur.get("sell_dir") != cside:
-            cur["sell_dir"], cur["sell_t"] = cside, now
-        elif now - cur["sell_t"] >= CONFIRM_SECONDS:
-            flip_call(cur, cside, comb, r, fib, elapsed, now, "SELL_FLIP")
-            cur.pop("sell_dir", None)
 
-    # ---- last minute ----
-    if final and ss and secs_left > FINAL_CUTOFF:
-        up_p, cand = ss["pm"], None
-        if cur["side"] is None:
-            if up_p >= FINAL_CALL_PCT:
-                cand = "UP"
-            elif 100 - up_p >= FINAL_CALL_PCT:
-                cand = "DOWN"
-        elif cur.get("flips", 0) < REV_MAX and not LOCK_CALL:   # LOCK
-            opp = "DOWN" if cur["side"] == "UP" else "UP"
-            if (up_p if opp == "UP" else 100 - up_p) >= FINAL_FLIP_PCT:
-                cand = opp
-        if cand is None:
-            cur.pop("final_dir", None)
-        elif cur.get("final_dir") != cand:
-            cur["final_dir"], cur["final_t"] = cand, now
-        elif now - cur["final_t"] >= FINAL_HOLD:
-            cp = up_p if cand == "UP" else 100 - up_p
-            if cur["side"] is None:
-                cur.update(side=cand, conf=cp, locked=True, called_at=round(elapsed),
-                           src="FINAL_AVG", votes_call=copy.deepcopy(cur["votes"]),
-                           tally_call=list(cur["tally"]), comb_call=cur["comb"])
-            else:
-                flip_call(cur, cand, comb, r, fib, elapsed, now, "FINAL_FLIP")
-                cur["conf"] = cp
-            cur.pop("final_dir", None)
-
+def run_window(state, cur, m, px, age, t, sink):
+    cur.setdefault("open", {})
+    cur.setdefault("open_t", t)
+    close_ts = cur["close_ts"]
+    secs_left, elapsed = close_ts - t, 900 - (close_ts - t)
+    q = quote(m)
+    yes = q["yes"]
+    price, n_ex = px["ETH"]
+    strike = float(m.get("floor_strike") or m.get("cap_strike") or 0) or cur["strike"]
+    cur["strike"] = strike
+    stale = age > C.stale_s or not price
+    prev_side = cur["side"]
+    ctx = update_signals(cur, px, strike, yes, close_ts, t)
+    can_call = not stale and bool(strike)
+    if cur["side"] is None and can_call and secs_left > C.call_cutoff:
+        maybe_call(cur, ctx, q, secs_left, elapsed, t)
+    if (cur["side"] is None and can_call and ctx["ss"]
+            and C.final_cutoff < secs_left <= FINAL_SECONDS):
+        maybe_final_call(cur, ctx, q, elapsed, t)
     if cur["side"]:
-        if final and ss:
-            sp = ss["pm"] if cur["side"] == "UP" else 100 - ss["pm"]
-            cur["live_conf"] = round(max(1.0, min(99.0, sp)), 1)
+        if secs_left <= FINAL_SECONDS and ctx["ss"]:
+            sp = ctx["ss"]["pm"] if cur["side"] == "UP" else 100 - ctx["ss"]["pm"]
+            cur["live_conf"] = round(clamp(sp, 1.0, 99.0), 1)
         else:
-            cur["live_conf"] = round(combo_conf(cur["side"], comb, cur["votes"]), 1)
-
+            cur["live_conf"] = round(combo_conf(cur["side"], ctx["comb"], cur["votes"]), 1)
     cur["price"] = price
     if price:
-        cur.setdefault("eth", []).append([round(elapsed), round(price, 2)])
+        cur["eth"].append([round(elapsed), round(price, 2)])
     cur["pts"].append([round(elapsed), round(yes, 1)])
 
-    # ---- post a new message on events, otherwise refresh the latest one ----
-    old_who, cur["who"] = cur.get("who"), who
-    since_post = now - cur.get("last_post", 0)
-    ev = None
-    if cur["side"] and not prev_side:
-        ev = f"New call: {cur['side']}"
-    elif prev_side and cur["side"] != prev_side:
-        label = {"SELL_FLIP": "Sell flip", "REV_FLIP": "Reversal flip",
-                 "FINAL_FLIP": "Last-minute flip"}.get(cur.get("src"), "Fast flip")
-        ev = f"{label}: SELL {prev_side} → BUY {cur['side']} (confidence {cur['conf']:.0f}%)"
-    elif cur.get("flipped") and not prev_flip:
-        ev = "Signal flipped against the call"
-    elif old_who and who != old_who and who != "even" and since_post >= MIN_GAP:
-        ev = f"Momentum shift: {who} gaining"
-    ev = ev or cur.get("pending_ev")
-    new_due = cur["message_id"] is None or ev is not None or since_post >= NEW_MSG_SECONDS
-    edit_due = now - cur.get("last_edit", 0) >= EDIT_SECONDS
-    if new_due or edit_due:
-        embed = build_embed(cur, state, yes, price, n_ex, secs_left, blend=blend, pm=pm)
+    since_post = t - cur.get("last_post", 0)
+    ev = f"New call: {cur['side']}" if cur["side"] and not prev_side else cur.get("pending_ev")
+    new_due = cur["message_id"] is None or ev is not None or since_post >= C.new_msg_s
+    if new_due or t - cur.get("last_edit", 0) >= C.edit_s:
+        embed = build_embed(cur, state, yes, price, n_ex, secs_left, pm=ctx["pm"],
+                            stale=age if age > C.stale_s else None)
         if ev:
             embed["description"] = f"**Update:** {ev}\n" + embed["description"]
-        text_only = (not new_due) and (now - cur.get("last_img", 0) < IMG_SECONDS)
-        if send_async(embed, None if new_due else cur["message_id"], cur,
-                      cur if new_due else None, text_only):
+        text_only = (not new_due) and (t - cur.get("last_img", 0) < C.img_s)
+        if sink.live(embed, cur, new_due, text_only):
             cur.pop("pending_ev", None)
             if new_due:
-                cur["last_post"] = now
+                cur["last_post"] = t
             if not text_only:
-                cur["last_img"] = now
-            cur["last_edit"] = now
+                cur["last_img"] = t
+            cur["last_edit"] = t
             if cur["side"]:
                 cur["buy_shown"] = True
         elif ev:
             cur["pending_ev"] = ev
-    save_state(state)
 
 
-# =====================================================================
-# LIVE LAYER: push feeds, throttles and local dashboard
-# =====================================================================
-KALSHI_POLL = float(os.getenv("KALSHI_POLL", "0.1"))
-DASH_PORT = int(os.getenv("DASH_PORT", "8000"))
-DASH_HZ = float(os.getenv("DASH_HZ", "30"))
-KEY_ID = os.getenv("KALSHI_KEY_ID")
-KEY_PATH = os.getenv("KALSHI_KEY_PATH")
-
-FEED = {"m": None, "t": 0.0}
-LATEST = {}
-STATE = {"s": None}
-FLOCK = threading.Lock()
-
-
-def run_ws(name, url, on_open, on_msg, headers=None):
-    def loop():
-        while True:
-            try:
-                ws = websocket.WebSocketApp(
-                    url, header=headers() if headers else None,
-                    on_open=on_open, on_message=on_msg,
-                    on_error=lambda w, e: print(name, "error", e))
-                ws.run_forever(ping_interval=15, ping_timeout=8)
-            except Exception as e:
-                print(name, "crashed", e)
-            time.sleep(1)
-    threading.Thread(target=loop, daemon=True).start()
-
-
-def start_price_feeds():
-    def cb_open(ws):
-        ws.send(json.dumps({"type": "subscribe", "product_ids": ["ETH-USD", "BTC-USD"],
-                            "channels": ["ticker"]}))
-
-    def cb_msg(ws, m):
-        d = json.loads(m)
-        if d.get("type") == "ticker" and d.get("price"):
-            LATEST[(d["product_id"][:3], "cb")] = (float(d["price"]), time.time())
-
-    def kr_open(ws):
-        ws.send(json.dumps({"method": "subscribe",
-                            "params": {"channel": "ticker", "symbol": ["ETH/USD", "BTC/USD"]}}))
-
-    def kr_msg(ws, m):
-        d = json.loads(m)
-        if d.get("channel") == "ticker":
-            for x in d.get("data", []):
-                LATEST[(x["symbol"].split("/")[0], "kr")] = (float(x["last"]), time.time())
-
-    def bs_open(ws):
-        for p in ("ethusd", "btcusd"):
-            ws.send(json.dumps({"event": "bts:subscribe",
-                                "data": {"channel": f"live_trades_{p}"}}))
-
-    def bs_msg(ws, m):
-        d = json.loads(m)
-        if d.get("event") == "trade":
-            sym = d["channel"].replace("live_trades_", "")[:3].upper()
-            LATEST[(sym, "bs")] = (float(d["data"]["price"]), time.time())
-
-    run_ws("coinbase", "wss://ws-feed.exchange.coinbase.com", cb_open, cb_msg)
-    run_ws("kraken", "wss://ws.kraken.com/v2", kr_open, kr_msg)
-    run_ws("bitstamp", "wss://ws.bitstamp.net", bs_open, bs_msg)
-
-
-def cached_prices():
-    now, out = time.time(), {}
-    for sym in ("ETH", "BTC"):
-        v = [p for (s, _), (p, t) in list(LATEST.items()) if s == sym and now - t < 10]
-        out[sym] = (statistics.median(v), len(v)) if v else (None, 0)
-    return out
-
-
-_open_market_rest = open_market
-
-
-def kalshi_rest():
-    m = None
-    while True:
-        t0 = time.time()
-        try:
-            if m is None or ts(m["close_time"]) <= time.time():
-                m = _open_market_rest()
-            if m:
-                m = {**m, **get_market(m["ticker"])}
-                with FLOCK:
-                    FEED["m"], FEED["t"] = m, time.time()
-        except Exception as e:
-            print("kalshi rest error", e)
-        time.sleep(max(0.0, (1.0 if KEY_ID else KALSHI_POLL) - (time.time() - t0)))
-
-
-def _ws_headers():
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import padding
-    path = "/trade-api/ws/v2"
-    with open(KEY_PATH, "rb") as f:
-        key = serialization.load_pem_private_key(f.read(), password=None)
-    t = str(int(time.time() * 1000))
-    sig = key.sign((t + "GET" + path).encode(),
-                   padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
-                               salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
-    return {"KALSHI-ACCESS-KEY": KEY_ID, "KALSHI-ACCESS-TIMESTAMP": t,
-            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode()}
-
-
-def kalshi_ws():
-    sub = {"tk": None}
-
-    def on_open(ws):
-        with FLOCK:
-            m = FEED["m"]
-        if m:
-            sub["tk"] = m["ticker"]
-            ws.send(json.dumps({"id": 1, "cmd": "subscribe",
-                                "params": {"channels": ["ticker"],
-                                           "market_tickers": [m["ticker"]]}}))
-
-    def on_msg(ws, raw):
-        msg = json.loads(raw)
-        if msg.get("type") != "ticker":
+def tick(state, feed, sink):
+    t = now()
+    m, age = feed.market()
+    px = feed.prices()
+    if REC and m:
+        REC.write(m, px)
+    with LOCK:
+        roll_window(state, m, sink)
+        if m is None:
             return
-        d = msg.get("msg", {})
-        with FLOCK:
-            if not FEED["m"]:
+        for s, (p, _) in px.items():
+            record_price(s, p)
+        cur = state["current"] or new_window(state, m)
+        run_window(state, cur, m, px, age, t, sink)
+
+
+# ======================================================================
+# SETTLEMENT
+# ======================================================================
+def settle_one(state, p, feed, sink):
+    t = now()
+    if t < p["close_ts"] + 1:
+        return
+    res = feed.result(p["ticker"])
+    if res is None:
+        if t < p["close_ts"] + 300:
+            return
+        if t > p["close_ts"] + 3600:
+            with LOCK:
+                if p in state["pending"]:
+                    state["pending"].remove(p)
+            return
+        if p.get("avg_exp") is not None and (p.get("avg_rem") or 99) <= 5:
+            res = "yes" if p["avg_exp"] >= p["strike"] else "no"
+        else:
+            price = feed.prices()["ETH"][0]
+            if price is None:
                 return
-            if sub["tk"] and FEED["m"]["ticker"] != sub["tk"]:
-                ws.close()
-                return
-            cur = dict(FEED["m"])
-            for k in ("yes_bid", "yes_ask", "yes_bid_dollars", "yes_ask_dollars"):
-                if k in d:
-                    cur[k] = d[k]
-            if "price" in d:
-                cur["last_price"] = d["price"]
-            FEED["m"], FEED["t"] = cur, time.time()
-
-    while FEED["m"] is None:
-        time.sleep(0.2)
-    run_ws("kalshi", "wss://api.elections.kalshi.com/trade-api/ws/v2",
-           on_open, on_msg, headers=_ws_headers)
-
-
-def feed_market():
-    with FLOCK:
-        m = FEED["m"]
-    return m if m and ts(m["close_time"]) > time.time() else None
-
-
-# ---- throttles so disk and settlement calls never slow a tick ----
-_settle_orig, _save_orig = settle_pending, save_state
-_last = {"settle": 0.0, "save": 0.0}
+            res = "yes" if price >= p["strike"] else "no"
+    up_won = res == "yes"
+    win = None if p["side"] is None else (up_won == (p["side"] == "UP"))
+    log_window({"ticker": p["ticker"], "close_ts": p["close_ts"], "strike": p["strike"], "res": res,
+                "side": p["side"], "win": win, "conf": p.get("conf"), "src": p.get("src"),
+                "entry_px": p.get("entry_px"), "yes_entry": p.get("yes_entry"),
+                "feat": p.get("feat_call") or p.get("feat")})
+    with LOCK:
+        if p not in state["pending"]:
+            return
+        state["pending"].remove(p)
+        if p["side"] is None:
+            return
+        state["history"].append({"ticker": p["ticker"], "side": p["side"], "win": win,
+                                 "conf": p.get("conf"), "entry_px": p.get("entry_px"),
+                                 "yes_entry": p.get("yes_entry"), "src": p.get("src"),
+                                 "called_at": p.get("called_at"), "comb": p.get("comb_call")})
+        p["pts"].append([900, 100 if up_won else 0])
+        outcome = "win" if win else "loss"
+        sink.final(build_embed(p, state, 100.0 if up_won else 0.0, None, 0, 0, outcome), p, outcome)
+    save_state(state, force=True)
 
 
-def _save_now(state):
-    _last["save"] = time.time()
-    _save_orig(state)
+def settle_pending(state, feed, sink):
+    with LOCK:
+        todo = list(state["pending"])
+    for p in todo:
+        try:
+            settle_one(state, p, feed, sink)
+        except Exception:
+            log.exception("settle error")
 
 
-def settle_throttled(state):
-    if time.time() - _last["settle"] >= 3:
-        _last["settle"] = time.time()
-        _settle_orig(state)
+def settler_loop(state, feed, sink):
+    while True:
+        settle_pending(state, feed, sink)
+        time.sleep(3)
 
 
-def save_throttled(state):
-    if time.time() - _last["save"] >= 1:
-        _save_now(state)
-
-
-# ---- local live dashboard ----
-PAGE = """<!doctype html><meta charset=utf-8><title>ETH 15m live</title>
+# ======================================================================
+# DASHBOARD
+# ======================================================================
+PAGE = r"""<!doctype html><meta charset=utf-8><title>ETH 15m live</title>
 <style>
 *{box-sizing:border-box}
 body{margin:0;height:100vh;display:flex;flex-direction:column;color:#fff;font-family:system-ui,sans-serif;
@@ -1785,7 +1730,6 @@ es.onmessage=e=>{D=JSON.parse(e.data);off=D.now*1000-Date.now();
  $('info').textContent='Combined '+(D.comb==null?'--':(D.comb>=0?'+':'')+D.comb.toFixed(2))
   +' | RSI '+(D.rsi==null?'--':D.rsi.toFixed(0))
   +' | Fib '+(D.fib||'--')+(D.fib?'%':'')
-  +' | Flips '+(D.flips||0)
   +(D.avg60?' | 60s avg $'+D.avg60.toFixed(2):'')};
 function draw(){
  requestAnimationFrame(draw);if(!D)return;
@@ -1810,19 +1754,18 @@ function draw(){
 draw();
 </script>"""
 
+STATE = {"s": None, "feed": None}
+
 
 def dash_payload(m):
-    st = STATE["s"] or {}
-    cur = st.get("current") or {}
-    out = {"now": time.time(), "price": cached_prices()["ETH"][0],
-           "strike": float(m.get("floor_strike") or m.get("cap_strike") or 0),
-           "close_ts": ts(m["close_time"]), "yes": yes_pct(m),
-           "side": cur.get("side"),
-           "conf": cur.get("live_conf") or cur.get("conf"),
-           "votes": cur.get("votes"), "tally": cur.get("tally"),
-           "comb": cur.get("comb"), "rsi": cur.get("rsi"), "fib": cur.get("fib"),
-           "flips": cur.get("flips", 0), "avg60": cur.get("avg60")}
-    return json.dumps(out, default=str)
+    cur = (STATE["s"] or {}).get("current") or {}
+    q = quote(m)
+    return json.dumps({"now": time.time(), "price": STATE["feed"].prices()["ETH"][0],
+                       "strike": float(m.get("floor_strike") or m.get("cap_strike") or 0),
+                       "close_ts": ts(m["close_time"]), "yes": q["yes"], "side": cur.get("side"),
+                       "conf": cur.get("live_conf") or cur.get("conf"), "votes": cur.get("votes"),
+                       "tally": cur.get("tally"), "comb": cur.get("comb"), "rsi": cur.get("rsi"),
+                       "fib": cur.get("fib"), "avg60": cur.get("avg60")}, default=str)
 
 
 class Dash(BaseHTTPRequestHandler):
@@ -1844,56 +1787,95 @@ class Dash(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             while True:
-                m = feed_market()
+                m, _ = STATE["feed"].market()
                 if m:
                     try:
                         data = dash_payload(m)
+                    except Exception:
+                        data = None
+                    if data:
                         self.wfile.write(f"data: {data}\n\n".encode())
                         self.wfile.flush()
-                    except RuntimeError:
-                        pass  # state changed mid-read; next frame is fine
-                time.sleep(1 / DASH_HZ)
+                time.sleep(1 / C.dash_hz)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
 
-# ---- swap in the live versions (tick reads these globals at call time) ----
-open_market = feed_market
-all_prices = cached_prices
-settle_pending = settle_throttled
-save_state = save_throttled
-
-
+# ======================================================================
+# ENTRY POINTS
+# ======================================================================
 def main():
-    threading.Thread(target=kalshi_rest, daemon=True).start()
-    start_price_feeds()
-    if KEY_ID and KEY_PATH:
-        threading.Thread(target=kalshi_ws, daemon=True).start()
+    global RENDER_POOL, REC
+    if not C.webhook:
+        sys.exit("Set DISCORD_WEBHOOK_URL")
+    if websocket is None:
+        sys.exit("pip install websocket-client cryptography requests pillow")
+    RENDER_POOL = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"))
+    feed, sink = LiveFeed(), LiveSink()
+    STATE["feed"] = feed
+    threading.Thread(target=feed.rest_loop, daemon=True).start()
+    feed.start_price_feeds()
+    if C.key_id and C.key_path:
+        threading.Thread(target=feed.start_kalshi_ws, daemon=True).start()
     else:
-        print("No Kalshi key set: polling Kalshi every", KALSHI_POLL, "s instead of push")
-    srv = ThreadingHTTPServer(("127.0.0.1", DASH_PORT), Dash)
+        log.info("No Kalshi key set: polling every %.2fs", C.kalshi_poll)
+    srv = ThreadingHTTPServer(("127.0.0.1", C.dash_port), Dash)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f"Live dashboard: http://localhost:{DASH_PORT}")
-
-    while feed_market() is None or not LATEST:
+    log.info("Dashboard: http://localhost:%d", C.dash_port)
+    if C.record:
+        REC = Recorder(C.tick_file)
+    while feed.market()[0] is None or not feed.latest:
         time.sleep(0.05)
     state = load_state()
     STATE["s"] = state
-    end = time.time() + RUN_SECONDS
-    nxt = time.time()
-    while time.time() < end:
-        try:
-            tick(state)
-        except Exception as e:
-            print("tick error", e)
-        nxt += POLL
-        d = nxt - time.time()
-        if d > 0:
-            time.sleep(d)
-        else:
-            nxt = time.time()
+    threading.Thread(target=settler_loop, args=(state, feed, sink), daemon=True).start()
+    end, nxt, errs = time.time() + C.run_s, time.time(), 0
+    try:
+        while time.time() < end:
+            try:
+                tick(state, feed, sink)
+                save_state(state)
+                errs = 0
+            except Exception:
+                errs += 1
+                log.exception("tick error")
+                time.sleep(min(5.0, 0.2 * errs))
+            nxt += C.poll
+            d = nxt - time.time()
+            if d > 0:
+                time.sleep(d)
+            else:
+                nxt = time.time()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        save_state(state, force=True)
+        RENDER_POOL.shutdown(wait=False, cancel_futures=True)
+
+
+def replay(path):
+    C.state_file, C.windows_file = "replay_state.json", "replay_windows.jsonl"
+    for f in (C.state_file, C.windows_file):
+        if os.path.exists(f):
+            os.remove(f)
+    feed, sink = ReplayFeed(path), NullSink()
+    state = {"history": [], "current": None, "pending": []}
+    for row in feed.rows:
+        feed.step(row)
+        tick(state, feed, sink)
+        settle_pending(state, feed, sink)
+    save_state(state, force=True)
+    report(state["history"])
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
+                        format="%(asctime)s %(levelname)s %(message)s")
+    if len(sys.argv) > 2 and sys.argv[1] == "replay":
+        replay(sys.argv[2])
+    elif len(sys.argv) > 1 and sys.argv[1] == "report":
+        with open(sys.argv[2] if len(sys.argv) > 2 else C.state_file) as fh:
+            report(json.load(fh)["history"])
+    else:
+        main()
