@@ -1,7 +1,9 @@
-"""Kalshi ETH 15m signal bot v2 (single file).
+#!/usr/bin/env python3
+"""Kalshi ETH 15m signal bot v2.1 (single file).
   python bot.py                 live
   python bot.py replay FILE     backtest recorded ticks (no Discord)
   python bot.py report [STATE]  ROI, calibration, baselines
+  python bot.py audit           list recent calls with Kalshi results
 """
 import base64, functools, io, json, logging, math, multiprocessing, os, random, statistics, sys, threading, time
 from collections import deque
@@ -54,6 +56,11 @@ class C:
     tick_file = _e("TICK_FILE", "ticks.jsonl")
     record = _e("RECORD", 1)
     stale_s = _e("STALE_SECONDS", 5.0)
+    price_max_age = _e("PRICE_MAX_AGE", 45.0)   # exchange price counts for this long
+    min_exch = _e("MIN_EXCH", 2)                # no new calls with fewer feeds
+    min_conf = _e("MIN_CONF", 55.0)             # instant calls need this confidence
+    max_jump = _e("MAX_JUMP", 0.015)            # ignore single-tick jumps bigger than 1.5%
+    fresh_stats = _e("FRESH_STATS", 0)          # 1 = archive old win/loss record at startup
     wide_spread = _e("WIDE_SPREAD", 10.0)
     abstain = _e("ABSTAIN", 0.04)
     instant = _e("INSTANT_CALL", 1)
@@ -266,7 +273,8 @@ class LiveFeed:
     def prices(self):
         t, out = time.time(), {}
         for sym in ("ETH", "BTC"):
-            v = [p for (s, _), (p, ts_) in list(self.latest.items()) if s == sym and t - ts_ < 5]
+            v = [p for (s, _), (p, ts_) in list(self.latest.items())
+                 if s == sym and t - ts_ < C.price_max_age]
             if len(v) >= 3:
                 med = statistics.median(v)
                 v = [p for p in v if abs(p / med - 1) < 0.005]   # drop outlier exchange
@@ -424,6 +432,20 @@ REC = None
 PRICES = {s: deque(maxlen=6000) for s in ("ETH", "BTC")}
 WEIGHTS = {"ETH": 0.5, "BTC": 0.5}
 DEF_SIG = {"ETH": 1.1e-4, "BTC": 0.9e-4}
+LASTGOOD = {}
+
+
+def sanitize(px):
+    """Hold the last good price when a feed jumps more than MAX_JUMP; n=0 pauses calls."""
+    out, t = {}, now()
+    for s, (p, n) in px.items():
+        g = LASTGOOD.get(s)
+        if p and g and abs(p / g[0] - 1) > C.max_jump and t - g[1] < 15:
+            p, n = g[0], 0
+        elif p:
+            LASTGOOD[s] = (p, t)
+        out[s] = (p, n)
+    return out
 
 
 def record_price(sym, price):
@@ -714,7 +736,7 @@ def instant_pick(yes, ss, mom, trend, fib, comb):
 
 
 # ======================================================================
-# STATE, STATS, REPORT
+# STATE, STATS, REPORT, AUDIT
 # ======================================================================
 LAST_SAVE = {"t": 0.0}
 
@@ -725,6 +747,7 @@ def load_state():
             with open(path) as f:
                 s = json.load(f)
             s.setdefault("history", [])
+            s.setdefault("history_old", [])
             s.setdefault("pending", [])
             s.setdefault("current", None)
             return s
@@ -732,7 +755,7 @@ def load_state():
             continue
         except Exception:
             log.exception("could not read %s", path)
-    return {"history": [], "current": None, "pending": []}
+    return {"history": [], "history_old": [], "current": None, "pending": []}
 
 
 def _slim(c):
@@ -751,6 +774,7 @@ def save_state(state, force=False):
     with LOCK:
         state["history"] = state["history"][-500:]
         blob = json.dumps({"history": state["history"],
+                           "history_old": state.get("history_old", [])[-2000:],
                            "pending": [_slim(p) for p in state["pending"]],
                            "current": _slim(state["current"])}, separators=(",", ":"), default=str)
     tmp = C.state_file + ".tmp"
@@ -814,6 +838,23 @@ def report(history):
               f"always UP {up / len(base) * 100:.1f}%")
 
 
+def audit(n=30):
+    try:
+        with open(C.windows_file) as f:
+            rows = [json.loads(x) for x in f if x.strip()]
+    except FileNotFoundError:
+        print("no windows file yet; it logs windows settled since the v2 upgrade")
+        return
+    called = [r for r in rows if r.get("side")]
+    bad = [r for r in called if r.get("win") != ((r["res"] == "yes") == (r["side"] == "UP"))]
+    print(f"{len(rows)} windows logged, {len(called)} with a call, {len(bad)} inconsistent")
+    for r in called[-n:]:
+        when = datetime.fromtimestamp(r["close_ts"]).strftime("%m-%d %H:%M")
+        print(f"{when} {r['ticker']} call {r['side']:4s} result {r['res']:3s} "
+              f"{'WIN ' if r['win'] else 'LOSS'} entry {r.get('entry_px')}c conf {r.get('conf')}")
+    print("Check a few of these tickers against Kalshi's own results page.")
+
+
 # ======================================================================
 # CHART RENDERER (runs in a separate process)
 # ======================================================================
@@ -827,7 +868,8 @@ TGT = (205, 210, 220)
 _FONT_DIRS = ["", "/usr/share/fonts/truetype/inter/", "/usr/share/fonts/truetype/roboto/",
               "/usr/share/fonts/truetype/liberation/", "/usr/share/fonts/truetype/liberation2/",
               "/usr/share/fonts/truetype/noto/", "/usr/share/fonts/truetype/dejavu/",
-              "C:/Windows/Fonts/", "/Library/Fonts/", "/System/Library/Fonts/Supplemental/"]
+              "/system/fonts/", "C:/Windows/Fonts/", "/Library/Fonts/",
+              "/System/Library/Fonts/Supplemental/"]
 _FONTS_B = ["Inter-Bold.ttf", "Roboto-Bold.ttf", "LiberationSans-Bold.ttf", "NotoSans-Bold.ttf",
             "arialbd.ttf", "Arial Bold.ttf", "DejaVuSans-Bold.ttf"]
 _FONTS_R = ["Inter-Regular.ttf", "Roboto-Regular.ttf", "LiberationSans-Regular.ttf",
@@ -1333,14 +1375,17 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, st
             if k in vt:
                 lines.append(f"{lab(vt[k][0])} · **{nm}** {vt[k][1]}")
         cb = c.get("comb_call") if done and c.get("comb_call") is not None else c.get("comb")
+        lean = "UP" if tally[0] > tally[1] else "DOWN" if tally[1] > tally[0] else "split"
         lines.append(f"**Confluence** UP {tally[0]} / DOWN {tally[1]} / NEUTRAL {tally[2]}"
-                     + (f" → **{side}**" if side else " → no call yet"))
+                     f" → indicators lean {lean}"
+                     + (f" | **locked call {side}**" if side else " | no call yet"))
         if cb is not None:
             lines.append(f"**Combined score** {cb:+.2f} (indicator call at ±{C.combo_min:.2f})")
     if stale:
         lines.append(f"**Warning** data is {stale:.0f}s old, new calls paused")
     if price:
-        lines.append(f"**Price** ${price:,.2f} (median of {n_ex} exch)")
+        lines.append(f"**Price** ${price:,.2f} (median of {n_ex} exch)"
+                     + (" ⚠ too few feeds, new calls paused" if n_ex < C.min_exch else ""))
     lines.append(f"**Strike** {c['strike']:,.2f} | {max(int(secs_left), 0)}s left")
     return {"title": title, "description": "\n".join(lines), "color": color, "fields": fields,
             "footer": {"text": "Signals only, not financial advice"},
@@ -1525,8 +1570,10 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t):
     if C.instant:
         side, s = instant_pick(q["yes"], ss, ctx["mom"], ctx["trend"], ctx["fib"], ctx["comb"])
         if side:
-            make_call(cur, side, combo_conf(side, s, cur["votes"]), "INSTANT", elapsed, q)
-            return
+            conf = combo_conf(side, s, cur["votes"])
+            if conf >= C.min_conf:
+                make_call(cur, side, conf, "INSTANT", elapsed, q)
+                return
     if ctx["all_ready"]:   # second chance: indicator confluence held for a few seconds
         cside = combo_side(ctx["comb"], ctx["ready"], ctx["fib"], ctx["r"])
         if cside and ss:
@@ -1561,7 +1608,7 @@ def run_window(state, cur, m, px, age, t, sink):
     price, n_ex = px["ETH"]
     strike = float(m.get("floor_strike") or m.get("cap_strike") or 0) or cur["strike"]
     cur["strike"] = strike
-    stale = age > C.stale_s or not price
+    stale = age > C.stale_s or not price or n_ex < C.min_exch
     prev_side = cur["side"]
     ctx = update_signals(cur, px, strike, yes, close_ts, t)
     can_call = not stale and bool(strike)
@@ -1606,7 +1653,7 @@ def run_window(state, cur, m, px, age, t, sink):
 def tick(state, feed, sink):
     t = now()
     m, age = feed.market()
-    px = feed.prices()
+    px = sanitize(feed.prices())
     if REC and m:
         REC.write(m, px)
     with LOCK:
@@ -1675,15 +1722,21 @@ def settle_pending(state, feed, sink):
 
 
 def settler_loop(state, feed, sink):
+    last_health = 0.0
     while True:
         settle_pending(state, feed, sink)
+        if time.time() - last_health > 60:
+            last_health = time.time()
+            ages = {f"{s}/{x}": round(time.time() - t_) for (s, x), (_, t_) in list(feed.latest.items())}
+            log.info("feed ages in seconds (6 expected: ETH+BTC x cb/kr/bs): %s", ages)
         time.sleep(3)
 
 
 # ======================================================================
 # DASHBOARD
 # ======================================================================
-PAGE = r"""<!doctype html><meta charset=utf-8><title>ETH 15m live</title>
+PAGE = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>ETH 15m live</title>
 <style>
 *{box-sizing:border-box}
 body{margin:0;height:100vh;display:flex;flex-direction:column;color:#fff;font-family:system-ui,sans-serif;
@@ -1809,7 +1862,7 @@ def main():
     if not C.webhook:
         sys.exit("Set DISCORD_WEBHOOK_URL")
     if websocket is None:
-        sys.exit("pip install websocket-client cryptography requests pillow")
+        sys.exit("pip install websocket-client requests pillow")
     RENDER_POOL = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"))
     feed, sink = LiveFeed(), LiveSink()
     STATE["feed"] = feed
@@ -1819,15 +1872,22 @@ def main():
         threading.Thread(target=feed.start_kalshi_ws, daemon=True).start()
     else:
         log.info("No Kalshi key set: polling every %.2fs", C.kalshi_poll)
-    srv = ThreadingHTTPServer(("127.0.0.1", C.dash_port), Dash)
-    srv.daemon_threads = True
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    log.info("Dashboard: http://localhost:%d", C.dash_port)
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", C.dash_port), Dash)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log.info("Dashboard: http://localhost:%d", C.dash_port)
+    except OSError as e:
+        log.warning("dashboard not started: %s", e)
     if C.record:
         REC = Recorder(C.tick_file)
     while feed.market()[0] is None or not feed.latest:
         time.sleep(0.05)
     state = load_state()
+    if C.fresh_stats and state["history"]:
+        state.setdefault("history_old", []).extend(state["history"])
+        state["history"] = []
+        log.info("archived old history, stats start fresh")
     STATE["s"] = state
     threading.Thread(target=settler_loop, args=(state, feed, sink), daemon=True).start()
     end, nxt, errs = time.time() + C.run_s, time.time(), 0
@@ -1860,7 +1920,7 @@ def replay(path):
         if os.path.exists(f):
             os.remove(f)
     feed, sink = ReplayFeed(path), NullSink()
-    state = {"history": [], "current": None, "pending": []}
+    state = {"history": [], "history_old": [], "current": None, "pending": []}
     for row in feed.rows:
         feed.step(row)
         tick(state, feed, sink)
@@ -1874,6 +1934,8 @@ if __name__ == "__main__":
                         format="%(asctime)s %(levelname)s %(message)s")
     if len(sys.argv) > 2 and sys.argv[1] == "replay":
         replay(sys.argv[2])
+    elif len(sys.argv) > 1 and sys.argv[1] == "audit":
+        audit()
     elif len(sys.argv) > 1 and sys.argv[1] == "report":
         with open(sys.argv[2] if len(sys.argv) > 2 else C.state_file) as fh:
             report(json.load(fh)["history"])
