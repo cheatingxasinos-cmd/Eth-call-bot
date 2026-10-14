@@ -48,7 +48,7 @@ MIN_SCORE = float(os.getenv("MIN_SCORE", "0.22"))
 MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))
 FLIP_SCORE = float(os.getenv("FLIP_SCORE", "99"))
 CALL_AFTER = int(os.getenv("CALL_AFTER", "99999"))
-CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "1.5"))
+CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "3"))   # LOCK: was 1.5
 W_MOM = float(os.getenv("W_MOM", "0.35"))
 W_RSI = float(os.getenv("W_RSI", "0.10"))
 W_FIB = float(os.getenv("W_FIB", "0.35"))
@@ -74,8 +74,8 @@ TIMER_LEAD = float(os.getenv("TIMER_LEAD", "0.7"))    # LIVE: clock shows the ti
 CALL_MODE = os.getenv("CALL_MODE", "combined")
 W_CORE = float(os.getenv("W_CORE", "0.5"))
 W_VOTE = float(os.getenv("W_VOTE", "0.5"))
-COMBO_MIN = float(os.getenv("COMBO_MIN", "0.30"))
-COMBO_OPP = int(os.getenv("COMBO_OPP", "1"))
+COMBO_MIN = float(os.getenv("COMBO_MIN", "0.40"))            # LOCK: was 0.30
+COMBO_OPP = int(os.getenv("COMBO_OPP", "0"))                 # LOCK: was 1
 CONF_MIN = int(os.getenv("CONF_MIN", "3"))
 EMA_DEAD = float(os.getenv("EMA_DEAD", "0.00005"))
 MACD_DEAD = float(os.getenv("MACD_DEAD", "0.00002"))
@@ -105,7 +105,20 @@ REV_FLIP = int(os.getenv("REV_FLIP", "1"))
 REV_MKT = float(os.getenv("REV_MKT", "60"))
 REV_PM = float(os.getenv("REV_PM", "65"))
 REV_HOLD = float(os.getenv("REV_HOLD", "3"))
-REV_MAX = int(os.getenv("REV_MAX", "3"))
+REV_MAX = int(os.getenv("REV_MAX", "0"))                     # LOCK: was 3 (0 = no flips)
+
+# ---- lock settings ----
+LOCK_CALL = int(os.getenv("LOCK_CALL", "1"))                 # LOCK: 1 = call is final, no flips
+LOCK_PM = float(os.getenv("LOCK_PM", "55"))                  # LOCK: strike model must back the side by this %
+
+# ---- instant call settings ----
+INSTANT_CALL = int(os.getenv("INSTANT_CALL", "1"))           # INSTANT: 1 = call on the first tick of every window
+W_I_PM = float(os.getenv("W_I_PM", "0.25"))                  # INSTANT: strike/settlement model
+W_I_MKT = float(os.getenv("W_I_MKT", "0.25"))                # INSTANT: Kalshi YES price
+W_I_MOM = float(os.getenv("W_I_MOM", "0.20"))                # INSTANT: tape momentum
+W_I_TREND = float(os.getenv("W_I_TREND", "0.15"))            # INSTANT: EMA3/8 + BTC/ETH basket tilt
+W_I_FIB = float(os.getenv("W_I_FIB", "0.10"))                # INSTANT: fib swing
+W_I_COMB = float(os.getenv("W_I_COMB", "0.05"))              # INSTANT: combined indicator score
 
 # ---- last-minute settlement settings ----
 W_MARKET_FINAL = float(os.getenv("W_MARKET_FINAL", "0.35"))
@@ -1293,6 +1306,18 @@ def flip_call(cur, new_side, comb, r, fib, elapsed, now, src):
     cur.pop("rev_t", None)
 
 
+def instant_pick(price, strike, yes, ss, mom, trend, fib, comb):
+    """INSTANT: always returns (side, score). Positive score = UP."""
+    s = W_I_MKT * (yes - 50) / 50
+    if ss:
+        s += W_I_PM * (ss["pm"] - 50) / 50
+    s += W_I_MOM * mom + W_I_TREND * trend + W_I_FIB * fib
+    s += W_I_COMB * max(-1.0, min(1.0, comb))
+    if abs(s) < 1e-6:                      # dead tie: price vs strike, then Kalshi
+        s = (price - strike) or (yes - 50) or 1.0
+    return ("UP" if s > 0 else "DOWN"), s
+
+
 def tick(state):
     settle_pending(state)
     m = open_market()
@@ -1380,9 +1405,25 @@ def tick(state):
                            f"retrace {fib_lvl}% ({fib:+.2f})" if fib_lvl else "forming"]
     cur["comb"] = round(comb, 3)
 
+    # ---- INSTANT: decide on the first tick, then lock ----
+    if (INSTANT_CALL and cur["side"] is None and secs_left > CALL_CUTOFF
+            and price and strike):
+        isd, iscore = instant_pick(price, strike, yes, ss, mom, trend, fib, comb)
+        cur.update(side=isd, conf=combo_conf(isd, iscore, cur["votes"]), locked=True,
+                   called_at=round(elapsed), src="INSTANT",
+                   rsi_call=cur["rsi"], fib_call=round(fib, 2),
+                   rsi_over=False, fib_over=False,
+                   votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
+                   comb_call=cur["comb"])
+
     # ---- initial call ----
     if CALL_MODE == "combined" and all_ready and cur["side"] is None and secs_left > CALL_CUTOFF:
         cside = combo_side(comb, ready, fib, r)
+        # LOCK: the call is final, so the settlement model must back the same side
+        if cside and LOCK_CALL and ss:
+            agree_pct = ss["pm"] if cside == "UP" else 100 - ss["pm"]
+            if agree_pct < LOCK_PM:
+                cside = None
         if cside is None:
             cur.pop("comb_dir", None)
         elif cur.get("comb_dir") != cside:
@@ -1436,9 +1477,10 @@ def tick(state):
                            votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
                            comb_call=cur["comb"])
 
-    # ---- SELL = the call trigger, firing for the opposite side ----
+    # ---- SELL = the call trigger, firing for the opposite side (disabled by LOCK_CALL) ----
     if (CALL_MODE == "combined" and all_ready and cur["side"] and cur["side"] == prev_side
-            and secs_left > CALL_CUTOFF and cur.get("flips", 0) < REV_MAX):
+            and secs_left > CALL_CUTOFF and cur.get("flips", 0) < REV_MAX
+            and not LOCK_CALL):                                  # LOCK
         cside = combo_side(comb, ready, fib, r)
         if cside is None or cside == cur["side"]:
             cur.pop("sell_dir", None)
@@ -1456,7 +1498,7 @@ def tick(state):
                 cand = "UP"
             elif 100 - up_p >= FINAL_CALL_PCT:
                 cand = "DOWN"
-        elif cur.get("flips", 0) < REV_MAX:
+        elif cur.get("flips", 0) < REV_MAX and not LOCK_CALL:   # LOCK
             opp = "DOWN" if cur["side"] == "UP" else "UP"
             if (up_p if opp == "UP" else 100 - up_p) >= FINAL_FLIP_PCT:
                 cand = opp
