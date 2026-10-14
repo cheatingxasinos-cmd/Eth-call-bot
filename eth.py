@@ -1,4 +1,4 @@
-"""Kalshi ETH 15m signal bot v3.1 (single file).
+"""Kalshi ETH 15m signal bot v3.2 (single file).
   python bot.py                 live
   python bot.py replay FILE     backtest recorded ticks (no Discord)
   python bot.py fit             fit the probability blend on samples.jsonl
@@ -93,11 +93,25 @@ class C:
     final_call_pct = _e("FINAL_CALL_PCT", 70.0)
     final_hold = _e("FINAL_HOLD", 2.0)
     final_cutoff = _e("FINAL_CUTOFF", 5)
-    # edge-based calling
-    min_edge = _e("MIN_EDGE", 1.0)        # cents of expected value after fee; -99 = always call
+    # old edge settings (no longer used to decide calls; edge is not shown)
+    min_edge = _e("MIN_EDGE", 1.0)
     min_p = _e("MIN_P", 0.62)
     edge_hold = _e("EDGE_HOLD", 2.0)
-    call_max = _e("CALL_MAX", 150.0)      # only call in the last N seconds; 900 = whole window
+    # indicator-vote calling
+    call_max = _e("CALL_MAX", 900.0)          # 900 = call any time in the window
+    conv_min = _e("CONV_MIN", 0.75)           # weighted vote strength needed to call, 0..1
+    conv_flip = _e("CONV_FLIP", 0.85)         # stronger bar to flip an existing call
+    vote_min_ready = _e("VOTE_MIN_READY", 5)  # indicators that must be warmed up, of 6
+    call_hold = _e("CALL_HOLD", 3.0)          # seconds the signal must persist before a first call
+    flip_hold = _e("FLIP_HOLD", 4.0)          # seconds the opposite signal must persist to flip
+    flip_cooldown = _e("FLIP_COOLDOWN", 25.0) # minimum seconds between calls in one window
+    flip_cutoff = _e("FLIP_CUTOFF", 15)       # no flips in the last N seconds
+    max_flips = _e("MAX_FLIPS", 2)
+    quote_max_age = _e("QUOTE_MAX_AGE", 3.0)  # Kalshi quote must be this fresh to call
+    call_px_age = _e("CALL_PX_AGE", 5.0)      # exchange price must be this fresh to call
+    max_disp_bp = _e("MAX_DISP_BP", 6.0)      # max exchange disagreement, basis points
+    max_spread = _e("MAX_SPREAD", 6.0)        # max Kalshi bid/ask spread, cents
+    max_entry = _e("MAX_ENTRY", 88.0)         # never pay more than this per contract, cents
     calib_file = _e("CALIB_FILE", "calib.json")
     samples_file = _e("SAMPLES_FILE", "samples.jsonl")
     sample_s = _e("SAMPLE_SECONDS", 10.0)
@@ -289,6 +303,23 @@ class LiveFeed:
             out[sym] = (statistics.median(v), len(v)) if v else (None, 0)
         return out
 
+    def quality(self):
+        """Is the data trustworthy enough to open a new call right now?"""
+        t = time.time()
+        fresh = [p for (s, _), (p, ts_) in list(self.latest.items())
+                 if s == "ETH" and t - ts_ < C.call_px_age]
+        n = len(fresh)
+        disp = (max(fresh) / min(fresh) - 1) * 1e4 if n >= 1 else 0.0
+        with self.lock:
+            qage = t - self.t if self.m else 999.0
+        if n < C.min_exch:
+            return {"ok": False, "why": f"only {n} fresh feeds"}
+        if disp > C.max_disp_bp:
+            return {"ok": False, "why": f"exchanges disagree {disp:.1f}bp"}
+        if qage > C.quote_max_age:
+            return {"ok": False, "why": f"Kalshi quote {qage:.1f}s old"}
+        return {"ok": True, "why": None}
+
     def start_price_feeds(self):
         L = self.latest
 
@@ -410,6 +441,10 @@ class ReplayFeed:
 
     def prices(self):
         return {s: (v[0], v[1]) for s, v in self.row["px"].items()}
+
+    def quality(self):
+        n = self.row["px"].get("ETH", [None, 0])[1]
+        return {"ok": n >= C.min_exch, "why": None if n >= C.min_exch else f"only {n} feeds"}
 
     def result(self, ticker):
         return self.results.get(ticker) if now() > ts(self.row["m"]["close_time"]) else None
@@ -575,7 +610,7 @@ def predict(yes, ss, secs_left):
 
 
 # ======================================================================
-# PROBABILITY AND EDGE-BASED CALLING
+# PROBABILITY (display only) AND INDICATOR-VOTE CALLING
 # ======================================================================
 def logit(p):
     p = clamp(p, 0.005, 0.995)
@@ -613,36 +648,87 @@ def p_up(yes, ss, secs_left):
 
 
 def edge_for(side, pu, q):
-    """(win prob, expected value in cents after fee, entry price in cents)."""
+    """(win prob, expected value in cents after fee, entry price in cents). Not used for calls."""
     ep = entry_price(q, side)
     ps = pu if side == "UP" else 1 - pu
     fee = 7 * (ep / 100) * (1 - ep / 100)        # approx Kalshi taker fee per contract, cents
     return ps, ps * 100 - ep - fee, ep
 
 
-def maybe_call(cur, ctx, q, secs_left, elapsed, t):
+VOTE_W = {"atr": 1.5, "ema": 1.0, "macd": 1.0, "mom": 1.0, "boll": 0.5, "fib": 0.5}
+
+
+def conviction(votes):
+    """Weighted vote over all six indicators: (score -1..1, ready, up, down).
+    Neutral votes count in the denominator, so only near-unanimous agreement scores high."""
+    num = den = 0.0
+    ready = up = dn = 0
+    for k, w in VOTE_W.items():
+        v = (votes.get(k) or [None])[0]
+        if v is None:
+            continue
+        ready += 1
+        den += w
+        num += w * v
+        up += v == 1
+        dn += v == -1
+    return (num / den if den else 0.0), ready, up, dn
+
+
+def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
     pu = p_up(q["yes"], ctx["ss"], secs_left)
-    if pu is None:
+    if pu is not None:
+        cur["p_up"] = round(pu, 4)               # display only
+    score, ready, up, dn = conviction(cur["votes"])
+    cur["conv"] = round(score, 3)
+
+    why = None
+    if not fq["ok"]:
+        why = fq["why"]
+    elif q["spread"] is not None and q["spread"] > C.max_spread:
+        why = f"Kalshi spread {q['spread']:.0f}c"
+    elif ready < C.vote_min_ready:
+        why = f"only {ready}/6 indicators ready"
+    cur["gate"] = why
+
+    cand = None
+    if why is None:
+        side = "UP" if score >= C.conv_min else "DOWN" if score <= -C.conv_min else None
+        opposed = dn if side == "UP" else up
+        atr_v = (cur["votes"].get("atr") or [None])[0]
+        atr_ok = atr_v == (1 if side == "UP" else -1)   # distance to strike must agree
+        if side and opposed == 0 and atr_ok and entry_price(q, side) <= C.max_entry:
+            cand = side
+
+    side = cur["side"]
+    if cand is None or cand == side:
+        cur.pop("cand", None)
         return
-    cur["p_up"] = round(pu, 4)
-    best = None
-    for side in ("UP", "DOWN"):
-        ps, edge, _ = edge_for(side, pu, q)
-        if ps >= C.min_p and edge >= C.min_edge and (best is None or edge > best[1]):
-            best = (side, edge, ps)
-    if best is None:
-        cur.pop("edge_dir", None)
+    if side is not None:                          # flip rules
+        if (cur.get("flips", 0) >= C.max_flips or secs_left <= C.flip_cutoff
+                or elapsed - cur.get("called_at", 0) < C.flip_cooldown
+                or abs(score) < C.conv_flip):
+            cur.pop("cand", None)
+            return
+        need = C.flip_hold
+    else:
+        need = C.call_hold
+    if cur.get("cand") != cand:
+        cur["cand"], cur["cand_t"] = cand, t
         return
-    side, edge, ps = best
-    if cur.get("edge_dir") != side:
-        cur["edge_dir"], cur["edge_t"] = side, t
-    elif t - cur["edge_t"] >= C.edge_hold:
-        cur["edge"] = round(edge, 2)
-        make_call(cur, side, ps * 100, "EDGE", elapsed, q)
+    if t - cur["cand_t"] < need:
+        return
+    if side is not None:                          # keep the superseded call for the audit log
+        cur["flips"] = cur.get("flips", 0) + 1
+        cur.setdefault("calls", []).append(
+            {"side": side, "at": cur.get("called_at"), "entry_px": cur.get("entry_px"), "conf": cur.get("conf")})
+        cur["buy_shown"] = False
+    cur.pop("cand", None)
+    make_call(cur, cand, 50 + 40 * abs(score), "VOTE", elapsed, q)
 
 
 # ======================================================================
-# INDICATORS (display only, they do not decide calls)
+# INDICATORS
 # ======================================================================
 def _ema(vals, n):
     a = 2 / (n + 1)
@@ -875,6 +961,9 @@ def report(history):
         up = sum(1 for h in base if up_won(h))
         print(f"baselines on {len(base)} calls: follow Kalshi favorite {fav / len(base) * 100:.1f}%, "
               f"always UP {up / len(base) * 100:.1f}%")
+    flips = sum(h.get("flips", 0) for h in history)
+    if flips:
+        print(f"{flips} flips across {n} calls (only the final side is scored here)")
 
 
 def audit(n=30):
@@ -890,12 +979,13 @@ def audit(n=30):
     for r in called[-n:]:
         when = datetime.fromtimestamp(r["close_ts"]).strftime("%m-%d %H:%M")
         print(f"{when} {r['ticker']} call {r['side']:4s} result {r['res']:3s} "
-              f"{'WIN ' if r['win'] else 'LOSS'} entry {r.get('entry_px')}c conf {r.get('conf')}")
+              f"{'WIN ' if r['win'] else 'LOSS'} entry {r.get('entry_px')}c conf {r.get('conf')} "
+              f"flips {r.get('flips', 0)}")
     print("Check a few of these tickers against Kalshi's own results page.")
 
 
 # ======================================================================
-# FITTING (optional: replaces the prior with measured weights)
+# FITTING (optional: replaces the display prior with measured weights)
 # ======================================================================
 def _fit(rows, iters=500, lr=1.0, l2=1e-3):
     X = [(logit(r["pm"] / 100), logit(r["yes"] / 100), 1.0) for r in rows]
@@ -936,7 +1026,7 @@ def fit(test_frac=0.3):
         print("blend beats the market out of sample, saved", out)
     else:
         out = {"a": 0.0, "b": 1.0, "c": 0.0}
-        print("no measurable edge over the Kalshi price; saved pure-market weights (no calls)")
+        print("no measurable edge over the Kalshi price; saved pure-market weights")
     with open(C.calib_file, "w") as f:
         json.dump(out, f)
 
@@ -1419,6 +1509,8 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, st
         title, color = "⚪ KALSHI ETH 15m: NO CALL", GREY
         lines = ["**Call:** ⚪ NO CALL yet", "**Action:** WAIT, no position",
                  f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%"]
+        if c.get("gate"):
+            lines.append(f"**Gate** no call: {c['gate']}")
     else:
         arrow = "🆙" if side == "UP" else "⬇️"
         conf = c.get("conf") or 50
@@ -1426,17 +1518,20 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, st
                       "settling": ("⏳ SETTLING", GREY)}.get(outcome, (None, GREEN if side == "UP" else RED))
         action = tag or ("HOLD" if c.get("buy_shown") else "BUY")
         lines = [f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry)"]
+        if c.get("flips"):
+            lines.append(f"**Flips** {c['flips']} this window")
         if not outcome:
             lc = c.get("live_conf", conf)
             lines.append(f"**Updated confidence:** {lc:.0f}% ({lc - conf:+.0f} vs entry)")
         lines += [f"**Action:** {action}", f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%"]
         if c.get("entry_px") is not None:
             lines.append(f"**Entry price** {c['entry_px']:.0f}¢")
-        if c.get("edge") is not None:
-            lines.append(f"**Edge at entry** {c['edge']:+.1f}¢ after fee")
         title = f"{arrow} KALSHI ETH 15m: {side} | {action}"
     if pm is not None:
         lines.append(f"**Strike model** UP {pm:.0f}% / DOWN {100 - pm:.0f}%")
+    if c.get("conv") is not None and not outcome:
+        lines.append(f"**Vote strength** {c['conv']:+.2f} (needs ±{C.conv_min:.2f} to call, "
+                     f"±{C.conv_flip:.2f} to flip)")
     if c.get("p_up") is not None and not outcome:
         lines.append(f"**Blended** UP {c['p_up'] * 100:.0f}% / DOWN {100 - c['p_up'] * 100:.0f}%")
     if c.get("avg_exp") is not None and (secs_left <= FINAL_SECONDS or outcome):
@@ -1460,15 +1555,15 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, st
         names = {"mom": "Momentum", "fib": "Fibonacci", "ema": "EMA 9/21",
                  "boll": "Bollinger", "atr": "ATR", "macd": "MACD"}
         lab = lambda v: "⚪ WARMING" if v is None else "🟢 UP" if v > 0 else "🔴 DOWN" if v < 0 else "⚪ NEUTRAL"
-        lines.append("**Indicators at entry (display only)**" if done and c.get("votes_call")
-                     else "**Indicators (display only)**")
+        lines.append("**Indicators at entry**" if done and c.get("votes_call")
+                     else "**Indicators (they decide the call)**")
         for k, nm in names.items():
             if k in vt:
                 lines.append(f"{lab(vt[k][0])} · **{nm}** {vt[k][1]}")
         lean = "UP" if tally[0] > tally[1] else "DOWN" if tally[1] > tally[0] else "split"
         lines.append(f"**Confluence** UP {tally[0]} / DOWN {tally[1]} / NEUTRAL {tally[2]}"
                      f" → indicators lean {lean}"
-                     + (f" | **locked call {side}**" if side else " | no call yet"))
+                     + (f" | **call {side}**" if side else " | no call yet"))
     if stale:
         lines.append(f"**Warning** data is {stale:.0f}s old, new calls paused")
     if price:
@@ -1653,7 +1748,7 @@ def update_signals(cur, px, strike, yes, close_ts, t):
             "r": r, "comb": comb, "ready": ready, "all_ready": len(ready) == 4}
 
 
-def run_window(state, cur, m, px, age, t, sink):
+def run_window(state, cur, m, px, age, t, sink, fq):
     cur.setdefault("open", {})
     cur.setdefault("open_t", t)
     close_ts = cur["close_ts"]
@@ -1667,12 +1762,11 @@ def run_window(state, cur, m, px, age, t, sink):
     prev_side = cur["side"]
     ctx = update_signals(cur, px, strike, yes, close_ts, t)
     can_call = not stale and bool(strike)
-    if (cur["side"] is None and can_call and ctx["ss"]
-            and C.final_cutoff < secs_left <= C.call_max):
-        maybe_call(cur, ctx, q, secs_left, elapsed, t)
-    pu = p_up(yes, ctx["ss"], secs_left)
-    if cur["side"] and pu is not None:
-        cur["live_conf"] = round(clamp((pu if cur["side"] == "UP" else 1 - pu) * 100, 1, 99), 1)
+    if can_call and ctx["ss"] and C.final_cutoff < secs_left <= C.call_max:
+        maybe_call(cur, ctx, q, secs_left, elapsed, t, fq)
+    if cur["side"] and cur.get("conv") is not None:
+        sgn = 1 if cur["side"] == "UP" else -1
+        cur["live_conf"] = round(clamp(50 + 45 * sgn * cur["conv"], 1, 99), 1)
     if can_call and ctx["ss"] and t - cur.get("last_sample", 0) >= C.sample_s:
         cur["last_sample"] = t   # logged for EVERY window, called or not, so fitting has no selection bias
         cur.setdefault("samples", []).append([round(secs_left), round(ctx["ss"]["pm"], 2), round(yes, 1)])
@@ -1682,7 +1776,10 @@ def run_window(state, cur, m, px, age, t, sink):
     cur["pts"].append([round(elapsed), round(yes, 1)])
 
     since_post = t - cur.get("last_post", 0)
-    ev = f"New call: {cur['side']}" if cur["side"] and not prev_side else cur.get("pending_ev")
+    if cur["side"] and cur["side"] != prev_side:
+        ev = f"Flipped to {cur['side']}" if prev_side else f"New call: {cur['side']}"
+    else:
+        ev = cur.get("pending_ev")
     new_due = cur["message_id"] is None or ev is not None or since_post >= C.new_msg_s
     if new_due or t - cur.get("last_edit", 0) >= C.edit_s:
         embed = build_embed(cur, state, yes, price, n_ex, secs_left, pm=ctx["pm"],
@@ -1716,7 +1813,7 @@ def tick(state, feed, sink):
         for s, (p, _) in px.items():
             record_price(s, p)
         cur = state["current"] or new_window(state, m)
-        run_window(state, cur, m, px, age, t, sink)
+        run_window(state, cur, m, px, age, t, sink, feed.quality())
 
 
 # ======================================================================
@@ -1747,7 +1844,8 @@ def settle_one(state, p, feed, sink):
     log_window({"ticker": p["ticker"], "close_ts": p["close_ts"], "strike": p["strike"], "res": res,
                 "side": p["side"], "win": win, "conf": p.get("conf"), "src": p.get("src"),
                 "entry_px": p.get("entry_px"), "yes_entry": p.get("yes_entry"),
-                "feat": p.get("feat_call") or p.get("feat")})
+                "feat": p.get("feat_call") or p.get("feat"),
+                "flips": p.get("flips", 0), "calls": p.get("calls")})
     with LOCK:
         if p not in state["pending"]:
             return
@@ -1764,7 +1862,8 @@ def settle_one(state, p, feed, sink):
         state["history"].append({"ticker": p["ticker"], "side": p["side"], "win": win,
                                  "conf": p.get("conf"), "entry_px": p.get("entry_px"),
                                  "yes_entry": p.get("yes_entry"), "src": p.get("src"),
-                                 "called_at": p.get("called_at"), "comb": p.get("comb_call")})
+                                 "called_at": p.get("called_at"), "comb": p.get("comb_call"),
+                                 "flips": p.get("flips", 0)})
         p["pts"].append([900, 100 if up_won else 0])
         outcome = "win" if win else "loss"
         sink.final(build_embed(p, state, 100.0 if up_won else 0.0, None, 0, 0, outcome), p, outcome)
