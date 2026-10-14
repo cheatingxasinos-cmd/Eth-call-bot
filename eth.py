@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
-"""Kalshi ETH 15m signal bot v2.1 (single file).
+"""Kalshi ETH 15m signal bot v3.1 (single file).
   python bot.py                 live
   python bot.py replay FILE     backtest recorded ticks (no Discord)
+  python bot.py fit             fit the probability blend on samples.jsonl
   python bot.py report [STATE]  ROI, calibration, baselines
   python bot.py audit           list recent calls with Kalshi results
 """
@@ -58,7 +58,7 @@ class C:
     stale_s = _e("STALE_SECONDS", 5.0)
     price_max_age = _e("PRICE_MAX_AGE", 45.0)   # exchange price counts for this long
     min_exch = _e("MIN_EXCH", 2)                # no new calls with fewer feeds
-    min_conf = _e("MIN_CONF", 55.0)             # instant calls need this confidence
+    min_conf = _e("MIN_CONF", 55.0)
     max_jump = _e("MAX_JUMP", 0.015)            # ignore single-tick jumps bigger than 1.5%
     fresh_stats = _e("FRESH_STATS", 0)          # 1 = archive old win/loss record at startup
     wide_spread = _e("WIDE_SPREAD", 10.0)
@@ -93,6 +93,14 @@ class C:
     final_call_pct = _e("FINAL_CALL_PCT", 70.0)
     final_hold = _e("FINAL_HOLD", 2.0)
     final_cutoff = _e("FINAL_CUTOFF", 5)
+    # edge-based calling
+    min_edge = _e("MIN_EDGE", 1.0)        # cents of expected value after fee; -99 = always call
+    min_p = _e("MIN_P", 0.62)
+    edge_hold = _e("EDGE_HOLD", 2.0)
+    call_max = _e("CALL_MAX", 150.0)      # only call in the last N seconds; 900 = whole window
+    calib_file = _e("CALIB_FILE", "calib.json")
+    samples_file = _e("SAMPLES_FILE", "samples.jsonl")
+    sample_s = _e("SAMPLE_SECONDS", 10.0)
     dash_port = _e("DASH_PORT", 8000)
     dash_hz = _e("DASH_HZ", 30.0)
     kalshi_poll = _e("KALSHI_POLL", 0.5)
@@ -567,7 +575,74 @@ def predict(yes, ss, secs_left):
 
 
 # ======================================================================
-# INDICATORS
+# PROBABILITY AND EDGE-BASED CALLING
+# ======================================================================
+def logit(p):
+    p = clamp(p, 0.005, 0.995)
+    return math.log(p / (1 - p))
+
+
+def sigmoid(x):
+    return 1 / (1 + math.exp(-clamp(x, -30, 30)))
+
+
+CAL = {"a": 0.5, "b": 0.5, "c": 0.0, "fitted": False}
+
+
+def load_calib():
+    try:
+        with open(C.calib_file) as f:
+            CAL.update(json.load(f))
+        CAL["fitted"] = True
+        log.info("calibration loaded: %s", CAL)
+    except FileNotFoundError:
+        log.info("no calib file, using time-weighted prior")
+    except Exception:
+        log.exception("calib load")
+
+
+def p_up(yes, ss, secs_left):
+    if not ss:
+        return None
+    if CAL["fitted"]:
+        a, b, c = CAL["a"], CAL["b"], CAL["c"]
+    else:                                   # prior: trust the model more as the window closes
+        a = 0.5 + 0.5 * clamp(1 - secs_left / 300, 0.0, 1.0)
+        b, c = 1 - a, 0.0
+    return sigmoid(a * logit(ss["pm"] / 100) + b * logit(yes / 100) + c)
+
+
+def edge_for(side, pu, q):
+    """(win prob, expected value in cents after fee, entry price in cents)."""
+    ep = entry_price(q, side)
+    ps = pu if side == "UP" else 1 - pu
+    fee = 7 * (ep / 100) * (1 - ep / 100)        # approx Kalshi taker fee per contract, cents
+    return ps, ps * 100 - ep - fee, ep
+
+
+def maybe_call(cur, ctx, q, secs_left, elapsed, t):
+    pu = p_up(q["yes"], ctx["ss"], secs_left)
+    if pu is None:
+        return
+    cur["p_up"] = round(pu, 4)
+    best = None
+    for side in ("UP", "DOWN"):
+        ps, edge, _ = edge_for(side, pu, q)
+        if ps >= C.min_p and edge >= C.min_edge and (best is None or edge > best[1]):
+            best = (side, edge, ps)
+    if best is None:
+        cur.pop("edge_dir", None)
+        return
+    side, edge, ps = best
+    if cur.get("edge_dir") != side:
+        cur["edge_dir"], cur["edge_t"] = side, t
+    elif t - cur["edge_t"] >= C.edge_hold:
+        cur["edge"] = round(edge, 2)
+        make_call(cur, side, ps * 100, "EDGE", elapsed, q)
+
+
+# ======================================================================
+# INDICATORS (display only, they do not decide calls)
 # ======================================================================
 def _ema(vals, n):
     a = 2 / (n + 1)
@@ -616,12 +691,6 @@ def rsi(prices, n=None):
         ag = (ag * (n - 1) + max(c, 0)) / n
         al = (al * (n - 1) + max(-c, 0)) / n
     return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
-
-
-def rsi_ok(side, r):
-    if r is None:
-        return True
-    return r >= C.rsi_block if side == "UP" else r <= 100 - C.rsi_block
 
 
 def vote_ema(p):
@@ -703,36 +772,6 @@ def momentum_fast(sym="ETH", win=10):
 def composite(mom, fib, trend, blend, rsi_s=0.0):
     prob = clamp((blend - 50) / 50, -1.0, 1.0)
     return (C.w_mom * mom + C.w_fib * fib + C.w_trend * trend + C.w_prob * prob + C.w_rsi * rsi_s), prob
-
-
-def combo_conf(side, comb, votes):
-    sgn = 1 if side == "UP" else -1
-    vs = [v[0] for v in votes.values() if v[0] is not None]
-    agree = sum(v * sgn for v in vs) / len(vs) if vs else 0.0
-    strength = clamp(comb * sgn / C.conf_full, -1.0, 1.0)
-    x = (1 - C.conf_vote_w) * strength + C.conf_vote_w * agree
-    return clamp(50 + 49 * x, 1.0, 99.0)
-
-
-def combo_side(comb, ready, fib, r):
-    sgn = 1 if comb > 0 else -1
-    cside = "UP" if sgn > 0 else "DOWN"
-    against = sum(1 for v in ready if v == -sgn)
-    good = (abs(comb) >= C.combo_min and against <= C.combo_opp
-            and fib * sgn >= -0.5 and rsi_ok(cside, r))
-    return cside if good else None
-
-
-def instant_pick(yes, ss, mom, trend, fib, comb):
-    """Returns (side or None, score). None means the score is too close to zero."""
-    s = C.w_i_mkt * (yes - 50) / 50
-    if ss:
-        s += C.w_i_pm * (ss["pm"] - 50) / 50
-    s += C.w_i_mom * mom + C.w_i_trend * trend + C.w_i_fib * fib
-    s += C.w_i_comb * clamp(comb, -1.0, 1.0)
-    if abs(s) < C.abstain:
-        return None, s
-    return ("UP" if s > 0 else "DOWN"), s
 
 
 # ======================================================================
@@ -853,6 +892,53 @@ def audit(n=30):
         print(f"{when} {r['ticker']} call {r['side']:4s} result {r['res']:3s} "
               f"{'WIN ' if r['win'] else 'LOSS'} entry {r.get('entry_px')}c conf {r.get('conf')}")
     print("Check a few of these tickers against Kalshi's own results page.")
+
+
+# ======================================================================
+# FITTING (optional: replaces the prior with measured weights)
+# ======================================================================
+def _fit(rows, iters=500, lr=1.0, l2=1e-3):
+    X = [(logit(r["pm"] / 100), logit(r["yes"] / 100), 1.0) for r in rows]
+    w = [0.5, 0.5, 0.0]
+    for _ in range(iters):
+        g = [0.0, 0.0, 0.0]
+        for x, r in zip(X, rows):
+            e = sigmoid(sum(a * b for a, b in zip(w, x))) - r["y"]
+            for i in range(3):
+                g[i] += e * x[i]
+        w = [wi - lr * (gi / len(rows) + (l2 * wi if i < 2 else 0)) for i, (wi, gi) in enumerate(zip(w, g))]
+    return w
+
+
+def _brier(rows, fn):
+    return statistics.fmean((fn(r) - r["y"]) ** 2 for r in rows)
+
+
+def fit(test_frac=0.3):
+    with open(C.samples_file) as f:
+        rows = [json.loads(x) for x in f if x.strip()]
+    rows = [r for r in rows if 5 < r["left"] <= 880]
+    tks = list(dict.fromkeys(r["tk"] for r in rows))
+    if len(tks) < 100:
+        print(f"only {len(tks)} windows; collect 100+ (ideally 500+) before trusting a fit")
+        return
+    cut = set(tks[:int(len(tks) * (1 - test_frac))])      # split by window, oldest first
+    tr = [r for r in rows if r["tk"] in cut]
+    te = [r for r in rows if r["tk"] not in cut]
+    a, b, c = _fit(tr)
+    bm = _brier(te, lambda r: r["yes"] / 100)
+    bs = _brier(te, lambda r: r["pm"] / 100)
+    bf = _brier(te, lambda r: sigmoid(a * logit(r["pm"] / 100) + b * logit(r["yes"] / 100) + c))
+    print(f"held-out Brier: market {bm:.4f} | strike model {bs:.4f} | fitted blend {bf:.4f}")
+    if bf < bm - 0.0005:
+        a, b, c = _fit(rows)
+        out = {"a": a, "b": b, "c": c}
+        print("blend beats the market out of sample, saved", out)
+    else:
+        out = {"a": 0.0, "b": 1.0, "c": 0.0}
+        print("no measurable edge over the Kalshi price; saved pure-market weights (no calls)")
+    with open(C.calib_file, "w") as f:
+        json.dump(out, f)
 
 
 # ======================================================================
@@ -1346,9 +1432,13 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, st
         lines += [f"**Action:** {action}", f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%"]
         if c.get("entry_px") is not None:
             lines.append(f"**Entry price** {c['entry_px']:.0f}¢")
+        if c.get("edge") is not None:
+            lines.append(f"**Edge at entry** {c['edge']:+.1f}¢ after fee")
         title = f"{arrow} KALSHI ETH 15m: {side} | {action}"
     if pm is not None:
         lines.append(f"**Strike model** UP {pm:.0f}% / DOWN {100 - pm:.0f}%")
+    if c.get("p_up") is not None and not outcome:
+        lines.append(f"**Blended** UP {c['p_up'] * 100:.0f}% / DOWN {100 - c['p_up'] * 100:.0f}%")
     if c.get("avg_exp") is not None and (secs_left <= FINAL_SECONDS or outcome):
         lines.append("**Last minute** Kalshi settles on the 60s average, not the final tick")
         if c.get("avg60") is not None:
@@ -1370,17 +1460,15 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, st
         names = {"mom": "Momentum", "fib": "Fibonacci", "ema": "EMA 9/21",
                  "boll": "Bollinger", "atr": "ATR", "macd": "MACD"}
         lab = lambda v: "⚪ WARMING" if v is None else "🟢 UP" if v > 0 else "🔴 DOWN" if v < 0 else "⚪ NEUTRAL"
-        lines.append("**Indicators at entry**" if done and c.get("votes_call") else "**Indicators**")
+        lines.append("**Indicators at entry (display only)**" if done and c.get("votes_call")
+                     else "**Indicators (display only)**")
         for k, nm in names.items():
             if k in vt:
                 lines.append(f"{lab(vt[k][0])} · **{nm}** {vt[k][1]}")
-        cb = c.get("comb_call") if done and c.get("comb_call") is not None else c.get("comb")
         lean = "UP" if tally[0] > tally[1] else "DOWN" if tally[1] > tally[0] else "split"
         lines.append(f"**Confluence** UP {tally[0]} / DOWN {tally[1]} / NEUTRAL {tally[2]}"
                      f" → indicators lean {lean}"
                      + (f" | **locked call {side}**" if side else " | no call yet"))
-        if cb is not None:
-            lines.append(f"**Combined score** {cb:+.2f} (indicator call at ±{C.combo_min:.2f})")
     if stale:
         lines.append(f"**Warning** data is {stale:.0f}s old, new calls paused")
     if price:
@@ -1565,39 +1653,6 @@ def update_signals(cur, px, strike, yes, close_ts, t):
             "r": r, "comb": comb, "ready": ready, "all_ready": len(ready) == 4}
 
 
-def maybe_call(cur, ctx, q, secs_left, elapsed, t):
-    ss = ctx["ss"]
-    if C.instant:
-        side, s = instant_pick(q["yes"], ss, ctx["mom"], ctx["trend"], ctx["fib"], ctx["comb"])
-        if side:
-            conf = combo_conf(side, s, cur["votes"])
-            if conf >= C.min_conf:
-                make_call(cur, side, conf, "INSTANT", elapsed, q)
-                return
-    if ctx["all_ready"]:   # second chance: indicator confluence held for a few seconds
-        cside = combo_side(ctx["comb"], ctx["ready"], ctx["fib"], ctx["r"])
-        if cside and ss:
-            if (ss["pm"] if cside == "UP" else 100 - ss["pm"]) < C.lock_pm:
-                cside = None
-        if cside is None:
-            cur.pop("comb_dir", None)
-        elif cur.get("comb_dir") != cside:
-            cur["comb_dir"], cur["comb_t"] = cside, t
-        elif t - cur["comb_t"] >= C.confirm_s:
-            make_call(cur, cside, combo_conf(cside, ctx["comb"], cur["votes"]), "COMBINED", elapsed, q)
-
-
-def maybe_final_call(cur, ctx, q, elapsed, t):
-    up_p = ctx["ss"]["pm"]
-    cand = "UP" if up_p >= C.final_call_pct else "DOWN" if 100 - up_p >= C.final_call_pct else None
-    if cand is None:
-        cur.pop("final_dir", None)
-    elif cur.get("final_dir") != cand:
-        cur["final_dir"], cur["final_t"] = cand, t
-    elif t - cur["final_t"] >= C.final_hold:
-        make_call(cur, cand, up_p if cand == "UP" else 100 - up_p, "FINAL_AVG", elapsed, q)
-
-
 def run_window(state, cur, m, px, age, t, sink):
     cur.setdefault("open", {})
     cur.setdefault("open_t", t)
@@ -1612,17 +1667,15 @@ def run_window(state, cur, m, px, age, t, sink):
     prev_side = cur["side"]
     ctx = update_signals(cur, px, strike, yes, close_ts, t)
     can_call = not stale and bool(strike)
-    if cur["side"] is None and can_call and secs_left > C.call_cutoff:
-        maybe_call(cur, ctx, q, secs_left, elapsed, t)
     if (cur["side"] is None and can_call and ctx["ss"]
-            and C.final_cutoff < secs_left <= FINAL_SECONDS):
-        maybe_final_call(cur, ctx, q, elapsed, t)
-    if cur["side"]:
-        if secs_left <= FINAL_SECONDS and ctx["ss"]:
-            sp = ctx["ss"]["pm"] if cur["side"] == "UP" else 100 - ctx["ss"]["pm"]
-            cur["live_conf"] = round(clamp(sp, 1.0, 99.0), 1)
-        else:
-            cur["live_conf"] = round(combo_conf(cur["side"], ctx["comb"], cur["votes"]), 1)
+            and C.final_cutoff < secs_left <= C.call_max):
+        maybe_call(cur, ctx, q, secs_left, elapsed, t)
+    pu = p_up(yes, ctx["ss"], secs_left)
+    if cur["side"] and pu is not None:
+        cur["live_conf"] = round(clamp((pu if cur["side"] == "UP" else 1 - pu) * 100, 1, 99), 1)
+    if can_call and ctx["ss"] and t - cur.get("last_sample", 0) >= C.sample_s:
+        cur["last_sample"] = t   # logged for EVERY window, called or not, so fitting has no selection bias
+        cur.setdefault("samples", []).append([round(secs_left), round(ctx["ss"]["pm"], 2), round(yes, 1)])
     cur["price"] = price
     if price:
         cur["eth"].append([round(elapsed), round(price, 2)])
@@ -1699,6 +1752,13 @@ def settle_one(state, p, feed, sink):
         if p not in state["pending"]:
             return
         state["pending"].remove(p)
+        try:
+            with open(C.samples_file, "a") as sf:
+                for left, pm_, y_ in p.get("samples", []):
+                    sf.write(json.dumps({"tk": p["ticker"], "left": left, "pm": pm_, "yes": y_,
+                                         "y": 1 if up_won else 0}, separators=(",", ":")) + "\n")
+        except Exception:
+            log.exception("samples log")
         if p["side"] is None:
             return
         state["history"].append({"ticker": p["ticker"], "side": p["side"], "win": win,
@@ -1859,6 +1919,7 @@ class Dash(BaseHTTPRequestHandler):
 # ======================================================================
 def main():
     global RENDER_POOL, REC
+    load_calib()
     if not C.webhook:
         sys.exit("Set DISCORD_WEBHOOK_URL")
     if websocket is None:
@@ -1916,9 +1977,11 @@ def main():
 
 def replay(path):
     C.state_file, C.windows_file = "replay_state.json", "replay_windows.jsonl"
-    for f in (C.state_file, C.windows_file):
+    C.samples_file = "replay_samples.jsonl"
+    for f in (C.state_file, C.windows_file, C.samples_file):
         if os.path.exists(f):
             os.remove(f)
+    load_calib()
     feed, sink = ReplayFeed(path), NullSink()
     state = {"history": [], "history_old": [], "current": None, "pending": []}
     for row in feed.rows:
@@ -1936,6 +1999,8 @@ if __name__ == "__main__":
         replay(sys.argv[2])
     elif len(sys.argv) > 1 and sys.argv[1] == "audit":
         audit()
+    elif len(sys.argv) > 1 and sys.argv[1] == "fit":
+        fit()
     elif len(sys.argv) > 1 and sys.argv[1] == "report":
         with open(sys.argv[2] if len(sys.argv) > 2 else C.state_file) as fh:
             report(json.load(fh)["history"])
