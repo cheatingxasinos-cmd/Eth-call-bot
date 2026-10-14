@@ -75,25 +75,25 @@ ATR_Z = float(os.getenv("ATR_Z", "0.5"))
 CONF_FULL = float(os.getenv("CONF_FULL", "0.6"))  # combined score that counts as full strength
 CONF_VOTE_W = float(os.getenv("CONF_VOTE_W", "0.4"))  # weight of badge agreement in confidence
 
-# ---- fast flip settings ----
+# ---- fast flip settings (now unused: SELL uses the call trigger) ----
 FAST_FLIP = int(os.getenv("FAST_FLIP", "1"))  # 0 turns flips off
-FAST_FLIP_COMB = float(os.getenv("FAST_FLIP_COMB", "0.50"))  # combined score toward the new side
-FAST_FLIP_MOM = float(os.getenv("FAST_FLIP_MOM", "0.60"))  # momentum toward the new side
-FAST_FLIP_CONF = float(os.getenv("FAST_FLIP_CONF", "85"))  # confidence of the new side
-FAST_FLIP_OPP = int(os.getenv("FAST_FLIP_OPP", "0"))  # votes still backing the old call
-FAST_FLIP_HOLD = float(os.getenv("FAST_FLIP_HOLD", "2.0"))  # secs the setup must hold
-FAST_FLIP_AGE = float(os.getenv("FAST_FLIP_AGE", "10"))  # min secs since the last call
-FAST_FLIP_CUTOFF = int(os.getenv("FAST_FLIP_CUTOFF", "30"))  # no fast flips this close to expiry
-FAST_FLIP_MAX = int(os.getenv("FAST_FLIP_MAX", "2"))  # max fast flips per window
-FAST_FLIP_NEED_MKT = int(os.getenv("FAST_FLIP_NEED_MKT", "0"))  # 1 = Kalshi must also lean the new way
-SELL_FLIP = int(os.getenv("SELL_FLIP", "1"))  # 1 = a SELL signal flips the call to the other side and BUYs it
-SELL_CUTOFF = int(os.getenv("SELL_CUTOFF", "10"))  # no sell/reversal flips inside this many secs of expiry
+FAST_FLIP_COMB = float(os.getenv("FAST_FLIP_COMB", "0.50"))
+FAST_FLIP_MOM = float(os.getenv("FAST_FLIP_MOM", "0.60"))
+FAST_FLIP_CONF = float(os.getenv("FAST_FLIP_CONF", "85"))
+FAST_FLIP_OPP = int(os.getenv("FAST_FLIP_OPP", "0"))
+FAST_FLIP_HOLD = float(os.getenv("FAST_FLIP_HOLD", "2.0"))
+FAST_FLIP_AGE = float(os.getenv("FAST_FLIP_AGE", "10"))
+FAST_FLIP_CUTOFF = int(os.getenv("FAST_FLIP_CUTOFF", "30"))
+FAST_FLIP_MAX = int(os.getenv("FAST_FLIP_MAX", "2"))
+FAST_FLIP_NEED_MKT = int(os.getenv("FAST_FLIP_NEED_MKT", "0"))
+SELL_FLIP = int(os.getenv("SELL_FLIP", "1"))
+SELL_CUTOFF = int(os.getenv("SELL_CUTOFF", "10"))
 
-# ---- reversal flip settings (market odds + strike model + price vs strike) ----
+# ---- reversal flip settings (REV_MAX still caps total flips per window) ----
 REV_FLIP = int(os.getenv("REV_FLIP", "1"))
-REV_MKT = float(os.getenv("REV_MKT", "60"))  # Kalshi % on the new side
-REV_PM = float(os.getenv("REV_PM", "65"))  # strike model % on the new side
-REV_HOLD = float(os.getenv("REV_HOLD", "3"))  # secs the reversal must hold
+REV_MKT = float(os.getenv("REV_MKT", "60"))
+REV_PM = float(os.getenv("REV_PM", "65"))
+REV_HOLD = float(os.getenv("REV_HOLD", "3"))
 REV_MAX = int(os.getenv("REV_MAX", "3"))  # max total flips per window
 
 
@@ -471,6 +471,17 @@ def combo_conf(side, comb, votes):
     strength = max(-1.0, min(1.0, comb * sgn / CONF_FULL))
     x = (1 - CONF_VOTE_W) * strength + CONF_VOTE_W * agree
     return max(1.0, min(99.0, 50 + 49 * x))
+
+
+def combo_side(comb, ready, fib, r):
+    """The call trigger. Returns 'UP'/'DOWN' if the setup passes, else None.
+    Used for both the initial call and the SELL flip."""
+    sgn = 1 if comb > 0 else -1
+    cside = "UP" if sgn > 0 else "DOWN"
+    against = sum(1 for v in ready if v == -sgn)
+    good = (abs(comb) >= COMBO_MIN and against <= COMBO_OPP
+            and fib * sgn >= -0.5 and rsi_ok(cside, r))
+    return cside if good else None
 
 
 def pct_trigger(yes):
@@ -1312,13 +1323,10 @@ def tick(state):
                            f"retrace {fib_lvl}% ({fib:+.2f})" if fib_lvl else "forming"]
     cur["comb"] = round(comb, 3)
 
+    # ---- initial call: uses the shared call trigger ----
     if CALL_MODE == "combined" and all_ready and cur["side"] is None and secs_left > CALL_CUTOFF:
-        sgn = 1 if comb > 0 else -1
-        cside = "UP" if sgn > 0 else "DOWN"
-        against = sum(1 for v in ready if v == -sgn)
-        good = (abs(comb) >= COMBO_MIN and against <= COMBO_OPP and fib * sgn >= -0.5
-                and rsi_ok(cside, r))
-        if not good:
+        cside = combo_side(comb, ready, fib, r)
+        if cside is None:
             cur.pop("comb_dir", None)
         elif cur.get("comb_dir") != cside:
             cur["comb_dir"], cur["comb_t"] = cside, now
@@ -1374,75 +1382,17 @@ def tick(state):
                            votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
                            comb_call=cur["comb"])
 
-    # ---- fast flip: change the call only on very high confidence AND momentum ----
-    if (FAST_FLIP and cur["side"] and cur["side"] == prev_side and all_ready
-            and secs_left > FAST_FLIP_CUTOFF and cur.get("flips", 0) < FAST_FLIP_MAX
-            and elapsed - cur.get("called_at", elapsed) >= FAST_FLIP_AGE):
-        new_side = "DOWN" if cur["side"] == "UP" else "UP"
-        ns = 1 if new_side == "UP" else -1
-        backing_old = sum(1 for v in ready if v == -ns)
-        new_conf = combo_conf(new_side, comb, cur["votes"])
-        ok = (comb * ns >= FAST_FLIP_COMB and mom * ns >= FAST_FLIP_MOM
-              and new_conf >= FAST_FLIP_CONF and backing_old <= FAST_FLIP_OPP
-              and fib * ns >= FIB_AGREE and rsi_ok(new_side, r)
-              and (not FAST_FLIP_NEED_MKT or (yes - 50) * ns > 0))
-        if not ok:
-            cur.pop("ff_t", None)
-        else:
-            cur.setdefault("ff_t", now)
-            if now - cur["ff_t"] >= FAST_FLIP_HOLD:
-                flip_call(cur, new_side, comb, r, fib, elapsed, now, "FAST_FLIP")
-
-    # ---- stuck SELL: a call sitting on plain SELL flips once it is safe and the market agrees ----
-    if (SELL_FLIP and cur["side"] and cur["side"] == prev_side and cur.get("flipped")
-            and secs_left > SELL_CUTOFF and cur.get("flips", 0) < REV_MAX):
-        sgn = 1 if cur["side"] == "UP" else -1
-        if (yes - 50) * sgn < 0 and price and strike and (price - strike) * sgn < 0:
-            flip_call(cur, "DOWN" if cur["side"] == "UP" else "UP",
-                      comb, r, fib, elapsed, now, "SELL_FLIP")
-
-    # ---- SELL signals: flip the whole call to the other side and BUY it ----
-    if cur["side"] and cur["side"] == prev_side and not cur.get("flipped"):
-        sgn = 1 if cur["side"] == "UP" else -1
-        aged = elapsed - cur.get("called_at", elapsed) >= FLIP_MIN_AGE
-        market_against = (yes - 50) * sgn < 0  # Kalshi has actually moved to the other side
-        sell = FLIP_SCORE < 99 and score * sgn < -FLIP_SCORE  # old flip trigger (off while FLIP_SCORE=99)
-        # harder SELL trigger: a held reversal in the composite score
-        if score * sgn < -FLIP_HARD and aged and market_against:
-            cur.setdefault("flip_since", now)
-            if now - cur["flip_since"] >= FLIP_HOLD:
-                sell = True
-        else:
-            cur.pop("flip_since", None)  # reversal broke, timer resets
-        # Fibonacci failed-swing SELL: a deep retrace against the call, with Kalshi also on the other side
-        if aged and fib * sgn < -0.7 and market_against:
-            sell = True
-        if sell:
-            if SELL_FLIP and secs_left > SELL_CUTOFF:
-                flip_call(cur, "DOWN" if cur["side"] == "UP" else "UP",
-                          comb, r, fib, elapsed, now, "SELL_FLIP")
-            else:
-                cur["flipped"] = True  # too close to expiry (or SELL_FLIP=0): plain SELL
-
-    # ---- reversal flip: market, strike model and price all say the call is wrong ----
-    if (REV_FLIP and cur["side"] and cur["side"] == prev_side
-            and secs_left > SELL_CUTOFF and cur.get("flips", 0) < REV_MAX):
-        ns = -1 if cur["side"] == "UP" else 1
-        new_side = "UP" if ns > 0 else "DOWN"
-        up_m = min(max(yes, 1), 99)
-        mkt_new = up_m if ns > 0 else 100 - up_m
-        pm_new = None if pm is None else (pm if ns > 0 else 100 - pm)
-        px_ok = bool(price and strike and (price - strike) * ns > 0)
-        aged = elapsed - cur.get("called_at", elapsed) >= FLIP_MIN_AGE
-        ok = (aged and px_ok and mkt_new >= REV_MKT
-              and pm_new is not None and pm_new >= REV_PM
-              and mom * ns >= 0 and trend * ns >= 0)
-        if not ok:
-            cur.pop("rev_t", None)
-        else:
-            cur.setdefault("rev_t", now)
-            if now - cur["rev_t"] >= REV_HOLD:
-                flip_call(cur, new_side, comb, r, fib, elapsed, now, "REV_FLIP")
+    # ---- SELL = the call trigger, firing for the opposite side ----
+    if (CALL_MODE == "combined" and all_ready and cur["side"] and cur["side"] == prev_side
+            and secs_left > CALL_CUTOFF and cur.get("flips", 0) < REV_MAX):
+        cside = combo_side(comb, ready, fib, r)
+        if cside is None or cside == cur["side"]:
+            cur.pop("sell_dir", None)
+        elif cur.get("sell_dir") != cside:
+            cur["sell_dir"], cur["sell_t"] = cside, now
+        elif now - cur["sell_t"] >= CONFIRM_SECONDS:
+            flip_call(cur, cside, comb, r, fib, elapsed, now, "SELL_FLIP")
+            cur.pop("sell_dir", None)
 
     if cur["side"]:
         cur["live_conf"] = round(combo_conf(cur["side"], comb, cur["votes"]), 1)
