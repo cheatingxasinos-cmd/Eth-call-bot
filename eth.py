@@ -33,7 +33,8 @@ RUN_SECONDS = int(os.getenv("RUN_SECONDS", str(345 * 60)))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
 W_MARKET = float(os.getenv("W_MARKET", "0.5"))
-CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "60"))
+FINAL_SECONDS = 60  # Kalshi settles on the average of the last 60s
+CALL_CUTOFF = max(int(os.getenv("CALL_CUTOFF", "60")), FINAL_SECONDS)  # old triggers/flips never fire in the last minute
 TILT_W = float(os.getenv("TILT_W", "0.25"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "0.22"))
 MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))
@@ -95,6 +96,13 @@ REV_MKT = float(os.getenv("REV_MKT", "60"))
 REV_PM = float(os.getenv("REV_PM", "65"))
 REV_HOLD = float(os.getenv("REV_HOLD", "3"))
 REV_MAX = int(os.getenv("REV_MAX", "3"))  # max total flips per window
+
+# ---- last-minute settlement settings ----
+W_MARKET_FINAL = float(os.getenv("W_MARKET_FINAL", "0.35"))  # market weight in the last 60s
+FINAL_CALL_PCT = float(os.getenv("FINAL_CALL_PCT", "70"))  # settlement odds needed for a late first call
+FINAL_FLIP_PCT = float(os.getenv("FINAL_FLIP_PCT", "80"))  # settlement odds needed to flip late
+FINAL_HOLD = float(os.getenv("FINAL_HOLD", "2.0"))  # seconds the odds must hold
+FINAL_CUTOFF = int(os.getenv("FINAL_CUTOFF", "5"))  # no new call or flip in the last N seconds
 
 
 # ---------- state ----------
@@ -269,21 +277,56 @@ def market_signal(prices, opens, since_open):
     return basket * (0.5 + 0.5 * breadth), breadth, zs
 
 
-def model_prob(price, strike, secs_left, tilt=0.0):
+def window_avg(sym, close_ts, now):
+    """Time-weighted sum and seconds of price already inside the final 60s window."""
+    start, end = close_ts - FINAL_SECONDS, min(now, close_ts)
+    pts = list(PRICES[sym])
+    if end <= start or not pts:
+        return 0.0, 0.0
+    px, inside = None, []
+    for t, p in pts:
+        if t <= start:
+            px = p
+        elif t <= end:
+            inside.append((t, p))
+    if px is None:
+        px = inside[0][1] if inside else pts[-1][1]
+    total, t0 = 0.0, start
+    for t, p in inside:
+        total += px * (t - t0)
+        t0, px = t, p
+    total += px * (end - t0)
+    return total, end - start
+
+
+def settle_stats(price, strike, close_ts, now, tilt=0.0):
+    """Odds that the 60s average finishes >= strike. Locked-in seconds carry no risk."""
     if not price or not strike:
         return None
-    tau = max(secs_left, 1)
-    sig = vol("ETH")
-    fade = min(1.0, math.sqrt(tau / 300))
-    z = math.log(price / strike) / (sig * math.sqrt(tau)) + TILT_W * max(-3.0, min(3.0, tilt)) * fade
-    return max(1.0, min(99.0, norm_cdf(z) * 100))
+    tau0 = max(close_ts - now, 0.0)
+    total, e = window_avg("ETH", close_ts, now)
+    rem = min(tau0, float(FINAL_SECONDS))  # window seconds still unseen
+    a, b = max(tau0 - FINAL_SECONDS, 0.0), tau0
+    exp_avg = (total + price * rem) / FINAL_SECONDS
+    # variance of the sum of a random walk over the unseen part of the window
+    V = -(b ** 3 - a ** 3) / 6 - a * a * (b - a) / 2 + b * (b * b - a * a) / 2
+    std = price * vol("ETH") * math.sqrt(max(V, 0.0)) / FINAL_SECONDS
+    fade = min(1.0, math.sqrt(tau0 / 300)) * rem / FINAL_SECONDS
+    shift = TILT_W * max(-3.0, min(3.0, tilt)) * fade
+    if std <= 1e-9:
+        pm = 99.0 if exp_avg >= strike else 1.0
+    else:
+        pm = max(1.0, min(99.0, norm_cdf((exp_avg - strike) / std + shift) * 100))
+    return {"pm": pm, "exp_avg": exp_avg, "std": std, "rem": rem,
+            "obs_avg": (total / e) if e > 1 else None,
+            "need": ((strike * FINAL_SECONDS - total) / rem) if rem > 0.5 else None}
 
 
-def predict(yes_mkt, price, strike, secs_left, tilt=0.0):
-    pm = model_prob(price, strike, secs_left, tilt)
-    if pm is None:
+def predict(yes_mkt, ss, secs_left):
+    if ss is None:
         return yes_mkt, None
-    return W_MARKET * yes_mkt + (1 - W_MARKET) * pm, pm
+    w = W_MARKET_FINAL if secs_left <= FINAL_SECONDS else W_MARKET
+    return w * yes_mkt + (1 - w) * ss["pm"], ss["pm"]
 
 
 def _fib_score(d):
@@ -394,9 +437,15 @@ def atr(p, n=None):
     return a
 
 
-def vote_atr(p, price, strike, secs_left):
+def vote_atr(p, price, strike, secs_left, ss=None):
     """ATR has no direction, so it is tied to the strike: how far is price from the strike
-    compared with the distance ATR says it can still travel before close."""
+    compared with the distance ATR says it can still travel before close.
+    In the last minute it judges the projected 60s average instead."""
+    if secs_left <= FINAL_SECONDS and ss:
+        gap = ss["exp_avg"] - strike
+        z = gap / ss["std"] if ss["std"] > 1e-9 else (9.0 if gap >= 0 else -9.0)
+        v = 1 if z >= ATR_Z else -1 if z <= -ATR_Z else 0
+        return v, f"60s avg proj ${ss['exp_avg']:,.2f}, {z:+.1f}σ from strike"
     a = atr(p)
     if a is None or not price or not strike or a <= 0:
         return None, "warming up"
@@ -736,8 +785,9 @@ def render_frames(cur, outcome, S, n):
     cw = (PX1 - PX0) / 30
     cx_ = lambda i: PX0 + (i + 0.5) * cw
     cs = _candles(eth, now_px or strike or 1)
-    hi = max([c[2] for c in cs] + ([strike] if strike else []))
-    lo = min([c[3] for c in cs] + ([strike] if strike else []))
+    extra = [v for v in (strike, cur.get("avg60")) if v]
+    hi = max([c[2] for c in cs] + extra)
+    lo = min([c[3] for c in cs] + extra)
     span = max(hi - lo, (strike or hi or 1) * 0.0008)
     mid = (hi + lo) / 2
     lo, hi = mid - span / 2 * 1.3, mid + span / 2 * 1.3
@@ -817,6 +867,15 @@ def render_frames(cur, outcome, S, n):
         c = C_UP if dd >= 0 else C_DN
         d.text((k(24), Y(v)), f"{'+' if dd >= 0 else '-'} ${abs(dd):{fmt}}", font=F(13),
                fill=c + (255,), anchor="lm")
+
+    # last-minute zone + running 60s average
+    zx = PX0 + (PX1 - PX0) * (900 - FINAL_SECONDS) / 900
+    d.rectangle([zx, PY0, PX1, IY1], fill=AMBER + (22,))
+    d.text(((zx + PX1) / 2, PY0 + k(18)), "LAST 60s", font=F(10), fill=AMBER + (255,), anchor="mm")
+    if cur.get("avg60"):
+        ay = max(PY0, min(PY1, Y(cur["avg60"])))
+        _dots(d, zx, ay, PX1, ay, AMBER + (255,), lw(2), k(4), k(3))
+        d.text((zx + k(4), ay - k(8)), "AVG60", font=F(10), fill=AMBER + (255,), anchor="ls")
 
     # entry marker
     ca = cur.get("called_at")
@@ -1052,6 +1111,14 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         title = f"{arrow} KALSHI ETH 15m: {side} | {action}"
     if pm is not None:
         lines.append(f"**Strike model** UP {pm:.0f}% / DOWN {100 - pm:.0f}%")
+    if c.get("avg_exp") is not None and (secs_left <= FINAL_SECONDS or outcome):
+        lines.append("**Last minute** Kalshi settles on the 60s average, not the final tick")
+        if c.get("avg60") is not None:
+            lines.append(f"**60s average so far** ${c['avg60']:,.2f} | projected ${c['avg_exp']:,.2f} "
+                         f"vs strike ${c['strike']:,.2f}")
+        if c.get("avg_need") is not None and (c.get("avg_rem") or 0) >= 1:
+            lines.append(f"**To finish UP** the last {c['avg_rem']:.0f}s must average "
+                         f"${c['avg_need']:,.2f}+")
     mk = c.get("mkt")
     if mk:
         arrows = " / ".join(f"{sym} {'▲' if z >= 0 else '▼'}" for sym, z in mk["z"].items())
@@ -1207,10 +1274,15 @@ def settle_pending(state):
             if res not in ("yes", "no"):
                 if time.time() < p["close_ts"] + 300:
                     continue
-                price, _ = eth_price()
-                if price is None:
-                    continue
-                res = "yes" if price >= p["strike"] else "no"
+                # Kalshi settles on the 60s average: use the stored projection if it was nearly locked in
+                if (p.get("avg_exp") is not None and p.get("avg_rem") is not None
+                        and p["avg_rem"] <= 5):
+                    res = "yes" if p["avg_exp"] >= p["strike"] else "no"
+                else:
+                    price, _ = eth_price()
+                    if price is None:
+                        continue
+                    res = "yes" if price >= p["strike"] else "no"
             win = (res == "yes") == (p["side"] == "UP")
             state["history"].append({"ticker": p["ticker"], "side": p["side"], "win": win,
                                      "flips": p.get("flips", 0),
@@ -1286,7 +1358,14 @@ def tick(state):
             cur["open"].setdefault(s, p)
     now_px = {s: p for s, (p, _) in px.items()}
     tilt, breadth, zs = market_signal(now_px, cur["open"], now - cur["open_t"])
-    blend, pm = predict(yes, price, strike, secs_left, tilt)
+    final = secs_left <= FINAL_SECONDS
+    ss = settle_stats(price, strike, close_ts, now, tilt)
+    blend, pm = predict(yes, ss, secs_left)
+    if ss:
+        cur["avg60"] = round(ss["obs_avg"], 2) if ss["obs_avg"] else None
+        cur["avg_exp"] = round(ss["exp_avg"], 2)
+        cur["avg_rem"] = round(ss["rem"], 1)
+        cur["avg_need"] = round(ss["need"], 2) if ss["need"] is not None else None
     cur["mkt"] = {"tilt": round(tilt, 2), "breadth": round(breadth, 2),
                   "z": {s: round(z, 2) for s, z in zs.items()}}
     cur["read"] = {"ETH": blend}
@@ -1300,6 +1379,9 @@ def tick(state):
     mom = 0.7 * momentum_fast("ETH") + 0.3 * math.tanh(tilt / 1.5)
     who = "buyers" if mom > 0.1 else "sellers" if mom < -0.1 else "even"
     score, prob = composite(mom, fib, trend, blend, rsi_s)
+    if final and ss:  # the average is locking in: fade the short-term signals
+        lock = max(0.0, min(1.0, (FINAL_SECONDS - secs_left) / FINAL_SECONDS))
+        score = (1 - lock) * score + lock * max(-1.0, min(1.0, (ss["pm"] - 50) / 50))
     cur["score"] = round(score, 3)
     cur["fib"] = fib_lvl
     cur["sig"] = {"mom": round(mom, 2), "fib": round(fib, 2), "trend": round(trend, 2),
@@ -1308,7 +1390,7 @@ def tick(state):
 
     # ---- indicator votes + combined call ----
     votes = {"ema": vote_ema(series), "boll": vote_boll(series),
-             "atr": vote_atr(series, price, strike, secs_left), "macd": vote_macd(series)}
+             "atr": vote_atr(series, price, strike, secs_left, ss), "macd": vote_macd(series)}
     ready = [v for v, _ in votes.values() if v is not None]
     all_ready = len(ready) == 4
     c_up, c_dn = ready.count(1), ready.count(-1)
@@ -1394,8 +1476,39 @@ def tick(state):
             flip_call(cur, cside, comb, r, fib, elapsed, now, "SELL_FLIP")
             cur.pop("sell_dir", None)
 
+    # ---- last minute: only the 60s-average settlement odds decide ----
+    if final and ss and secs_left > FINAL_CUTOFF:
+        up_p, cand = ss["pm"], None
+        if cur["side"] is None:
+            if up_p >= FINAL_CALL_PCT:
+                cand = "UP"
+            elif 100 - up_p >= FINAL_CALL_PCT:
+                cand = "DOWN"
+        elif cur.get("flips", 0) < REV_MAX:
+            opp = "DOWN" if cur["side"] == "UP" else "UP"
+            if (up_p if opp == "UP" else 100 - up_p) >= FINAL_FLIP_PCT:
+                cand = opp
+        if cand is None:
+            cur.pop("final_dir", None)
+        elif cur.get("final_dir") != cand:
+            cur["final_dir"], cur["final_t"] = cand, now
+        elif now - cur["final_t"] >= FINAL_HOLD:
+            cp = up_p if cand == "UP" else 100 - up_p
+            if cur["side"] is None:
+                cur.update(side=cand, conf=cp, locked=True, called_at=round(elapsed),
+                           src="FINAL_AVG", votes_call=copy.deepcopy(cur["votes"]),
+                           tally_call=list(cur["tally"]), comb_call=cur["comb"])
+            else:
+                flip_call(cur, cand, comb, r, fib, elapsed, now, "FINAL_FLIP")
+                cur["conf"] = cp
+            cur.pop("final_dir", None)
+
     if cur["side"]:
-        cur["live_conf"] = round(combo_conf(cur["side"], comb, cur["votes"]), 1)
+        if final and ss:
+            sp = ss["pm"] if cur["side"] == "UP" else 100 - ss["pm"]
+            cur["live_conf"] = round(max(1.0, min(99.0, sp)), 1)
+        else:
+            cur["live_conf"] = round(combo_conf(cur["side"], comb, cur["votes"]), 1)
 
     cur["price"] = price
     if price:
@@ -1409,7 +1522,8 @@ def tick(state):
     if cur["side"] and not prev_side:
         ev = f"New call: {cur['side']}"
     elif prev_side and cur["side"] != prev_side:
-        label = {"SELL_FLIP": "Sell flip", "REV_FLIP": "Reversal flip"}.get(cur.get("src"), "Fast flip")
+        label = {"SELL_FLIP": "Sell flip", "REV_FLIP": "Reversal flip",
+                 "FINAL_FLIP": "Last-minute flip"}.get(cur.get("src"), "Fast flip")
         ev = f"{label}: SELL {prev_side} → BUY {cur['side']} (confidence {cur['conf']:.0f}%)"
     elif cur.get("flipped") and not prev_flip:
         ev = "Signal flipped against the call"
