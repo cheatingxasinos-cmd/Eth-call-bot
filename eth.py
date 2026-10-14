@@ -1,4 +1,4 @@
-"""Kalshi ETH 15m signal bot v3.3 (single file).
+"""Kalshi ETH 15m signal bot v3.4 (single file).
   python bot.py                 live
   python bot.py replay FILE     backtest recorded ticks (no Discord)
   python bot.py fit             fit the probability blend on samples.jsonl
@@ -100,8 +100,11 @@ class C:
     # indicator-only calling
     call_max = _e("CALL_MAX", 900.0)          # call any time in the window
     vote_min_ready = _e("VOTE_MIN_READY", 6)  # all six indicators must be warmed up
-    call_hold = _e("CALL_HOLD", 8.0)          # seconds all six must agree (time debounce)
+    call_hold = _e("CALL_HOLD", 8.0)          # seconds the vote must hold (time debounce)
+    call_min_agree = _e("CALL_MIN_AGREE", 4)       # indicators that must agree to call
+    call_max_against = _e("CALL_MAX_AGAINST", 1)   # indicators allowed to point the other way
     sell_hold = _e("SELL_HOLD", 2.0)          # seconds a majority must be against before SELL
+    recover_hold = _e("RECOVER_HOLD", 2.0)    # seconds opposition must be gone before SELL clears
     quote_max_age = _e("QUOTE_MAX_AGE", 3.0)  # Kalshi quote must be this fresh to call
     call_px_age = _e("CALL_PX_AGE", 5.0)      # exchange price must be this fresh to call
     max_disp_bp = _e("MAX_DISP_BP", 6.0)      # max exchange disagreement, basis points
@@ -668,19 +671,33 @@ def conviction(votes):
 
 
 def check_exit(cur, t):
-    """After a call: never flip. Warn when any indicator turns against it, SELL when most have."""
+    """After a call: never flip. Warn when any indicator turns against it, SELL when most have.
+    SELL clears once opposition no longer outnumbers support for RECOVER_HOLD seconds."""
     sgn = 1 if cur["side"] == "UP" else -1
     vs = {k: v[0] for k, v in cur["votes"].items() if v[0] is not None}
     opp = [k for k, v in vs.items() if v == -sgn]
     sup = [k for k, v in vs.items() if v == sgn]
     cur["opposing"], cur["supporting"] = opp, sup
+    against = len(opp) > len(sup)
     if not cur.get("sell"):
-        if len(opp) > len(sup):
+        if against:
             cur.setdefault("sell_t", t)
             if t - cur["sell_t"] >= C.sell_hold:
-                cur["sell"], cur["sell_at"] = True, round(900 - cur.get("secs_left", 0))   # latched
+                cur["sell"] = True
+                cur.pop("sell_t", None)
+                cur.pop("recover_t", None)
+                cur.setdefault("sell_at", round(900 - cur.get("secs_left", 0)))  # first SELL only
+                cur["sell_n"] = cur.get("sell_n", 0) + 1
         else:
             cur.pop("sell_t", None)
+    else:
+        if against:
+            cur.pop("recover_t", None)           # still bad: restart the recovery timer
+        else:
+            cur.setdefault("recover_t", t)
+            if t - cur["recover_t"] >= C.recover_hold:
+                cur["sell"] = False
+                cur.pop("recover_t", None)
     cur["warn"] = 2 if cur.get("sell") else 1 if opp else 0
 
 
@@ -711,12 +728,13 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
 
     cand = None
     if why is None:
-        if up == ready:
+        if up >= C.call_min_agree and dn <= C.call_max_against:
             cand = "UP"
-        elif dn == ready:
+        elif dn >= C.call_min_agree and up <= C.call_max_against:
             cand = "DOWN"
         else:
-            cur["lock_why"] = f"indicators split {up} up / {dn} down / {ready - up - dn} neutral"
+            cur["lock_why"] = (f"need {C.call_min_agree}+ agreeing and at most {C.call_max_against} against: "
+                               f"{up} up / {dn} down / {ready - up - dn} neutral")
         if cand:
             sgn = 1 if cand == "UP" else -1
             if not ss or sgn * (ss["exp_avg"] - cur["strike"]) <= 0:
@@ -1562,7 +1580,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, st
     if c.get("tally") and not outcome:
         tl = c["tally"]
         lines.append(f"**Indicators** {tl[0]} up / {tl[1]} down / {tl[2]} neutral "
-                     f"(all six must agree to lock)")
+                     f"({C.call_min_agree} of 6 must agree, max {C.call_max_against} against)")
     if c.get("p_up") is not None and not outcome:
         lines.append(f"**Blended** UP {c['p_up'] * 100:.0f}% / DOWN {100 - c['p_up'] * 100:.0f}% (display only)")
     if c.get("avg_exp") is not None and (secs_left <= FINAL_SECONDS or outcome):
@@ -1791,6 +1809,7 @@ def run_window(state, cur, m, px, age, t, sink, fq):
     cur["strike"] = strike
     stale = age > C.stale_s or not price or n_ex < C.min_exch
     prev_side = cur["side"]
+    prev_sell = cur.get("sell", False)
     ctx = update_signals(cur, px, strike, yes, close_ts, t)
     can_call = not stale and bool(strike)
     if can_call and ctx["ss"] and C.final_cutoff < secs_left <= C.call_max:
@@ -1808,8 +1827,12 @@ def run_window(state, cur, m, px, age, t, sink, fq):
 
     since_post = t - cur.get("last_post", 0)
     ev = cur.get("pending_ev")
+    cur["warn_posted"] = min(cur.get("warn_posted", 0), cur.get("warn", 0))   # allow repeat alerts
     if cur["side"] and cur["side"] != prev_side:
         ev = f"New call: {cur['side']} 🔒"
+    elif prev_sell and not cur.get("sell"):
+        ev = "✅ Signals recovered: SELL cleared, back to HOLD"
+        cur["warn_posted"] = cur.get("warn", 0)
     elif cur.get("warn", 0) > cur.get("warn_posted", 0):     # SELL and warnings post a fresh message
         cur["warn_posted"] = cur["warn"]
         ev = ("🚨 SELL: signals have turned against the call" if cur["warn"] == 2
@@ -1879,7 +1902,7 @@ def settle_one(state, p, feed, sink):
                 "side": p["side"], "win": win, "conf": p.get("conf"), "src": p.get("src"),
                 "entry_px": p.get("entry_px"), "yes_entry": p.get("yes_entry"),
                 "feat": p.get("feat_call") or p.get("feat"),
-                "sell_at": p.get("sell_at"), "fc": p.get("fc")})
+                "sell_at": p.get("sell_at"), "sell_n": p.get("sell_n"), "fc": p.get("fc")})
     with LOCK:
         if p not in state["pending"]:
             return
