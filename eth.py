@@ -103,7 +103,11 @@ class C:
     call_hold = _e("CALL_HOLD", 8.0)          # seconds the vote must hold (time debounce)
     call_min_agree = _e("CALL_MIN_AGREE", 4)       # indicators that must agree to call
     call_max_against = _e("CALL_MAX_AGAINST", 1)   # indicators allowed to point the other way
-    sell_hold = _e("SELL_HOLD", 2.0)          # seconds a majority must be against before SELL
+    warn_min_opp = _e("WARN_MIN_OPP", 2)      # indicators against before a warning can start
+    warn_hold = _e("WARN_HOLD", 4.0)          # seconds that count must hold
+    warn_clear = _e("WARN_CLEAR", 3.0)        # seconds below that count before it clears
+    sell_min_opp = _e("SELL_MIN_OPP", 5)      # indicators against needed for SELL
+    sell_hold = _e("SELL_HOLD", 2.0)          # seconds the SELL condition must hold
     recover_hold = _e("RECOVER_HOLD", 2.0)    # seconds opposition must be gone before SELL clears
     quote_max_age = _e("QUOTE_MAX_AGE", 3.0)  # Kalshi quote must be this fresh to call
     call_px_age = _e("CALL_PX_AGE", 5.0)      # exchange price must be this fresh to call
@@ -671,14 +675,15 @@ def conviction(votes):
 
 
 def check_exit(cur, t):
-    """After a call: never flip. Warn when any indicator turns against it, SELL when most have.
-    SELL clears once opposition no longer outnumbers support for RECOVER_HOLD seconds."""
+    """After a call: never flip. Warn when WARN_MIN_OPP indicators stay against it for WARN_HOLD
+    seconds. SELL when SELL_MIN_OPP indicators stay against it for SELL_HOLD seconds.
+    SELL clears once fewer than SELL_MIN_OPP are against for RECOVER_HOLD seconds."""
     sgn = 1 if cur["side"] == "UP" else -1
     vs = {k: v[0] for k, v in cur["votes"].items() if v[0] is not None}
     opp = [k for k, v in vs.items() if v == -sgn]
     sup = [k for k, v in vs.items() if v == sgn]
     cur["opposing"], cur["supporting"] = opp, sup
-    against = len(opp) > len(sup)
+    against = len(opp) >= C.sell_min_opp
     if not cur.get("sell"):
         if against:
             cur.setdefault("sell_t", t)
@@ -698,7 +703,19 @@ def check_exit(cur, t):
             if t - cur["recover_t"] >= C.recover_hold:
                 cur["sell"] = False
                 cur.pop("recover_t", None)
-    cur["warn"] = 2 if cur.get("sell") else 1 if opp else 0
+    if len(opp) >= C.warn_min_opp:
+        cur.pop("warn_clear_t", None)
+        cur.setdefault("warn_t", t)
+        if t - cur["warn_t"] >= C.warn_hold:
+            cur["warn_active"] = True
+    else:
+        cur.pop("warn_t", None)
+        if cur.get("warn_active"):
+            cur.setdefault("warn_clear_t", t)
+            if t - cur["warn_clear_t"] >= C.warn_clear:
+                cur["warn_active"] = False
+                cur.pop("warn_clear_t", None)
+    cur["warn"] = 2 if cur.get("sell") else 1 if cur.get("warn_active") else 0
 
 
 def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
