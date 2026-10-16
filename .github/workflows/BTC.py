@@ -1,22 +1,21 @@
-
 name: BTC 15m Signal Bot
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # new run every 6h; each run lasts ~5h45m so runs hand off
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write            # needed to commit the state files back
+  contents: write
 
 concurrency:
   group: btc-signal-bot
-  cancel-in-progress: false  # let the running job finish; the next one queues
+  cancel-in-progress: false
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 355     # hard cap, under the 360 min GitHub limit
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,9 +44,9 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           KALSHI_KEY_ID: ${{ secrets.KALSHI_KEY_ID }}
-          RUN_SECONDS: "20700"   # 345 min, then the script exits cleanly
+          RUN_SECONDS: "20700"
           POLL_SECONDS: "1"
-          RECORD: "0"            # skip the large btc_ticks.jsonl tick recorder
+          RECORD: "0"
         run: python Btc.py
 
       - name: Save state
@@ -55,7 +54,9 @@ jobs:
         run: |
           git config user.name "signal-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add -f btc_state.json btc_windows.jsonl btc_calib.json 2>/dev/null || true
+          for f in btc_state.json btc_windows.jsonl btc_calib.json; do
+            [ -f "$f" ] && git add -f "$f"
+          done
           if ! git diff --cached --quiet; then
             git commit -m "update btc state [skip ci]"
             git pull --rebase origin main || true
