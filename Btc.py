@@ -1327,7 +1327,7 @@ def fit(test_frac=0.3):
             out[bk] = dict(pure)
             print(f"[{bk}] no measurable edge over the Kalshi price; saved pure-market weights")
     with open(C.calib_file, "w") as f:
-        json.dump({"buckets": out}, f
+        json.dump({"buckets": out}, f)
                   
 # ======================================================================
 # CHART RENDERER (runs in a separate process)  -- UNCHANGED
