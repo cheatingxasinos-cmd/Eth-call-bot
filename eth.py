@@ -1,11 +1,24 @@
-"""Kalshi ETH 15m signal bot v3.5 (single file).
-  python bot.py                 live
-  python bot.py replay FILE     backtest recorded ticks (no Discord)
-  python bot.py fit             fit the probability blend on samples.jsonl
-  python bot.py report [FILE]   ROI, calibration, baselines (state.json or windows.jsonl)
-  python bot.py audit           list recent calls with Kalshi results
-  python bot.py basis           how often our feed disagreed with Kalshi's result
-  python bot.py sells           would selling at the first SELL have beaten holding?
+"""Kalshi ETH 15m signal bot v4.0-strict (single file).
+
+v4.0-strict changes vs v3.5 (fewer, higher-quality calls; every threshold is an env-overridable C value):
+  1. Stricter edge gate: MIN_EV 2.0 -> 4.0 cents, P_HAIRCUT 0.02 -> 0.03.
+  2. FINAL_CUTOFF 10 -> 60: no NEW calls in the last minute (proxy-feed basis error). Exit/SELL
+     checks on an existing call are not gated by it and keep running until the window closes.
+  3. Winner's-curse guard: reject when the model's win prob exceeds the Kalshi-implied win prob
+     by more than MAX_DISAGREE (0.15).
+  4. Price band: reject entry prices above MAX_ENTRY (85c) or below MIN_ENTRY (20c).
+  5. Kelly sizing uses the realistic fill (entry price + SLIP, clamped to 99) so size matches the ledger.
+  6. Vote requirement unchanged (CALL_MIN_AGREE 4, CALL_MAX_AGAINST 1).
+  7. ATR vote scaled by ATR_SCALE (1.25) because atr() is a mean absolute 10s change, not a true range.
+  8. Active strategy parameters are logged at startup.
+
+  python eth.py                 live
+  python eth.py replay FILE     backtest recorded ticks (no Discord)
+  python eth.py fit             fit the probability blend on samples.jsonl
+  python eth.py report [FILE]   ROI, calibration, baselines (state.json or windows.jsonl)
+  python eth.py audit           list recent calls with Kalshi results
+  python eth.py basis           how often our feed disagreed with Kalshi's result
+  python eth.py sells           would selling at the first SELL have beaten holding?
 """
 import base64, functools, io, json, logging, math, multiprocessing, os, random, statistics, sys, threading, time
 from collections import deque
@@ -59,6 +72,7 @@ class C:
     record = _e("RECORD", 1)
     stale_s = _e("STALE_SECONDS", 5.0)
     price_max_age = _e("PRICE_MAX_AGE", 45.0)   # exchange price counts for this long
+    price_fresh = _e("PRICE_FRESH", 15.0)       # feeds fresher than this count toward n_ex
     min_exch = _e("MIN_EXCH", 2)                # no new calls with fewer feeds
     min_conf = _e("MIN_CONF", 55.0)
     max_jump = _e("MAX_JUMP", 0.015)            # ignore single-tick jumps bigger than 1.5%
@@ -80,7 +94,7 @@ class C:
     w_vote = _e("W_VOTE", 0.5)
     w_mom, w_rsi = _e("W_MOM", 0.35), _e("W_RSI", 0.10)
     w_fib, w_trend, w_prob = _e("W_FIB", 0.35), _e("W_TREND", 0.10), _e("W_PROB", 0.10)
-    final_cutoff = _e("FINAL_CUTOFF", 10)     # no new calls or SELL checks in the last N seconds
+    final_cutoff = _e("FINAL_CUTOFF", 60)     # no NEW calls in the last N seconds (exits/SELL checks still run)
     min_p = _e("MIN_P", 0.62)                 # model win prob gate (try 0.55 once the edge gate is live)
     # indicator-based calling
     call_max = _e("CALL_MAX", 900.0)          # call any time in the window
@@ -114,8 +128,8 @@ class C:
     fast_p = _e("FAST_P", 0.80)          # model win prob that unlocks the short hold
     fast_hold = _e("FAST_HOLD", 3.0)     # seconds to hold when the model is strong
     # edge-first calling, sizing and risk
-    min_ev = _e("MIN_EV", 2.0)               # min edge in cents after fee and haircut
-    p_haircut = _e("P_HAIRCUT", 0.02)        # shave the model's win prob before judging it
+    min_ev = _e("MIN_EV", 4.0)               # min edge in cents after fee and haircut
+    p_haircut = _e("P_HAIRCUT", 0.03)        # shave the model's win prob before judging it
     bankroll = _e("BANKROLL", 1000.0)        # starting paper bankroll, dollars
     kelly_frac = _e("KELLY_FRAC", 0.25)
     max_stake_pct = _e("MAX_STAKE_PCT", 0.02)   # hard cap per window, fraction of bankroll
@@ -129,6 +143,11 @@ class C:
     use_book = _e("USE_BOOK", 1)
     sell_act = _e("SELL_ACT", 0)             # 1 = ledger exits at the first SELL, 0 = hold to settle
     fat_tail = _e("FAT_TAIL", 1)
+    # v4.0-strict
+    max_disagree = _e("MAX_DISAGREE", 0.15)  # max model win prob minus Kalshi-implied win prob
+    max_entry = _e("MAX_ENTRY", 85.0)        # no calls priced above this many cents (payout too small)
+    min_entry = _e("MIN_ENTRY", 20.0)        # no calls priced below this many cents (long shots)
+    atr_scale = _e("ATR_SCALE", 1.25)        # approx true range / mean abs 10s change
 
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
@@ -277,6 +296,9 @@ class LiveFeed:
             if "price" in d:
                 cur["last_price"] = d["price"]
                 cur.pop("last_price_dollars", None)
+            if "price_dollars" in d:
+                cur["last_price_dollars"] = d["price_dollars"]
+                cur.pop("last_price", None)
             self.m, self.t, self.ws_t = cur, time.time(), time.time()
 
     def rest_loop(self):
@@ -300,12 +322,18 @@ class LiveFeed:
     def prices(self):
         t, out = time.time(), {}
         for sym in ("ETH", "BTC"):
-            v = [p for (s, _), (p, ts_) in list(self.latest.items())
+            v = [(p, ts_) for (s, _), (p, ts_) in list(self.latest.items())
                  if s == sym and t - ts_ < C.price_max_age]
             if len(v) >= 3:
-                med = statistics.median(v)
-                v = [p for p in v if abs(p / med - 1) < 0.005]   # drop outlier exchange
-            out[sym] = (statistics.median(v), len(v)) if v else (None, 0)
+                med = statistics.median(p for p, _ in v)
+                v = [(p, a) for p, a in v if abs(p / med - 1) < 0.005]   # drop outlier exchange
+            if v:
+                # median over everything within price_max_age; n counts only genuinely fresh feeds,
+                # so stale feeds still give a price but n=0 pauses calls and raises the warning
+                n_fresh = sum(1 for _, a in v if t - a < C.price_fresh)
+                out[sym] = (statistics.median(p for p, _ in v), n_fresh)
+            else:
+                out[sym] = (None, 0)
         return out
 
     def quality(self):
@@ -638,7 +666,7 @@ def predict(yes, ss, secs_left):
     return w * yes + (1 - w) * ss["pm"], ss["pm"]
 
 # ======================================================================
-# PROBABILITY (display only), RISK, AND INDICATOR-GATED CALLING
+# PROBABILITY (feeds the edge gate), RISK, AND INDICATOR-GATED CALLING
 # ======================================================================
 def logit(p):
     p = clamp(p, 0.005, 0.995)
@@ -652,10 +680,23 @@ def sigmoid(x):
 CAL = {"a": 0.5, "b": 0.5, "c": 0.0, "fitted": False}
 
 
+BUCKETS = ("far", "mid", "late")
+
+
+def bucket_for(secs_left):
+    """Time bucket by seconds left: far >300, mid 61-300, late <=60."""
+    return "far" if secs_left > 300 else "mid" if secs_left > 60 else "late"
+
+
 def load_calib():
     try:
         with open(C.calib_file) as f:
-            CAL.update(json.load(f))
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("buckets"), dict):
+            CAL["buckets"] = {k: v for k, v in data["buckets"].items() if k in BUCKETS}
+        else:                                   # old flat {'a','b','c'} format
+            CAL.pop("buckets", None)
+            CAL.update(data)
         CAL["fitted"] = True
         log.info("calibration loaded: %s", CAL)
     except FileNotFoundError:
@@ -668,7 +709,10 @@ def p_up(yes, ss, secs_left):
     if not ss:
         return None
     if CAL["fitted"]:
-        a, b, c = CAL["a"], CAL["b"], CAL["c"]
+        w = (CAL.get("buckets") or {}).get(bucket_for(secs_left))
+        if w is None:
+            w = CAL
+        a, b, c = w["a"], w["b"], w["c"]
     else:                                   # prior: trust the model more as the window closes
         a = 0.5 + 0.5 * clamp(1 - secs_left / 300, 0.0, 1.0)
         b, c = 1 - a, 0.0
@@ -806,7 +850,7 @@ def check_exit(cur, t):
 def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
     pu = p_up(q["yes"], ctx["ss"], secs_left)
     if pu is not None:
-        cur["p_up"] = round(pu, 4)               # display only
+        cur["p_up"] = round(pu, 4)               # shown, and also feeds the edge gate below
     score, ready, up, dn = conviction(cur["votes"])
     cur["conv"] = round(score, 3)
     cur["secs_left"] = secs_left
@@ -821,10 +865,15 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
         return
 
     ss = ctx["ss"]
-    if ss and pu is not None:                     # display only
+    if ss and pu is not None:                     # forecast box is display only (pu itself gates the edge)
         cur["fc"] = {"p_up": round(pu, 3), "exp": round(ss["exp_avg"], 2),
                      "lo": round(ss["exp_avg"] - ss["std"], 2),
                      "hi": round(ss["exp_avg"] + ss["std"], 2), "at": round(elapsed)}
+
+    if secs_left <= C.final_cutoff:               # new calls only; the locked branch above (exits) never reaches here
+        cur["gate"], cur["lock_why"] = f"final {C.final_cutoff:g}s: no new calls", None
+        cur.pop("cand", None)
+        return
 
     why = None
     if not fq["ok"]:
@@ -859,9 +908,21 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
         else:
             ps, ev, ep = edge_for(cand, pu, q)
             ev_h = ev - C.p_haircut * 100
-            n = kelly_contracts(ps, ep)
+            # size on the realistic fill (entry + slip, clamped to 99), the same price fill_check books.
+            # Only one call per window exists, so there is no other open exposure to subtract;
+            # RISK['open_cost'] is deliberately not tracked.
+            ep_fill = clamp(ep + C.slip, 1, 99)
+            n = kelly_contracts(ps, ep_fill)
+            implied = q["yes"] / 100 if cand == "UP" else 1 - q["yes"] / 100
             if ps < C.min_p:
                 cand, cur["lock_why"] = None, f"model win prob {ps * 100:.0f}% is below {C.min_p * 100:.0f}%"
+            elif ps - implied > C.max_disagree:
+                cand, cur["lock_why"] = None, (f"model disagrees with Kalshi by {(ps - implied) * 100:.0f} points, "
+                                               f"likely model error")
+            elif ep > C.max_entry:
+                cand, cur["lock_why"] = None, f"entry {ep:.0f}c is above the {C.max_entry:.0f}c cap (payout too small for fee and tail risk)"
+            elif ep < C.min_entry:
+                cand, cur["lock_why"] = None, f"entry {ep:.0f}c is below the {C.min_entry:.0f}c floor (long shot)"
             elif ev_h < C.min_ev:
                 cand, cur["lock_why"] = None, f"edge {ev_h:+.1f}c after fee and haircut, need {C.min_ev:.1f}c"
             elif n < 1:
@@ -973,6 +1034,8 @@ def vote_atr(p, price, strike, secs_left, ss=None):
         v = 1 if z >= C.atr_z else -1 if z <= -C.atr_z else 0
         return v, f"60s avg proj ${ss['exp_avg']:,.2f}, {z:+.1f}σ from strike"
     a = atr(p)
+    if a is not None:
+        a *= C.atr_scale                  # atr() is a mean abs change, scale toward true range
     if a is None or not price or not strike or a <= 0:
         return None, "warming up"
     z = (price - strike) / (a * math.sqrt(max(secs_left, 10) / 10))
@@ -1054,9 +1117,12 @@ def save_state(state, force=False):
         return
     LAST_SAVE["t"] = time.time()
     with LOCK:
-        state["history"] = state["history"][-500:]
+        if len(state["history"]) > 500:
+            state.setdefault("history_old", []).extend(state["history"][:-500])
+            state["history"] = state["history"][-500:]
+        state["history_old"] = state.get("history_old", [])[-20000:]
         blob = json.dumps({"history": state["history"],
-                           "history_old": state.get("history_old", [])[-2000:],
+                           "history_old": state["history_old"],
                            "pending": [_slim(p) for p in state["pending"]],
                            "current": _slim(state["current"]),
                            "risk": state.get("risk", {})}, separators=(",", ":"), default=str)
@@ -1175,7 +1241,11 @@ def sells():
 # ======================================================================
 # FITTING (optional: replaces the display prior with measured weights)
 # ======================================================================
-def _fit(rows, iters=500, lr=1.0, l2=1e-3):
+def _fit(rows, iters=500, lr=1.0, l2=1e-3, bucket=None):
+    if bucket is not None:
+        rows = [r for r in rows if bucket_for(r["left"]) == bucket]
+    if not rows:
+        return [0.5, 0.5, 0.0]
     X = [(logit(r["pm"] / 100), logit(r["yes"] / 100), 1.0) for r in rows]
     w = [0.5, 0.5, 0.0]
     for _ in range(iters):
@@ -1197,28 +1267,36 @@ def fit(test_frac=0.3):
         rows = [json.loads(x) for x in f if x.strip()]
     rows = [r for r in rows if 5 < r["left"] <= 880]
     tks = list(dict.fromkeys(r["tk"] for r in rows))
-    if len(tks) < 100:
-        print(f"only {len(tks)} windows; collect 100+ (ideally 500+) before trusting a fit")
+    if len(tks) < 300:
+        print(f"only {len(tks)} windows; collect 300+ (ideally 500+) before trusting a fit")
         return
     cut = set(tks[:int(len(tks) * (1 - test_frac))])      # split by window, oldest first
     tr = [r for r in rows if r["tk"] in cut]
     te = [r for r in rows if r["tk"] not in cut]
-    a, b, c = _fit(tr)
-    bm = _brier(te, lambda r: r["yes"] / 100)
-    bs = _brier(te, lambda r: r["pm"] / 100)
-    bf = _brier(te, lambda r: sigmoid(a * logit(r["pm"] / 100) + b * logit(r["yes"] / 100) + c))
-    print(f"held-out Brier: market {bm:.4f} | strike model {bs:.4f} | fitted blend {bf:.4f}")
-    if bf < bm - 0.0005:
-        a, b, c = _fit(rows)
-        out = {"a": a, "b": b, "c": c}
-        print("blend beats the market out of sample, saved", out)
-    else:
-        out = {"a": 0.0, "b": 1.0, "c": 0.0}
-        print("no measurable edge over the Kalshi price; saved pure-market weights")
+    out, pure = {}, {"a": 0.0, "b": 1.0, "c": 0.0}
+    for bk in BUCKETS:
+        trb = [r for r in tr if bucket_for(r["left"]) == bk]
+        teb = [r for r in te if bucket_for(r["left"]) == bk]
+        allb = [r for r in rows if bucket_for(r["left"]) == bk]
+        if not trb or not teb:
+            print(f"[{bk}] not enough samples (train {len(trb)}, test {len(teb)}); pure-market weights")
+            out[bk] = dict(pure)
+            continue
+        a, b, c = _fit(trb)
+        bm = _brier(teb, lambda r: r["yes"] / 100)
+        bs = _brier(teb, lambda r: r["pm"] / 100)
+        bf = _brier(teb, lambda r: sigmoid(a * logit(r["pm"] / 100) + b * logit(r["yes"] / 100) + c))
+        print(f"[{bk}] held-out Brier ({len(teb)} rows): market {bm:.4f} | strike model {bs:.4f} | fitted blend {bf:.4f}")
+        if bf < bm - 0.002:
+            a, b, c = _fit(allb)
+            out[bk] = {"a": a, "b": b, "c": c}
+            print(f"[{bk}] blend beats the market out of sample, saved", out[bk])
+        else:
+            out[bk] = dict(pure)
+            print(f"[{bk}] no measurable edge over the Kalshi price; saved pure-market weights")
     with open(C.calib_file, "w") as f:
-        json.dump(out, f)
-
-
+        json.dump({"buckets": out}, f)
+Here is part 2 of 2, from # CHART RENDERER to the end of the file. Paste it directly after part 1, which ends with json.dump({"buckets": out}, f). Leave two blank lines between them.
 # ======================================================================
 # CHART RENDERER (runs in a separate process)  -- UNCHANGED
 # ======================================================================
@@ -1582,7 +1660,8 @@ def render_frames(cur, outcome, S, n):
     # vote badges
     done = outcome in ("win", "loss")
     vt = (cur.get("votes_call") if done else None) or cur.get("votes") or {}
-    tl = (cur.get("tally_call") if done else None) or cur.get("tally")
+    tl = ((cur.get("tally6_call") or cur.get("tally_call")) if done else None) \
+        or cur.get("tally6") or cur.get("tally")
     cv = cur.get("live_conf") if outcome is None else None
     cshown = cv if cv is not None else conf
     grey = (90, 96, 108)
@@ -1799,12 +1878,28 @@ IO = ThreadPoolExecutor(4)
 RENDER_POOL = None
 
 
+RENDER_LOCK = threading.Lock()
+
+
 def render_chart(snap, outcome):
-    if RENDER_POOL is not None:
+    global RENDER_POOL
+    pool = RENDER_POOL
+    if pool is not None:
         try:
-            return RENDER_POOL.submit(chart_file, snap, outcome).result(timeout=30)
+            return pool.submit(chart_file, snap, outcome).result(timeout=30)
         except Exception:
-            log.exception("render pool failed, rendering inline")
+            log.exception("render pool failed, recreating it and rendering inline")
+            with RENDER_LOCK:
+                if RENDER_POOL is pool:           # another thread may already have replaced it
+                    try:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        log.exception("old render pool shutdown")
+                    try:
+                        RENDER_POOL = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"))
+                        log.warning("render pool recreated")
+                    except Exception:
+                        log.exception("render pool recreate failed")
     return chart_file(snap, outcome)
 
 
@@ -1914,6 +2009,12 @@ def roll_window(state, m, sink):
     save_state(state, force=True)
 
 
+def log_params():
+    log.info("strategy v4.0-strict: MIN_EV=%.1f P_HAIRCUT=%.3f MIN_P=%.2f FINAL_CUTOFF=%s MAX_DISAGREE=%.2f "
+             "MIN_ENTRY=%.0f MAX_ENTRY=%.0f ATR_SCALE=%.2f", C.min_ev, C.p_haircut, C.min_p, C.final_cutoff,
+             C.max_disagree, C.min_entry, C.max_entry, C.atr_scale)
+
+
 def make_call(cur, side, conf, src, elapsed, q, n=1, ev=None):
     ep = round(entry_price(q, side), 1)
     cur.update(side=side, conf=conf, locked=True, called_at=round(elapsed), src=src,
@@ -1925,11 +2026,46 @@ def make_call(cur, side, conf, src, elapsed, q, n=1, ev=None):
                fill_due=now() + C.fill_delay)
 
 
+def _parse_levels(raw, scale=1.0):
+    """Parse raw book levels into [(price_cents, qty)], tolerating string values and dict levels."""
+    out = []
+    for lv in raw if isinstance(raw, (list, tuple)) else []:
+        try:
+            if isinstance(lv, dict):
+                p = lv.get("price", lv.get("price_dollars"))
+                q = lv.get("quantity", lv.get("qty", lv.get("count", lv.get("quantity_fp"))))
+            else:
+                p, q = lv[0], lv[1]
+            p, q = float(p) * scale, int(float(q))
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        if math.isfinite(p) and 0 < p < 100 and q > 0:
+            out.append((p, q))
+    return out
+
+
+def _book_containers(resp):
+    return [(k, resp[k]) for k in ("orderbook", "orderbook_fp")
+            if isinstance(resp, dict) and isinstance(resp.get(k), dict)]
+
+
+def _book_side(resp, name):
+    """Levels (price cents, qty) of bids on side 'yes' or 'no'; [] when nothing parses."""
+    for _, ob in _book_containers(resp):
+        for key, scale in ((name, 1.0), (name + "_dollars", 100.0)):
+            lv = _parse_levels(ob.get(key), scale)
+            if lv:
+                return lv
+    return []
+
+
 def book_fill(ticker, side, n):
-    """Average cents to buy n contracts by walking the book. Check the response shape on your account."""
-    ob = kget(f"/markets/{ticker}/orderbook").get("orderbook", {})
-    bids = ob.get("no" if side == "UP" else "yes") or []     # buying YES hits NO bids, and vice versa
-    levels = sorted(((100 - float(p), int(q)) for p, q in bids), key=lambda x: x[0])
+    """Average cents to buy n contracts by walking the book. None when the needed side has no usable levels."""
+    resp = kget(f"/markets/{ticker}/orderbook")
+    bids = _book_side(resp, "no" if side == "UP" else "yes")    # buying YES hits NO bids, and vice versa
+    if not bids or n <= 0:
+        return None
+    levels = sorted(((100 - p, q) for p, q in bids), key=lambda x: x[0])
     need, cost = n, 0.0
     for px, qty in levels:
         take = min(need, qty)
@@ -1937,7 +2073,31 @@ def book_fill(ticker, side, n):
         need -= take
         if need <= 0:
             break
-    return (cost + need * 99) / n          # unfilled remainder priced at 99c
+    return (cost + need * 99) / n          # only a partial fill's unfilled remainder is priced at 99c
+
+
+def book_check():
+    """Startup diagnostic: log the orderbook response shape so a parse problem is visible immediately."""
+    try:
+        ticker = STATE["feed"].ticker() if STATE.get("feed") else None
+        if not ticker:
+            log.warning("book_check: no ticker")
+            return
+        resp = kget(f"/markets/{ticker}/orderbook")
+        log.info("book_check %s: top-level keys %s", ticker, list(resp) if isinstance(resp, dict) else type(resp))
+        for cname, ob in _book_containers(resp):
+            log.info("book_check: %s keys %s", cname, list(ob))
+            for key, raw in ob.items():
+                if isinstance(raw, (list, tuple)):
+                    log.info("book_check: %s.%s first levels %s (of %d)", cname, key, list(raw[:2]), len(raw))
+        yes, no = _book_side(resp, "yes"), _book_side(resp, "no")
+        if not yes and not no:
+            log.warning("book_check: NEITHER side parses into numeric (price, qty) pairs; "
+                        "book fills will be unavailable (check the orderbook response shape)")
+        else:
+            log.info("book_check: parsed %d yes levels, %d no levels", len(yes), len(no))
+    except Exception:
+        log.warning("book_check failed", exc_info=True)
 
 
 def fill_check(cur, q, t):
@@ -1951,11 +2111,19 @@ def fill_check(cur, q, t):
         def job():
             try:
                 avg = book_fill(cur["ticker"], cur["side"], cur["contracts"])
-                with LOCK:
+            except Exception:
+                log.warning("book fill failed for %s, entry price left unchanged", cur.get("ticker"), exc_info=True)
+                avg = None
+            with LOCK:
+                if avg is None:
+                    cur["book_px"] = None
+                    cur["book_failed"] = True
+                else:
                     cur["book_px"] = round(avg, 1)
                     cur["entry_px"] = round(max(cur["entry_px"], avg), 1)
-            except Exception:
-                log.exception("book fill")
+            if avg is None:
+                log.warning("book fill unavailable for %s (empty/unparsed book); entry_px unchanged",
+                            cur.get("ticker"))
         IO.submit(job)
 
 
@@ -2023,7 +2191,7 @@ def run_window(state, cur, m, px, age, t, sink, fq):
     prev_sell = cur.get("sell", False)
     ctx = update_signals(cur, px, strike, yes, close_ts, t)
     can_call = not stale and bool(strike)
-    if can_call and ctx["ss"] and C.final_cutoff < secs_left <= C.call_max:
+    if can_call and ctx["ss"] and 0 < secs_left <= C.call_max:   # final_cutoff gates new calls inside maybe_call, not exits
         maybe_call(cur, ctx, q, secs_left, elapsed, t, fq)
     if cur["side"]:
         fill_check(cur, q, t)
@@ -2220,7 +2388,7 @@ es.onmessage=e=>{D=JSON.parse(e.data);off=D.now*1000-Date.now();
  const V=D.votes||{};
  NAMES.forEach(([k])=>{const x=V[k]||[null,''],v=x[0];
   setB(k,v,v===1?'UP':v===-1?'DOWN':v===0?'NEUTRAL':'WAIT',x[1])});
- const t=D.tally;
+ const t=D.tally6||D.tally;
  if(t&&(t[0]+t[1]+t[2])>0){const tv=t[0]>t[1]?1:t[1]>t[0]?-1:0;setB('tally',tv,t[0]+'U '+t[1]+'D','Confluence')}
  else setB('tally',null,'WAIT','');
  if(D.side)setB('conf',D.side==='UP'?1:-1,Math.round(D.conf||0)+'%','Live confidence');
@@ -2239,8 +2407,9 @@ function draw(){
  $('clk').textContent=Math.floor(left/60000)+':'+String(Math.floor(left/1000)%60).padStart(2,'0')+'.'+String(Math.floor(left%1000)).padStart(3,'0');
  $('px').textContent=D.price?'$'+D.price.toFixed(2):'--';
  $('tg').textContent=D.strike?'$'+D.strike.toFixed(2):'--';
- const df=D.price-D.strike;$('diff').textContent=(df>=0?'▲ $':'▼ $')+Math.abs(df).toFixed(2);
- $('diff').style.color=df>=0?'#00d98e':'#ff5757';
+ const df=D.price==null?null:D.price-D.strike;
+ $('diff').textContent=df==null?'--':(df>=0?'▲ $':'▼ $')+Math.abs(df).toFixed(2);
+ $('diff').style.color=df==null?'':df>=0?'#00d98e':'#ff5757';
  $('kal').textContent='Kalshi YES '+D.yes.toFixed(0)+'% / NO '+(100-D.yes).toFixed(0)+'%';
  $('call').textContent=D.side?D.side+' call '+Math.round(D.conf||0)+'%':'No call yet';
  g.clearRect(0,0,W,H);if(hist.length<2)return;
@@ -2248,7 +2417,7 @@ function draw(){
  let lo=Math.min(...vals),hi=Math.max(...vals),pad=(hi-lo||1)*.15;lo-=pad;hi+=pad;
  const X=t=>(t-t0)/(t1-t0)*(W-90*r),Y=v=>H-(v-lo)/(hi-lo)*H;
  if(D.strike){g.setLineDash([8*r,6*r]);g.strokeStyle='#cdd2dc';g.beginPath();g.moveTo(0,Y(D.strike));g.lineTo(W,Y(D.strike));g.stroke();g.setLineDash([])}
- g.strokeStyle=df>=0?'#00d98e':'#ff5757';g.lineWidth=2*r;g.beginPath();
+ g.strokeStyle=(df==null||df>=0)?'#00d98e':'#ff5757';g.lineWidth=2*r;g.beginPath();
  hist.forEach((h,i)=>{i?g.lineTo(X(h[0]),Y(h[1])):g.moveTo(X(h[0]),Y(h[1]))});g.stroke();
 }
 draw();
@@ -2264,7 +2433,8 @@ def dash_payload(m):
                        "strike": float(m.get("floor_strike") or m.get("cap_strike") or 0),
                        "close_ts": ts(m["close_time"]), "yes": q["yes"], "side": cur.get("side"),
                        "conf": cur.get("live_conf") or cur.get("conf"), "votes": cur.get("votes"),
-                       "tally": cur.get("tally"), "comb": cur.get("comb"), "rsi": cur.get("rsi"),
+                       "tally": cur.get("tally"), "tally6": cur.get("tally6") or cur.get("tally6_call"),
+                       "comb": cur.get("comb"), "rsi": cur.get("rsi"),
                        "fib": cur.get("fib"), "avg60": cur.get("avg60"),
                        "sell": cur.get("sell"), "warn": cur.get("warn"),
                        "opposing": cur.get("opposing")}, default=str)
@@ -2308,6 +2478,7 @@ class Dash(BaseHTTPRequestHandler):
 # ======================================================================
 def main():
     global RENDER_POOL, REC
+    log_params()
     load_calib()
     if not C.webhook:
         sys.exit("Set DISCORD_WEBHOOK_URL")
@@ -2333,6 +2504,7 @@ def main():
         REC = Recorder(C.tick_file)
     while feed.market()[0] is None or not feed.latest:
         time.sleep(0.05)
+    book_check()
     state = load_state()
     if C.fresh_stats and state["history"]:
         state.setdefault("history_old", []).extend(state["history"])
@@ -2368,6 +2540,7 @@ def main():
 def replay(path):
     C.state_file, C.windows_file = "replay_state.json", "replay_windows.jsonl"
     C.samples_file = "replay_samples.jsonl"
+    log_params()
     C.use_book = 0                                   # no network in replay
     for f in (C.state_file, C.windows_file, C.samples_file):
         if os.path.exists(f):
