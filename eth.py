@@ -93,7 +93,7 @@ class C:
     final_call_pct = _e("FINAL_CALL_PCT", 70.0)
     final_hold = _e("FINAL_HOLD", 2.0)
     final_cutoff = _e("FINAL_CUTOFF", 10)     # no new calls or SELL checks in the last N seconds
-    # old edge settings (unused; kept so old env files still load)
+    # old edge settings (min_p is now used by the model gate; the rest are unused)
     min_edge = _e("MIN_EDGE", 1.0)
     min_p = _e("MIN_P", 0.62)
     edge_hold = _e("EDGE_HOLD", 2.0)
@@ -126,6 +126,10 @@ class C:
     max_bytes = int(_e("MAX_MB", 7.5) * 1024 * 1024)
     live_frames = _e("LIVE_FRAMES", 4)
     timer_lead = _e("TIMER_LEAD", 0.7)
+    # accuracy patch
+    fast_p = _e("FAST_P", 0.80)          # model win prob that unlocks the short hold
+    fast_hold = _e("FAST_HOLD", 3.0)     # seconds to hold when the model is strong
+    edge_floor = _e("EDGE_FLOOR", -3.0)  # block calls whose EV after fee is worse than this (cents)
 
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
@@ -518,15 +522,28 @@ def series_10s(sym="ETH", n=90, step=10):
     return out
 
 
+VOLC = {}
+
+
 def vol(sym):
-    pts = list(PRICES[sym])
-    rets = [math.log(p1 / p0) / math.sqrt(t1 - t0)
-            for (t0, p0), (t1, p1) in zip(pts, pts[1:]) if t1 - t0 > 0.05]
+    t = now()
+    hit = VOLC.get(sym)
+    if hit and abs(t - hit[0]) < 0.25:
+        return hit[1]
     base = DEF_SIG[sym]
-    if len(rets) < 8:
-        return base
-    s = math.sqrt(sum(r * r for r in rets) / len(rets))
-    return clamp(s, base * 0.4, base * 4)
+    bars, last = [], None
+    for tt, p in list(PRICES[sym]):
+        if t - tt > 300:
+            continue
+        if last is None or tt - last >= 5:     # 5s bars drop tick-level noise
+            bars.append((tt, p))
+            last = tt
+    out = base
+    if len(bars) >= 8 and bars[-1][0] - bars[0][0] > 20:
+        var = sum(math.log(p1 / p0) ** 2 for (_, p0), (_, p1) in zip(bars, bars[1:]))
+        out = clamp(math.sqrt(var / (bars[-1][0] - bars[0][0])), base * 0.4, base * 4)
+    VOLC[sym] = (t, out)
+    return out
 
 
 def z60(sym):
@@ -608,7 +625,6 @@ def predict(yes, ss, secs_left):
     w = C.w_market_final if secs_left <= FINAL_SECONDS else C.w_market
     return w * yes + (1 - w) * ss["pm"], ss["pm"]
 
-
 # ======================================================================
 # PROBABILITY (display only) AND INDICATOR-ONLY CALLING
 # ======================================================================
@@ -648,7 +664,7 @@ def p_up(yes, ss, secs_left):
 
 
 def edge_for(side, pu, q):
-    """(win prob, expected value in cents after fee, entry price in cents). Not used for calls."""
+    """(win prob, expected value in cents after fee, entry price in cents)."""
     ep = entry_price(q, side)
     ps = pu if side == "UP" else 1 - pu
     fee = 7 * (ep / 100) * (1 - ep / 100)        # approx Kalshi taker fee per contract, cents
@@ -759,16 +775,29 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
             elif sgn * (q["yes"] - 50) <= 0:
                 cand, cur["lock_why"] = None, "Kalshi favors the other side"
 
+    if cand:                                      # model gate: votes alone cannot open a call
+        if pu is None:
+            cand, cur["lock_why"] = None, "no model probability yet"
+        else:
+            ps, ev, ep = edge_for(cand, pu, q)
+            if ps < C.min_p:
+                cand, cur["lock_why"] = None, f"model win prob {ps * 100:.0f}% is below {C.min_p * 100:.0f}%"
+            elif ev < C.edge_floor:
+                cand, cur["lock_why"] = None, f"EV {ev:+.1f}c after fee at {ep:.0f}c entry"
+            else:
+                cur["cand_ps"] = ps
+
     if cand is None:
         cur.pop("cand", None)
         return
     if cur.get("cand") != cand:
         cur["cand"], cur["cand_t"] = cand, t
         return
-    if t - cur["cand_t"] < C.call_hold:
+    hold = C.fast_hold if cur.get("cand_ps", 0) >= C.fast_p else C.call_hold
+    if t - cur["cand_t"] < hold:
         return
     cur.pop("cand", None)
-    make_call(cur, cand, 50 + 40 * abs(score), "VOTE", elapsed, q)
+    make_call(cur, cand, clamp(cur.get("cand_ps", 0.5) * 100, 50, 99), "VOTE", elapsed, q)
 
 
 # ======================================================================
