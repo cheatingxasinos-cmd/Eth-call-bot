@@ -1,9 +1,11 @@
-"""Kalshi ETH 15m signal bot v3.4 (single file).
+"""Kalshi ETH 15m signal bot v3.5 (single file).
   python bot.py                 live
   python bot.py replay FILE     backtest recorded ticks (no Discord)
   python bot.py fit             fit the probability blend on samples.jsonl
-  python bot.py report [STATE]  ROI, calibration, baselines
+  python bot.py report [FILE]   ROI, calibration, baselines (state.json or windows.jsonl)
   python bot.py audit           list recent calls with Kalshi results
+  python bot.py basis           how often our feed disagreed with Kalshi's result
+  python bot.py sells           would selling at the first SELL have beaten holding?
 """
 import base64, functools, io, json, logging, math, multiprocessing, os, random, statistics, sys, threading, time
 from collections import deque
@@ -62,20 +64,10 @@ class C:
     max_jump = _e("MAX_JUMP", 0.015)            # ignore single-tick jumps bigger than 1.5%
     fresh_stats = _e("FRESH_STATS", 0)          # 1 = archive old win/loss record at startup
     wide_spread = _e("WIDE_SPREAD", 10.0)
-    abstain = _e("ABSTAIN", 0.04)
-    instant = _e("INSTANT_CALL", 1)
-    call_cutoff = max(_e("CALL_CUTOFF", 60), 60)
-    confirm_s = _e("CONFIRM_SECONDS", 3.0)
-    lock_pm = _e("LOCK_PM", 55.0)
     tilt_w = _e("TILT_W", 0.25)
     mom_min = _e("MOM_MIN", 0.10)
     fib_agree = _e("FIB_AGREE", 0.15)
     rsi_n = _e("RSI_N", 14)
-    rsi_block = _e("RSI_BLOCK", 20.0)
-    combo_min = _e("COMBO_MIN", 0.40)
-    combo_opp = _e("COMBO_OPP", 0)
-    conf_full = _e("CONF_FULL", 0.6)
-    conf_vote_w = _e("CONF_VOTE_W", 0.4)
     ema_dead = _e("EMA_DEAD", 0.00005)
     macd_dead = _e("MACD_DEAD", 0.00002)
     bb_up = _e("BB_UP", 0.65)
@@ -88,16 +80,9 @@ class C:
     w_vote = _e("W_VOTE", 0.5)
     w_mom, w_rsi = _e("W_MOM", 0.35), _e("W_RSI", 0.10)
     w_fib, w_trend, w_prob = _e("W_FIB", 0.35), _e("W_TREND", 0.10), _e("W_PROB", 0.10)
-    w_i_pm, w_i_mkt, w_i_mom = _e("W_I_PM", 0.25), _e("W_I_MKT", 0.25), _e("W_I_MOM", 0.20)
-    w_i_trend, w_i_fib, w_i_comb = _e("W_I_TREND", 0.15), _e("W_I_FIB", 0.10), _e("W_I_COMB", 0.05)
-    final_call_pct = _e("FINAL_CALL_PCT", 70.0)
-    final_hold = _e("FINAL_HOLD", 2.0)
     final_cutoff = _e("FINAL_CUTOFF", 10)     # no new calls or SELL checks in the last N seconds
-    # old edge settings (min_p is now used by the model gate; the rest are unused)
-    min_edge = _e("MIN_EDGE", 1.0)
-    min_p = _e("MIN_P", 0.62)
-    edge_hold = _e("EDGE_HOLD", 2.0)
-    # indicator-only calling
+    min_p = _e("MIN_P", 0.62)                 # model win prob gate (try 0.55 once the edge gate is live)
+    # indicator-based calling
     call_max = _e("CALL_MAX", 900.0)          # call any time in the window
     vote_min_ready = _e("VOTE_MIN_READY", 6)  # all six indicators must be warmed up
     call_hold = _e("CALL_HOLD", 8.0)          # seconds the vote must hold (time debounce)
@@ -126,10 +111,24 @@ class C:
     max_bytes = int(_e("MAX_MB", 7.5) * 1024 * 1024)
     live_frames = _e("LIVE_FRAMES", 4)
     timer_lead = _e("TIMER_LEAD", 0.7)
-    # accuracy patch
     fast_p = _e("FAST_P", 0.80)          # model win prob that unlocks the short hold
     fast_hold = _e("FAST_HOLD", 3.0)     # seconds to hold when the model is strong
-    edge_floor = _e("EDGE_FLOOR", -3.0)  # block calls whose EV after fee is worse than this (cents)
+    # edge-first calling, sizing and risk
+    min_ev = _e("MIN_EV", 2.0)               # min edge in cents after fee and haircut
+    p_haircut = _e("P_HAIRCUT", 0.02)        # shave the model's win prob before judging it
+    bankroll = _e("BANKROLL", 1000.0)        # starting paper bankroll, dollars
+    kelly_frac = _e("KELLY_FRAC", 0.25)
+    max_stake_pct = _e("MAX_STAKE_PCT", 0.02)   # hard cap per window, fraction of bankroll
+    max_contracts = _e("MAX_CONTRACTS", 200)
+    daily_stop = _e("DAILY_STOP", 0.05)      # stop calling after losing 5% in a UTC day
+    streak_n = _e("STREAK_N", 3)             # losses in a row that trigger a pause
+    pause_windows = _e("PAUSE_WINDOWS", 2)
+    loss_scale = _e("LOSS_SCALE", 0.5)       # stake multiplier per consecutive loss, max 2 applied
+    fill_delay = _e("FILL_DELAY", 1.5)       # seconds between signal and assumed fill
+    slip = _e("SLIP", 1.0)                   # extra cents of slippage on the fill
+    use_book = _e("USE_BOOK", 1)
+    sell_act = _e("SELL_ACT", 0)             # 1 = ledger exits at the first SELL, 0 = hold to settle
+    fat_tail = _e("FAT_TAIL", 1)
 
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
@@ -265,6 +264,8 @@ class LiveFeed:
         with self.lock:
             if not self.m:
                 return
+            if d.get("market_ticker") not in (None, self.m["ticker"]):
+                return                      # late message from the previous window
             cur = dict(self.m)
             for base in ("yes_bid", "yes_ask"):
                 if base in d or base + "_dollars" in d:
@@ -506,6 +507,17 @@ def norm_cdf(x):
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 
+def t4_cdf(x):
+    """Student-t CDF, 4 degrees of freedom, closed form."""
+    s = 1 + x * x / 4
+    return 0.5 + 0.375 * x / math.sqrt(s) * (1 - x * x / (12 * s))
+
+
+def cdf(x):
+    """Unit-variance CDF: fat-tailed t4 (rescaled) or normal."""
+    return t4_cdf(x * math.sqrt(2)) if C.fat_tail else norm_cdf(x)
+
+
 def series_10s(sym="ETH", n=90, step=10):
     pts = list(PRICES[sym])
     if not pts:
@@ -613,7 +625,7 @@ def settle_stats(price, strike, close_ts, t, tilt=0.0):
     if std <= 1e-9:
         pm = 99.0 if exp_avg >= strike else 1.0
     else:
-        pm = clamp(norm_cdf((exp_avg - strike) / std + shift) * 100, 1.0, 99.0)
+        pm = clamp(cdf((exp_avg - strike) / std + shift) * 100, 1.0, 99.0)
     return {"pm": pm, "exp_avg": exp_avg, "std": std, "rem": rem,
             "obs_avg": (total / e) if e > 1 else None,
             "need": ((strike * FINAL_SECONDS - total) / rem) if rem > 0.5 else None}
@@ -626,7 +638,7 @@ def predict(yes, ss, secs_left):
     return w * yes + (1 - w) * ss["pm"], ss["pm"]
 
 # ======================================================================
-# PROBABILITY (display only) AND INDICATOR-ONLY CALLING
+# PROBABILITY (display only), RISK, AND INDICATOR-GATED CALLING
 # ======================================================================
 def logit(p):
     p = clamp(p, 0.005, 0.995)
@@ -663,12 +675,69 @@ def p_up(yes, ss, secs_left):
     return sigmoid(a * logit(ss["pm"] / 100) + b * logit(yes / 100) + c)
 
 
+def _fee(ep, n=1):
+    """Kalshi taker fee in cents for n contracts at ep cents (rounded up per order)."""
+    p = ep / 100
+    return math.ceil(7 * n * p * (1 - p) - 1e-9)
+
+
 def edge_for(side, pu, q):
     """(win prob, expected value in cents after fee, entry price in cents)."""
     ep = entry_price(q, side)
     ps = pu if side == "UP" else 1 - pu
     fee = 7 * (ep / 100) * (1 - ep / 100)        # approx Kalshi taker fee per contract, cents
     return ps, ps * 100 - ep - fee, ep
+
+
+RISK = {}
+
+
+def risk_init(state):
+    global RISK
+    RISK = state.setdefault("risk", {})
+    for k, v in (("bank", C.bankroll), ("day", ""), ("day_start", C.bankroll),
+                 ("recent", []), ("pause_until", 0.0)):
+        RISK.setdefault(k, v)
+
+
+def streak_losses():
+    n = 0
+    for w in reversed(RISK.get("recent", [])):
+        if w:
+            break
+        n += 1
+    return n
+
+
+def kelly_contracts(ps, ep):
+    p = ps - C.p_haircut
+    k = (ep + _fee(ep)) / 100                       # cost per contract incl. worst-case fee, dollars
+    if not 0 < k < 1 or p <= k:
+        return 0
+    f = (p - k) / (1 - k)                           # full Kelly fraction of bankroll
+    f = min(f * C.kelly_frac, C.max_stake_pct) * C.loss_scale ** min(streak_losses(), 2)
+    return min(int(RISK["bank"] * f / k), C.max_contracts)
+
+
+def risk_gate(t):
+    d = datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d")
+    if RISK.get("day") != d:
+        RISK["day"], RISK["day_start"] = d, RISK["bank"]
+    if RISK["bank"] <= RISK["day_start"] * (1 - C.daily_stop):
+        return f"daily loss stop hit (bank ${RISK['bank']:,.0f})"
+    if t < RISK.get("pause_until", 0):
+        return f"streak pause, {int(RISK['pause_until'] - t)}s left"
+    return None
+
+
+def risk_record(win, close_ts, pnl_usd):
+    RISK["bank"] = round(RISK["bank"] + pnl_usd, 2)
+    r = RISK.setdefault("recent", [])
+    r.append(bool(win))
+    del r[:-10]
+    if streak_losses() >= C.streak_n:
+        RISK["pause_until"] = close_ts + 900 * C.pause_windows
+        RISK["recent"] = [False]                    # resume at reduced size
 
 
 VOTE_W = {"atr": 1.5, "ema": 1.0, "macd": 1.0, "mom": 1.0, "boll": 0.5, "fib": 0.5}
@@ -743,7 +812,12 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
     cur["secs_left"] = secs_left
 
     if cur["side"] is not None:                   # locked: warnings only, no flips
+        before = cur.get("sell_n", 0)
         check_exit(cur, t)
+        if cur.get("sell_n", 0) > before and "sell_px" not in cur:
+            # what an exit would actually fetch: sell YES at the bid, or sell NO at 100 - ask
+            cur["sell_px"] = round((q["bid"] if q["bid"] is not None else q["yes"] - 2) if cur["side"] == "UP"
+                                   else 100 - (q["ask"] if q["ask"] is not None else q["yes"] + 2), 1)
         return
 
     ss = ctx["ss"]
@@ -757,6 +831,8 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
         why = fq["why"]                           # bad data only, not a signal threshold
     elif ready < C.vote_min_ready:
         why = f"only {ready}/6 indicators ready"
+    else:
+        why = risk_gate(t)
     cur["gate"], cur["lock_why"] = why, None
 
     cand = None
@@ -775,17 +851,23 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
             elif sgn * (q["yes"] - 50) <= 0:
                 cand, cur["lock_why"] = None, "Kalshi favors the other side"
 
-    if cand:                                      # model gate: votes alone cannot open a call
+    if cand:                                      # edge gate: votes alone cannot open a call
         if pu is None:
             cand, cur["lock_why"] = None, "no model probability yet"
+        elif q["ask"] is None or q["bid"] is None:
+            cand, cur["lock_why"] = None, "no two-sided quote to fill against"
         else:
             ps, ev, ep = edge_for(cand, pu, q)
+            ev_h = ev - C.p_haircut * 100
+            n = kelly_contracts(ps, ep)
             if ps < C.min_p:
                 cand, cur["lock_why"] = None, f"model win prob {ps * 100:.0f}% is below {C.min_p * 100:.0f}%"
-            elif ev < C.edge_floor:
-                cand, cur["lock_why"] = None, f"EV {ev:+.1f}c after fee at {ep:.0f}c entry"
+            elif ev_h < C.min_ev:
+                cand, cur["lock_why"] = None, f"edge {ev_h:+.1f}c after fee and haircut, need {C.min_ev:.1f}c"
+            elif n < 1:
+                cand, cur["lock_why"] = None, "stake sizes to zero contracts"
             else:
-                cur["cand_ps"] = ps
+                cur["cand_ps"], cur["cand_n"], cur["cand_ev"] = ps, n, round(ev_h, 1)
 
     if cand is None:
         cur.pop("cand", None)
@@ -797,7 +879,8 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
     if t - cur["cand_t"] < hold:
         return
     cur.pop("cand", None)
-    make_call(cur, cand, clamp(cur.get("cand_ps", 0.5) * 100, 50, 99), "VOTE", elapsed, q)
+    make_call(cur, cand, clamp(cur.get("cand_ps", 0.5) * 100, 50, 99), "VOTE", elapsed, q,
+              cur.get("cand_n", 1), cur.get("cand_ev"))
 
 
 # ======================================================================
@@ -948,12 +1031,13 @@ def load_state():
             s.setdefault("history_old", [])
             s.setdefault("pending", [])
             s.setdefault("current", None)
+            s.setdefault("risk", {})
             return s
         except FileNotFoundError:
             continue
         except Exception:
             log.exception("could not read %s", path)
-    return {"history": [], "history_old": [], "current": None, "pending": []}
+    return {"history": [], "history_old": [], "current": None, "pending": [], "risk": {}}
 
 
 def _slim(c):
@@ -974,7 +1058,8 @@ def save_state(state, force=False):
         blob = json.dumps({"history": state["history"],
                            "history_old": state.get("history_old", [])[-2000:],
                            "pending": [_slim(p) for p in state["pending"]],
-                           "current": _slim(state["current"])}, separators=(",", ":"), default=str)
+                           "current": _slim(state["current"]),
+                           "risk": state.get("risk", {})}, separators=(",", ":"), default=str)
     tmp = C.state_file + ".tmp"
     with open(tmp, "w") as f:
         f.write(blob)
@@ -1002,9 +1087,11 @@ def stats(h):
         n, w = len(xs), sum(1 for x in xs if x["win"])
         return f"{w}W-{n - w}L ({w / n * 100:.0f}%)" if n else "n/a"
     priced = [x for x in h if x.get("entry_px")]
-    cost = sum(x["entry_px"] for x in priced)
-    pnl = sum((100 - x["entry_px"]) if x["win"] else -x["entry_px"] for x in priced)
-    roi = f"{pnl / cost * 100:+.1f}% on {len(priced)}" if cost else "n/a"
+    cost = sum(x["entry_px"] * (x.get("contracts") or 1) for x in priced)
+    pnl = sum(x["pnl_c"] if x.get("pnl_c") is not None
+              else ((100 - x["entry_px"]) if x["win"] else -x["entry_px"]) - _fee(x["entry_px"])
+              for x in priced)
+    roi = f"{pnl / cost * 100:+.1f}% net on {len(priced)}" if cost else "n/a"
     return {"all": wl(h), "last": wl(h[-50:]), "roi": roi}
 
 
@@ -1015,7 +1102,7 @@ def report(history):
         return
     wins = sum(1 for h in history if h["win"])
     print(f"calls {n}, win rate {wins / n * 100:.1f}%")
-    print("ROI per contract (before fees):", stats(history)["roi"])
+    print("ROI on cost, net of fees:", stats(history)["roi"])
     conf = [h for h in history if h.get("conf") is not None]
     if conf:
         brier = statistics.fmean((h["conf"] / 100 - (1 if h["win"] else 0)) ** 2 for h in conf)
@@ -1043,7 +1130,7 @@ def audit(n=30):
     except FileNotFoundError:
         print("no windows file yet; it logs windows settled since the v2 upgrade")
         return
-    called = [r for r in rows if r.get("side")]
+    called = [r for r in rows if r.get("side") and r.get("res")]
     bad = [r for r in called if r.get("win") != ((r["res"] == "yes") == (r["side"] == "UP"))]
     print(f"{len(rows)} windows logged, {len(called)} with a call, {len(bad)} inconsistent")
     for r in called[-n:]:
@@ -1052,6 +1139,37 @@ def audit(n=30):
         print(f"{when} {r['ticker']} call {r['side']:4s} result {r['res']:3s} "
               f"{'WIN ' if r['win'] else 'LOSS'} entry {r.get('entry_px')}c conf {r.get('conf')}{sold}")
     print("Check a few of these tickers against Kalshi's own results page.")
+
+
+def basis():
+    """How often our feed's projected 60s average landed on the opposite side of the strike from Kalshi."""
+    with open(C.windows_file) as f:
+        rows = [json.loads(x) for x in f if x.strip()]
+    rows = [r for r in rows if r.get("res") and r.get("avg_exp") and (r.get("avg_rem") or 99) <= 5]
+    if not rows:
+        print("no usable windows yet")
+        return
+    miss = [r for r in rows if (r["avg_exp"] >= r["strike"]) != (r["res"] == "yes")]
+    print(f"{len(rows)} windows, feed disagreed with Kalshi on {len(miss)} ({len(miss) / len(rows) * 100:.1f}%)")
+    for r in miss[-20:]:
+        print(f"  {r['ticker']} feed gap {(r['avg_exp'] / r['strike'] - 1) * 1e4:+.1f}bp, Kalshi said {r['res']}")
+
+
+def sells():
+    """Would exiting at the first SELL have beaten holding to settlement?"""
+    with open(C.windows_file) as f:
+        rows = [json.loads(x) for x in f if x.strip()]
+    rows = [r for r in rows if r.get("pnl_hold_c") is not None]
+    s = [r for r in rows if r.get("sell_px") is not None]
+    if not s:
+        print("no SELL signals logged yet")
+        return
+    hold, sell = sum(r["pnl_hold_c"] for r in s), sum(r["pnl_sell_c"] for r in s)
+    better = sum(1 for r in s if r["pnl_sell_c"] > r["pnl_hold_c"])
+    print(f"{len(s)} of {len(rows)} calls got a SELL")
+    print(f"holding netted ${hold / 100:+.2f}, selling at the first SELL netted ${sell / 100:+.2f}")
+    print(f"selling beat holding on {better} ({better / len(s) * 100:.0f}%); "
+          f"false alarms (call won anyway): {sum(1 for r in s if r.get('win'))}")
 
 
 # ======================================================================
@@ -1102,7 +1220,7 @@ def fit(test_frac=0.3):
 
 
 # ======================================================================
-# CHART RENDERER (runs in a separate process)
+# CHART RENDERER (runs in a separate process)  -- UNCHANGED
 # ======================================================================
 CW, CH = 720, 860
 WHITE = (255, 255, 255, 255)
@@ -1582,9 +1700,10 @@ def chart_file(cur, outcome=None):
 def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, stale=None):
     side = c["side"]
     s = stats(state["history"])
-    fields = [{"name": "All-time", "value": s["all"], "inline": True},
+    fields = [{"name": "Last 500", "value": s["all"], "inline": True},
               {"name": "Last 50", "value": s["last"], "inline": True},
-              {"name": "ROI", "value": s["roi"], "inline": True}]
+              {"name": "ROI (net)", "value": s["roi"], "inline": True},
+              {"name": "Bankroll", "value": f"${RISK.get('bank', 0):,.0f}", "inline": True}]
     if side is None:
         title, color = "⚪ KALSHI ETH 15m: NO CALL", GREY
         lines = ["**Call:** ⚪ NO SAFE CALL yet", "**Action:** WAIT, no position",
@@ -1604,17 +1723,22 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, st
             if c.get("sell"):
                 action, color = "🚨 SELL", RED
                 alert = ["# 🚨 SELL 🚨", "**Most indicators have turned against this call**"]
+                if c.get("sell_px") is not None and c.get("entry_px") is not None:
+                    alert.append(f"**Exit now** ~{c['sell_px']:.0f}¢ vs {c['entry_px']:.0f}¢ entry (before fees)")
             elif c.get("warn") == 1:
                 color = 0xFFB300
                 alert = ["⚠️ **WARNING** against: " + ", ".join(c.get("opposing", []))
                          + f" ({len(c.get('opposing', []))}/6)"]
         lines = alert + [f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry) 🔒"]
         if not outcome:
-            lc = c.get("live_conf", conf)
+            lc = c.get("live_p", conf)
             lines.append(f"**Updated confidence:** {lc:.0f}% ({lc - conf:+.0f} vs entry)")
         lines += [f"**Action:** {action}", f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%"]
         if c.get("entry_px") is not None:
             lines.append(f"**Entry price** {c['entry_px']:.0f}¢")
+        if c.get("contracts"):
+            lines.append(f"**Size** {c['contracts']} contracts (~${c['contracts'] * c['entry_px'] / 100:,.0f}) "
+                         f"| edge {c.get('entry_ev') or 0:+.1f}c after fee")
         title = f"{arrow} KALSHI ETH 15m: {side} | {action}"
     fc = c.get("fc")
     if fc:
@@ -1623,8 +1747,8 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, st
                      + (" | 🔒 frozen at call" if side else ""))
     if pm is not None:
         lines.append(f"**Strike model** UP {pm:.0f}% / DOWN {100 - pm:.0f}%")
-    if c.get("tally") and not outcome:
-        tl = c["tally"]
+    if (c.get("tally6") or c.get("tally")) and not outcome:
+        tl = c.get("tally6") or c["tally"]
         lines.append(f"**Indicators** {tl[0]} up / {tl[1]} down / {tl[2]} neutral "
                      f"({C.call_min_agree} of 6 must agree, max {C.call_max_against} against)")
     if c.get("p_up") is not None and not outcome:
@@ -1645,7 +1769,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, st
         lines.append(f"**Signals** Fibonacci {c.get('fib') or 'forming'}% | RSI {rs}")
     done = outcome in ("win", "loss")
     vt = (c.get("votes_call") if done else None) or c.get("votes")
-    tally = (c.get("tally_call") if done else None) or c.get("tally")
+    tally = ((c.get("tally6_call") or c.get("tally_call")) if done else None) or c.get("tally6") or c.get("tally")
     if vt and tally:
         names = {"mom": "Momentum", "fib": "Fibonacci", "ema": "EMA 9/21",
                  "boll": "Bollinger", "atr": "ATR", "macd": "MACD"}
@@ -1709,6 +1833,8 @@ def send(embed, message_id=None, snap=None, outcome=None, text_only=False):
             continue
         if r.status_code == 404 and message_id:     # message deleted: post a new one
             message_id = None
+            if not f:
+                embed.pop("image", None)            # no file to attach, so drop the dangling reference
             continue
         if r.status_code >= 500:
             time.sleep(1 + attempt)
@@ -1728,7 +1854,7 @@ class LiveSink:
         def run():
             try:
                 new_id = send(embed, mid, snap, None, text_only)
-                if new_due:
+                if new_due or new_id != mid:
                     with LOCK:
                         cur["message_id"] = new_id
             except Exception:
@@ -1780,20 +1906,57 @@ def roll_window(state, m, sink):
         return
     state["current"] = None
     state["pending"].append(cur)
+    last = cur["pts"][-1][1] if cur["pts"] else 50
     if cur["side"] is None:
-        last = cur["pts"][-1][1] if cur["pts"] else 50
         sink.final(build_embed(cur, state, last, None, 0, 0), cur, None)
     else:
-        sink.final(build_embed(cur, state, 50, None, 0, 0, "settling"), cur, "settling")
+        sink.final(build_embed(cur, state, last, None, 0, 0, "settling"), cur, "settling")
     save_state(state, force=True)
 
 
-def make_call(cur, side, conf, src, elapsed, q):
+def make_call(cur, side, conf, src, elapsed, q, n=1, ev=None):
+    ep = round(entry_price(q, side), 1)
     cur.update(side=side, conf=conf, locked=True, called_at=round(elapsed), src=src,
                votes_call=dict(cur["votes"]), tally_call=list(cur["tally"]),
+               tally6_call=list(cur["tally6"]),
                comb_call=cur["comb"], rsi_call=cur["rsi"],
-               entry_px=round(entry_price(q, side), 1), yes_entry=round(q["yes"], 1),
-               feat_call=dict(cur["feat"]))
+               entry_px=ep, sig_px=ep, yes_entry=round(q["yes"], 1),
+               feat_call=dict(cur["feat"]), contracts=n, entry_ev=ev,
+               fill_due=now() + C.fill_delay)
+
+
+def book_fill(ticker, side, n):
+    """Average cents to buy n contracts by walking the book. Check the response shape on your account."""
+    ob = kget(f"/markets/{ticker}/orderbook").get("orderbook", {})
+    bids = ob.get("no" if side == "UP" else "yes") or []     # buying YES hits NO bids, and vice versa
+    levels = sorted(((100 - float(p), int(q)) for p, q in bids), key=lambda x: x[0])
+    need, cost = n, 0.0
+    for px, qty in levels:
+        take = min(need, qty)
+        cost += take * px
+        need -= take
+        if need <= 0:
+            break
+    return (cost + need * 99) / n          # unfilled remainder priced at 99c
+
+
+def fill_check(cur, q, t):
+    """Paper fill: worst of signal price and the quote FILL_DELAY later, plus slippage, then the real book."""
+    if not cur.get("side") or cur.get("filled") or t < cur.get("fill_due", 1e18):
+        return
+    cur["filled"] = True
+    px = entry_price(q, cur["side"]) + C.slip
+    cur["entry_px"] = round(clamp(max(px, cur["sig_px"]), 1, 99), 1)   # never a better fill than the signal
+    if C.use_book:
+        def job():
+            try:
+                avg = book_fill(cur["ticker"], cur["side"], cur["contracts"])
+                with LOCK:
+                    cur["book_px"] = round(avg, 1)
+                    cur["entry_px"] = round(max(cur["entry_px"], avg), 1)
+            except Exception:
+                log.exception("book fill")
+        IO.submit(job)
 
 
 def update_signals(cur, px, strike, yes, close_ts, t):
@@ -1832,6 +1995,8 @@ def update_signals(cur, px, strike, yes, close_ts, t):
                            else -1 if fib <= -C.fib_agree else 0,
                            f"retrace {fib_lvl}% ({fib:+.2f})" if fib_lvl else "forming"]
     cur["tally"] = [ready.count(1), ready.count(-1), len(ready) - ready.count(1) - ready.count(-1)]
+    vs6 = [v[0] for v in cur["votes"].values() if v[0] is not None]      # all six votes, what calls use
+    cur["tally6"] = [vs6.count(1), vs6.count(-1), len(vs6) - vs6.count(1) - vs6.count(-1)]
     cur.update(comb=round(comb, 3), score=round(score, 3), fib=fib_lvl,
                rsi=round(r, 1) if r is not None else None,
                sig={"mom": round(mom, 2), "fib": round(fib, 2), "trend": round(trend, 2), "prob": round(prob, 2)})
@@ -1860,9 +2025,14 @@ def run_window(state, cur, m, px, age, t, sink, fq):
     can_call = not stale and bool(strike)
     if can_call and ctx["ss"] and C.final_cutoff < secs_left <= C.call_max:
         maybe_call(cur, ctx, q, secs_left, elapsed, t, fq)
+    if cur["side"]:
+        fill_check(cur, q, t)
     if cur["side"] and cur.get("conv") is not None:
         sgn = 1 if cur["side"] == "UP" else -1
-        cur["live_conf"] = round(clamp(50 + 45 * sgn * cur["conv"], 1, 99), 1)
+        cur["live_conf"] = round(clamp(50 + 45 * sgn * cur["conv"], 1, 99), 1)   # chart badge (unchanged)
+    if cur["side"] and cur.get("p_up") is not None:
+        ps_now = cur["p_up"] if cur["side"] == "UP" else 1 - cur["p_up"]       # same scale as entry confidence
+        cur["live_p"] = round(clamp(ps_now * 100, 1, 99), 1)
     if can_call and ctx["ss"] and t - cur.get("last_sample", 0) >= C.sample_s:
         cur["last_sample"] = t   # logged for EVERY window, called or not, so fitting has no selection bias
         cur.setdefault("samples", []).append([round(secs_left), round(ctx["ss"]["pm"], 2), round(yes, 1)])
@@ -1922,33 +2092,41 @@ def tick(state, feed, sink):
 # ======================================================================
 # SETTLEMENT
 # ======================================================================
+def settle_pnl(p, win):
+    """Cents P&L for the whole position: hold to settlement, exit at first SELL, and the one the ledger uses."""
+    ep, n = p.get("entry_px"), p.get("contracts") or 1
+    if ep is None or win is None:
+        return {}
+    hold = n * ((100 if win else 0) - ep) - _fee(ep, n)
+    sp = p.get("sell_px")
+    sell = n * (sp - ep) - _fee(ep, n) - _fee(sp, n) if sp is not None else hold
+    return {"contracts": n, "pnl_hold_c": round(hold, 1), "pnl_sell_c": round(sell, 1),
+            "pnl_c": round(sell if (C.sell_act and sp is not None) else hold, 1)}
+
+
 def settle_one(state, p, feed, sink):
     t = now()
     if t < p["close_ts"] + 1:
         return
     res = feed.result(p["ticker"])
     if res is None:
-        if t < p["close_ts"] + 300:
-            return
-        if t > p["close_ts"] + 3600:
+        if t > p["close_ts"] + 3600:             # never guess from a later price: log it as unresolved
+            log_window({"ticker": p["ticker"], "close_ts": p["close_ts"], "strike": p["strike"],
+                        "res": None, "side": p["side"], "win": None})
             with LOCK:
                 if p in state["pending"]:
                     state["pending"].remove(p)
-            return
-        if p.get("avg_exp") is not None and (p.get("avg_rem") or 99) <= 5:
-            res = "yes" if p["avg_exp"] >= p["strike"] else "no"
-        else:
-            price = feed.prices()["ETH"][0]
-            if price is None:
-                return
-            res = "yes" if price >= p["strike"] else "no"
+        return
     up_won = res == "yes"
     win = None if p["side"] is None else (up_won == (p["side"] == "UP"))
+    pn = settle_pnl(p, win)
     log_window({"ticker": p["ticker"], "close_ts": p["close_ts"], "strike": p["strike"], "res": res,
                 "side": p["side"], "win": win, "conf": p.get("conf"), "src": p.get("src"),
                 "entry_px": p.get("entry_px"), "yes_entry": p.get("yes_entry"),
                 "feat": p.get("feat_call") or p.get("feat"),
-                "sell_at": p.get("sell_at"), "sell_n": p.get("sell_n"), "fc": p.get("fc")})
+                "sell_at": p.get("sell_at"), "sell_n": p.get("sell_n"), "fc": p.get("fc"),
+                "avg_exp": p.get("avg_exp"), "avg_rem": p.get("avg_rem"), "avg60": p.get("avg60"),
+                **pn, "sell_px": p.get("sell_px"), "book_px": p.get("book_px")})
     with LOCK:
         if p not in state["pending"]:
             return
@@ -1966,7 +2144,9 @@ def settle_one(state, p, feed, sink):
                                  "conf": p.get("conf"), "entry_px": p.get("entry_px"),
                                  "yes_entry": p.get("yes_entry"), "src": p.get("src"),
                                  "called_at": p.get("called_at"), "comb": p.get("comb_call"),
-                                 "sell_at": p.get("sell_at")})
+                                 "sell_at": p.get("sell_at"), **pn, "sell_px": p.get("sell_px")})
+        if pn:
+            risk_record(win, p["close_ts"], pn["pnl_c"] / 100)
         p["pts"].append([900, 100 if up_won else 0])
         outcome = "win" if win else "loss"
         sink.final(build_embed(p, state, 100.0 if up_won else 0.0, None, 0, 0, outcome), p, outcome)
@@ -2158,6 +2338,7 @@ def main():
         state.setdefault("history_old", []).extend(state["history"])
         state["history"] = []
         log.info("archived old history, stats start fresh")
+    risk_init(state)
     STATE["s"] = state
     threading.Thread(target=settler_loop, args=(state, feed, sink), daemon=True).start()
     end, nxt, errs = time.time() + C.run_s, time.time(), 0
@@ -2187,12 +2368,14 @@ def main():
 def replay(path):
     C.state_file, C.windows_file = "replay_state.json", "replay_windows.jsonl"
     C.samples_file = "replay_samples.jsonl"
+    C.use_book = 0                                   # no network in replay
     for f in (C.state_file, C.windows_file, C.samples_file):
         if os.path.exists(f):
             os.remove(f)
     load_calib()
     feed, sink = ReplayFeed(path), NullSink()
-    state = {"history": [], "history_old": [], "current": None, "pending": []}
+    state = {"history": [], "history_old": [], "current": None, "pending": [], "risk": {}}
+    risk_init(state)
     for row in feed.rows:
         feed.step(row)
         tick(state, feed, sink)
@@ -2210,8 +2393,18 @@ if __name__ == "__main__":
         audit()
     elif len(sys.argv) > 1 and sys.argv[1] == "fit":
         fit()
+    elif len(sys.argv) > 1 and sys.argv[1] == "basis":
+        basis()
+    elif len(sys.argv) > 1 and sys.argv[1] == "sells":
+        sells()
     elif len(sys.argv) > 1 and sys.argv[1] == "report":
-        with open(sys.argv[2] if len(sys.argv) > 2 else C.state_file) as fh:
-            report(json.load(fh)["history"])
+        path = sys.argv[2] if len(sys.argv) > 2 else C.state_file
+        with open(path) as fh:
+            if path.endswith(".jsonl"):
+                h = [r for r in (json.loads(x) for x in fh if x.strip())
+                     if r.get("side") and r.get("win") is not None]
+            else:
+                h = json.load(fh)["history"]
+        report(h)
     else:
         main()
