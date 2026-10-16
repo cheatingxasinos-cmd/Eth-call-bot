@@ -1,4 +1,4 @@
-"""Kalshi ETH 15m signal bot v4.0-strict (single file).
+"""Kalshi BTC 15m signal bot (early-call mode, forked from eth.py v4.0-strict)
 
 v4.0-strict changes vs v3.5 (fewer, higher-quality calls; every threshold is an env-overridable C value):
   1. Stricter edge gate: MIN_EV 2.0 -> 4.0 cents, P_HAIRCUT 0.02 -> 0.03.
@@ -12,13 +12,13 @@ v4.0-strict changes vs v3.5 (fewer, higher-quality calls; every threshold is an 
   7. ATR vote scaled by ATR_SCALE (1.25) because atr() is a mean absolute 10s change, not a true range.
   8. Active strategy parameters are logged at startup.
 
-  python eth.py                 live
-  python eth.py replay FILE     backtest recorded ticks (no Discord)
-  python eth.py fit             fit the probability blend on samples.jsonl
-  python eth.py report [FILE]   ROI, calibration, baselines (state.json or windows.jsonl)
-  python eth.py audit           list recent calls with Kalshi results
-  python eth.py basis           how often our feed disagreed with Kalshi's result
-  python eth.py sells           would selling at the first SELL have beaten holding?
+  python btc.py                 live
+  python btc.py replay FILE     backtest recorded ticks (no Discord)
+  python btc.py fit             fit the probability blend on samples.jsonl
+  python btc.py report [FILE]   ROI, calibration, baselines (state.json or windows.jsonl)
+  python btc.py audit           list recent calls with Kalshi results
+  python btc.py basis           how often our feed disagreed with Kalshi's result
+  python btc.py sells           would selling at the first SELL have beaten holding?
 """
 import base64, functools, io, json, logging, math, multiprocessing, os, random, statistics, sys, threading, time
 from collections import deque
@@ -59,16 +59,17 @@ def _e(name, default):
 
 class C:
     webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
-    series = _e("KALSHI_SERIES", "KXETH15M")
+    sym = _e("SYMBOL", "BTC")
+    series = _e("KALSHI_SERIES", "KXBTC15M")
     poll = _e("POLL_SECONDS", 0.5)
     edit_s = _e("EDIT_SECONDS", 1.0)
     img_s = _e("IMG_SECONDS", 1.0)
     new_msg_s = _e("NEW_MSG_SECONDS", 30.0)
     run_s = _e("RUN_SECONDS", 345 * 60)
     save_s = _e("SAVE_SECONDS", 2.0)
-    state_file = _e("STATE_FILE", "state.json")
-    windows_file = _e("WINDOWS_FILE", "windows.jsonl")
-    tick_file = _e("TICK_FILE", "ticks.jsonl")
+    state_file = _e("STATE_FILE", "btc_state.json")
+    windows_file = _e("WINDOWS_FILE", "btc_windows.jsonl")
+    tick_file = _e("TICK_FILE", "btc_ticks.jsonl")
     record = _e("RECORD", 1)
     stale_s = _e("STALE_SECONDS", 5.0)
     price_max_age = _e("PRICE_MAX_AGE", 45.0)   # exchange price counts for this long
@@ -82,8 +83,8 @@ class C:
     mom_min = _e("MOM_MIN", 0.10)
     fib_agree = _e("FIB_AGREE", 0.15)
     rsi_n = _e("RSI_N", 14)
-    ema_dead = _e("EMA_DEAD", 0.00005)
-    macd_dead = _e("MACD_DEAD", 0.00002)
+    ema_dead = _e("EMA_DEAD", 0.00003)
+    macd_dead = _e("MACD_DEAD", 0.00001)
     bb_up = _e("BB_UP", 0.65)
     bb_dn = _e("BB_DN", 0.35)
     atr_n = _e("ATR_N", 14)
@@ -111,15 +112,15 @@ class C:
     quote_max_age = _e("QUOTE_MAX_AGE", 3.0)  # Kalshi quote must be this fresh to call
     call_px_age = _e("CALL_PX_AGE", 5.0)      # exchange price must be this fresh to call
     max_disp_bp = _e("MAX_DISP_BP", 6.0)      # max exchange disagreement, basis points
-    calib_file = _e("CALIB_FILE", "calib.json")
-    samples_file = _e("SAMPLES_FILE", "samples.jsonl")
+    calib_file = _e("CALIB_FILE", "btc_calib.json")
+    samples_file = _e("SAMPLES_FILE", "btc_samples.jsonl")
     sample_s = _e("SAMPLE_SECONDS", 10.0)
     dash_port = _e("DASH_PORT", 8000)
     dash_hz = _e("DASH_HZ", 30.0)
     kalshi_poll = _e("KALSHI_POLL", 0.5)
     key_id = os.getenv("KALSHI_KEY_ID")
     key_path = os.getenv("KALSHI_KEY_PATH")
-    logo_path = os.getenv("LOGO_PATH", "eth_logo.png")
+    logo_path = os.getenv("LOGO_PATH", "btc_logo.png")
     live_scale = _e("LIVE_SCALE", 1.0)
     final_scale = _e("FINAL_SCALE", 3.0)
     max_bytes = int(_e("MAX_MB", 7.5) * 1024 * 1024)
@@ -148,6 +149,20 @@ class C:
     max_entry = _e("MAX_ENTRY", 85.0)        # no calls priced above this many cents (payout too small)
     min_entry = _e("MIN_ENTRY", 20.0)        # no calls priced below this many cents (long shots)
     atr_scale = _e("ATR_SCALE", 1.25)        # approx true range / mean abs 10s change
+    fib_min_range = _e("FIB_MIN_RANGE", 0.0002)
+    early_s = _e("EARLY_S", 60.0)
+    early_min_s = _e("EARLY_MIN_S", 3.0)
+    early_ready = _e("EARLY_READY", 5)
+    early_agree = _e("EARLY_AGREE", 3)
+    early_against = _e("EARLY_AGAINST", 2)
+    early_hold = _e("EARLY_HOLD", 2.0)
+    early_fast_hold = _e("EARLY_FAST_HOLD", 1.0)
+    early_min_p = _e("EARLY_MIN_P", 0.54)
+    early_min_ev = _e("EARLY_MIN_EV", 1.0)
+    early_haircut = _e("EARLY_HAIRCUT", 0.02)
+    early_min_entry = _e("EARLY_MIN_ENTRY", 30.0)
+    early_max_entry = _e("EARLY_MAX_ENTRY", 72.0)
+    early_mid_band = _e("EARLY_MID_BAND", 4.0)
 
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
@@ -340,7 +355,7 @@ class LiveFeed:
         """Is the data trustworthy enough to open a new call right now?"""
         t = time.time()
         fresh = [p for (s, _), (p, ts_) in list(self.latest.items())
-                 if s == "ETH" and t - ts_ < C.call_px_age]
+                 if s == C.sym and t - ts_ < C.call_px_age]
         n = len(fresh)
         disp = (max(fresh) / min(fresh) - 1) * 1e4 if n >= 1 else 0.0
         with self.lock:
@@ -459,8 +474,8 @@ class ReplayFeed:
             m = rs[0]["m"]
             close = ts(m["close_time"])
             strike = float(m.get("floor_strike") or m.get("cap_strike") or 0)
-            v = [r["px"]["ETH"][0] for r in rs
-                 if close - 60 <= r["t"] <= close and r["px"].get("ETH") and r["px"]["ETH"][0]]
+            v = [r["px"][C.sym][0] for r in rs
+                 if close - 60 <= r["t"] <= close and r["px"].get(C.sym) and r["px"][C.sym][0]]
             if v and strike:
                 self.results[tk] = "yes" if statistics.fmean(v) >= strike else "no"
 
@@ -476,7 +491,7 @@ class ReplayFeed:
         return {s: (v[0], v[1]) for s, v in self.row["px"].items()}
 
     def quality(self):
-        n = self.row["px"].get("ETH", [None, 0])[1]
+        n = self.row["px"].get(C.sym, [None, 0])[1]
         return {"ok": n >= C.min_exch, "why": None if n >= C.min_exch else f"only {n} feeds"}
 
     def result(self, ticker):
@@ -506,7 +521,7 @@ REC = None
 # PRICE HISTORY AND MATH
 # ======================================================================
 PRICES = {s: deque(maxlen=6000) for s in ("ETH", "BTC")}
-WEIGHTS = {"ETH": 0.5, "BTC": 0.5}
+WEIGHTS = {"BTC": 0.7, "ETH": 0.3}
 DEF_SIG = {"ETH": 1.1e-4, "BTC": 0.9e-4}
 LASTGOOD = {}
 
@@ -546,7 +561,7 @@ def cdf(x):
     return t4_cdf(x * math.sqrt(2)) if C.fat_tail else norm_cdf(x)
 
 
-def series_10s(sym="ETH", n=90, step=10):
+def series_10s(sym=C.sym, n=90, step=10):
     pts = list(PRICES[sym])
     if not pts:
         return []
@@ -642,12 +657,12 @@ def settle_stats(price, strike, close_ts, t, tilt=0.0):
     if not price or not strike:
         return None
     tau0 = max(close_ts - t, 0.0)
-    total, e = window_avg("ETH", close_ts, t)
+    total, e = window_avg(C.sym, close_ts, t)
     rem = min(tau0, float(FINAL_SECONDS))
     a, b = max(tau0 - FINAL_SECONDS, 0.0), tau0
     exp_avg = (total + price * rem) / FINAL_SECONDS
     V = -(b ** 3 - a ** 3) / 6 - a * a * (b - a) / 2 + b * (b * b - a * a) / 2
-    std = price * vol("ETH") * math.sqrt(max(V, 0.0)) / FINAL_SECONDS
+    std = price * vol(C.sym) * math.sqrt(max(V, 0.0)) / FINAL_SECONDS
     fade = min(1.0, math.sqrt(tau0 / 300)) * rem / FINAL_SECONDS
     shift = C.tilt_w * clamp(tilt, -3.0, 3.0) * fade
     if std <= 1e-9:
@@ -753,8 +768,8 @@ def streak_losses():
     return n
 
 
-def kelly_contracts(ps, ep):
-    p = ps - C.p_haircut
+def kelly_contracts(ps, ep, hc=None):
+    p = ps - (C.p_haircut if hc is None else hc)
     k = (ep + _fee(ep)) / 100                       # cost per contract incl. worst-case fee, dollars
     if not 0 < k < 1 or p <= k:
         return 0
@@ -847,6 +862,17 @@ def check_exit(cur, t):
     cur["warn"] = 2 if cur.get("sell") else 1 if cur.get("warn_active") else 0
 
 
+def tune(elapsed):
+    if elapsed <= C.early_s:
+        return dict(early=True, ready=C.early_ready, agree=C.early_agree, against=C.early_against,
+                    hold=C.early_hold, fast_hold=C.early_fast_hold, min_p=C.early_min_p,
+                    min_ev=C.early_min_ev, hc=C.early_haircut, lo=C.early_min_entry,
+                    hi=C.early_max_entry, band=C.early_mid_band)
+    return dict(early=False, ready=C.vote_min_ready, agree=C.call_min_agree, against=C.call_max_against,
+                hold=C.call_hold, fast_hold=C.fast_hold, min_p=C.min_p, min_ev=C.min_ev,
+                hc=C.p_haircut, lo=C.min_entry, hi=C.max_entry, band=0.0)
+
+
 def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
     pu = p_up(q["yes"], ctx["ss"], secs_left)
     if pu is not None:
@@ -875,29 +901,35 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
         cur.pop("cand", None)
         return
 
+    if elapsed < C.early_min_s:
+        cur["gate"], cur["lock_why"] = "window just opened, waiting for first quotes", None
+        cur.pop("cand", None)
+        return
+    T = tune(elapsed)
+
     why = None
     if not fq["ok"]:
         why = fq["why"]                           # bad data only, not a signal threshold
-    elif ready < C.vote_min_ready:
-        why = f"only {ready}/6 indicators ready"
+    elif ready < T["ready"]:
+        why = f"only {ready}/6 indicators ready (need {T['ready']})"
     else:
         why = risk_gate(t)
     cur["gate"], cur["lock_why"] = why, None
 
     cand = None
     if why is None:
-        if up >= C.call_min_agree and dn <= C.call_max_against:
+        if up >= T["agree"] and dn <= T["against"]:
             cand = "UP"
-        elif dn >= C.call_min_agree and up <= C.call_max_against:
+        elif dn >= T["agree"] and up <= T["against"]:
             cand = "DOWN"
         else:
-            cur["lock_why"] = (f"need {C.call_min_agree}+ agreeing and at most {C.call_max_against} against: "
+            cur["lock_why"] = (f"need {T['agree']}+ agreeing and at most {T['against']} against: "
                                f"{up} up / {dn} down / {ready - up - dn} neutral")
         if cand:
             sgn = 1 if cand == "UP" else -1
             if not ss or sgn * (ss["exp_avg"] - cur["strike"]) <= 0:
                 cand, cur["lock_why"] = None, "projected settle is on the wrong side of the strike"
-            elif sgn * (q["yes"] - 50) <= 0:
+            elif sgn * (q["yes"] - 50) + T["band"] <= 0:
                 cand, cur["lock_why"] = None, "Kalshi favors the other side"
 
     if cand:                                      # edge gate: votes alone cannot open a call
@@ -907,24 +939,24 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
             cand, cur["lock_why"] = None, "no two-sided quote to fill against"
         else:
             ps, ev, ep = edge_for(cand, pu, q)
-            ev_h = ev - C.p_haircut * 100
+            ev_h = ev - T["hc"] * 100
             # size on the realistic fill (entry + slip, clamped to 99), the same price fill_check books.
             # Only one call per window exists, so there is no other open exposure to subtract;
             # RISK['open_cost'] is deliberately not tracked.
             ep_fill = clamp(ep + C.slip, 1, 99)
-            n = kelly_contracts(ps, ep_fill)
+            n = kelly_contracts(ps, ep_fill, T["hc"])
             implied = q["yes"] / 100 if cand == "UP" else 1 - q["yes"] / 100
-            if ps < C.min_p:
-                cand, cur["lock_why"] = None, f"model win prob {ps * 100:.0f}% is below {C.min_p * 100:.0f}%"
+            if ps < T["min_p"]:
+                cand, cur["lock_why"] = None, f"model win prob {ps * 100:.0f}% is below {T['min_p'] * 100:.0f}%"
             elif ps - implied > C.max_disagree:
                 cand, cur["lock_why"] = None, (f"model disagrees with Kalshi by {(ps - implied) * 100:.0f} points, "
                                                f"likely model error")
-            elif ep > C.max_entry:
-                cand, cur["lock_why"] = None, f"entry {ep:.0f}c is above the {C.max_entry:.0f}c cap (payout too small for fee and tail risk)"
-            elif ep < C.min_entry:
-                cand, cur["lock_why"] = None, f"entry {ep:.0f}c is below the {C.min_entry:.0f}c floor (long shot)"
-            elif ev_h < C.min_ev:
-                cand, cur["lock_why"] = None, f"edge {ev_h:+.1f}c after fee and haircut, need {C.min_ev:.1f}c"
+            elif ep > T["hi"]:
+                cand, cur["lock_why"] = None, f"entry {ep:.0f}c is above the {T['hi']:.0f}c cap (payout too small for fee and tail risk)"
+            elif ep < T["lo"]:
+                cand, cur["lock_why"] = None, f"entry {ep:.0f}c is below the {T['lo']:.0f}c floor (long shot)"
+            elif ev_h < T["min_ev"]:
+                cand, cur["lock_why"] = None, f"edge {ev_h:+.1f}c after fee and haircut, need {T['min_ev']:.1f}c"
             elif n < 1:
                 cand, cur["lock_why"] = None, "stake sizes to zero contracts"
             else:
@@ -936,7 +968,7 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
     if cur.get("cand") != cand:
         cur["cand"], cur["cand_t"] = cand, t
         return
-    hold = C.fast_hold if cur.get("cand_ps", 0) >= C.fast_p else C.call_hold
+    hold = T["fast_hold"] if cur.get("cand_ps", 0) >= C.fast_p else T["hold"]
     if t - cur["cand_t"] < hold:
         return
     cur.pop("cand", None)
@@ -966,7 +998,7 @@ def fib_signal(prices):
     if len(prices) < 8:
         return 0.0, None
     hi, lo, last = max(prices), min(prices), prices[-1]
-    if hi - lo < last * 0.0003:
+    if hi - lo < last * C.fib_min_range:
         return 0.0, None
     up_swing = prices.index(lo) < len(prices) - 1 - prices[::-1].index(hi)
     d = (hi - last) / (hi - lo) if up_swing else (last - lo) / (hi - lo)
@@ -979,7 +1011,7 @@ def trend_signal(prices, tilt):
     ema = 0.0
     if len(prices) >= 8:
         e3, e8 = _ema(prices, 3)[-1], _ema(prices, 8)[-1]
-        ema = math.tanh(math.log(e3 / e8) / (vol("ETH") * math.sqrt(30)))
+        ema = math.tanh(math.log(e3 / e8) / (vol(C.sym) * math.sqrt(30)))
     return 0.5 * ema + 0.5 * math.tanh(tilt / 1.5)
 
 
@@ -1060,7 +1092,7 @@ def _pressure(p):
     return (ups - dns) / (ups + dns) if ups + dns > 0 else 0.0
 
 
-def momentum_fast(sym="ETH", win=10):
+def momentum_fast(sym=C.sym, win=10):
     pts = list(PRICES[sym])
     if len(pts) < 6:
         return 0.0
@@ -1295,7 +1327,8 @@ def fit(test_frac=0.3):
             out[bk] = dict(pure)
             print(f"[{bk}] no measurable edge over the Kalshi price; saved pure-market weights")
     with open(C.calib_file, "w") as f:
-        json.dump({"buckets": out}, f)
+        json.dump({"buckets": out}, f
+                  
 # ======================================================================
 # CHART RENDERER (runs in a separate process)  -- UNCHANGED
 # ======================================================================
@@ -1451,7 +1484,7 @@ def render_frames(cur, outcome, S, n):
     lg = int(k(60))
     base.paste(_logo(lg), (int(k(24)), int(k(24))), _logo(lg))
     d.ellipse([k(24), k(24), k(24) + lg, k(24) + lg], outline=(255, 255, 255, 80), width=lw(1.5))
-    d.text((k(98), k(54)), "ETH 15 min", font=F(30), fill=WHITE, anchor="lm")
+    d.text((k(98), k(54)), f"{C.sym} 15 min", font=F(30), fill=WHITE, anchor="lm")
 
     ring = outcome in (None, "settling")
     if outcome == "win":
@@ -1509,7 +1542,7 @@ def render_frames(cur, outcome, S, n):
     Y = lambda v: PY1 - (v - lo) / (hi - lo) * (PY1 - PY0)
 
     base.paste(_logo(int(k(24))), (int(k(26)), int(k(203))), _logo(int(k(24))))
-    d.text((k(58), k(215)), "ETH / USD · 30s", font=F(12, False), fill=MUTED, anchor="lm")
+    d.text((k(58), k(215)), f"{C.sym} / USD · 30s", font=F(12, False), fill=MUTED, anchor="lm")
     for i in range(5):
         v = lo + (hi - lo) * i / 4
         _dots(d, PX0, Y(v), PX1, Y(v), (150, 165, 200, 40), lw(1), k(2), k(5))
@@ -1783,7 +1816,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, st
               {"name": "ROI (net)", "value": s["roi"], "inline": True},
               {"name": "Bankroll", "value": f"${RISK.get('bank', 0):,.0f}", "inline": True}]
     if side is None:
-        title, color = "⚪ KALSHI ETH 15m: NO CALL", GREY
+        title, color = f"⚪ KALSHI {C.sym} 15m: NO CALL", GREY
         lines = ["**Call:** ⚪ NO SAFE CALL yet", "**Action:** WAIT, no position",
                  f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%"]
         if c.get("gate"):
@@ -1817,7 +1850,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, pm=None, st
         if c.get("contracts"):
             lines.append(f"**Size** {c['contracts']} contracts (~${c['contracts'] * c['entry_px'] / 100:,.0f}) "
                          f"| edge {c.get('entry_ev') or 0:+.1f}c after fee")
-        title = f"{arrow} KALSHI ETH 15m: {side} | {action}"
+        title = f"{arrow} KALSHI {C.sym} 15m: {side} | {action}"
     fc = c.get("fc")
     if fc:
         lines.append(f"**Forecast** settles ~${fc['exp']:,.2f} (±1σ ${fc['lo']:,.2f} to ${fc['hi']:,.2f}) "
@@ -2012,6 +2045,8 @@ def log_params():
     log.info("strategy v4.0-strict: MIN_EV=%.1f P_HAIRCUT=%.3f MIN_P=%.2f FINAL_CUTOFF=%s MAX_DISAGREE=%.2f "
              "MIN_ENTRY=%.0f MAX_ENTRY=%.0f ATR_SCALE=%.2f", C.min_ev, C.p_haircut, C.min_p, C.final_cutoff,
              C.max_disagree, C.min_entry, C.max_entry, C.atr_scale)
+    log.info("early mode: EARLY_S=%.0f EARLY_AGREE=%d EARLY_AGAINST=%d EARLY_MIN_P=%.2f EARLY_MIN_EV=%.1f",
+             C.early_s, C.early_agree, C.early_against, C.early_min_p, C.early_min_ev)
 
 
 def make_call(cur, side, conf, src, elapsed, q, n=1, ev=None):
@@ -2128,7 +2163,7 @@ def fill_check(cur, q, t):
 
 def update_signals(cur, px, strike, yes, close_ts, t):
     secs_left = close_ts - t
-    price = px["ETH"][0]
+    price = px[C.sym][0]
     for s, (p, _) in px.items():
         if p:
             cur["open"].setdefault(s, p)
@@ -2141,12 +2176,12 @@ def update_signals(cur, px, strike, yes, close_ts, t):
                    avg_need=round(ss["need"], 2) if ss["need"] is not None else None)
     cur["mkt"] = {"tilt": round(tilt, 2), "breadth": round(breadth, 2),
                   "z": {s: round(z, 2) for s, z in zs.items()}}
-    series = series_10s("ETH")
+    series = series_10s(C.sym)
     fib, fib_lvl = fib_signal(series)
     trend = trend_signal(series, tilt)
     r = rsi(series)
     rsi_s = clamp((r - 50) / 50, -1.0, 1.0) if r is not None else 0.0
-    mom = 0.7 * momentum_fast("ETH") + 0.3 * math.tanh(tilt / 1.5)
+    mom = 0.7 * momentum_fast(C.sym) + 0.3 * math.tanh(tilt / 1.5)
     score, prob = composite(mom, fib, trend, blend, rsi_s)
     if secs_left <= FINAL_SECONDS and ss:
         lock = clamp((FINAL_SECONDS - secs_left) / FINAL_SECONDS, 0.0, 1.0)
@@ -2182,7 +2217,7 @@ def run_window(state, cur, m, px, age, t, sink, fq):
     secs_left, elapsed = close_ts - t, 900 - (close_ts - t)
     q = quote(m)
     yes = q["yes"]
-    price, n_ex = px["ETH"]
+    price, n_ex = px[C.sym]
     strike = float(m.get("floor_strike") or m.get("cap_strike") or 0) or cur["strike"]
     cur["strike"] = strike
     stale = age > C.stale_s or not price or n_ex < C.min_exch
@@ -2421,6 +2456,7 @@ function draw(){
 }
 draw();
 </script>"""
+PAGE = PAGE.replace("ETH 15", C.sym + " 15")
 
 STATE = {"s": None, "feed": None}
 
@@ -2428,7 +2464,7 @@ STATE = {"s": None, "feed": None}
 def dash_payload(m):
     cur = (STATE["s"] or {}).get("current") or {}
     q = quote(m)
-    return json.dumps({"now": time.time(), "price": STATE["feed"].prices()["ETH"][0],
+    return json.dumps({"now": time.time(), "price": STATE["feed"].prices()[C.sym][0],
                        "strike": float(m.get("floor_strike") or m.get("cap_strike") or 0),
                        "close_ts": ts(m["close_time"]), "yes": q["yes"], "side": cur.get("side"),
                        "conf": cur.get("live_conf") or cur.get("conf"), "votes": cur.get("votes"),
