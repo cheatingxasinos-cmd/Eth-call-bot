@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: eth-predictions
+  group: btc-predictions
   cancel-in-progress: false
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RUN_SECONDS: "20700"
           POLL_SECONDS: "1"
-        run: python eth.py
+        run: python btc.py
 
       - name: Save stats
         if: always()
