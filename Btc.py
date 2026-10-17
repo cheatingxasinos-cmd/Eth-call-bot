@@ -1,7 +1,7 @@
 """Kalshi BTC 15m signal bot (early-call mode, forked from eth.py v4.0-strict)
 
 v4.0-strict changes vs v3.5 (fewer, higher-quality calls; every threshold is an env-overridable C value):
-  1. Stricter edge gate: MIN_EV 2.0 -> 4.0 cents, P_HAIRCUT 0.02 -> 0.03.
+  1. Stricter edge gate: MIN_EV 2.0 -> 2.0 cents, P_HAIRCUT 0.02 -> 0.03.
   2. FINAL_CUTOFF 10 -> 60: no NEW calls in the last minute (proxy-feed basis error). Exit/SELL
      checks on an existing call are not gated by it and keep running until the window closes.
   3. Winner's-curse guard: reject when the model's win prob exceeds the Kalshi-implied win prob
