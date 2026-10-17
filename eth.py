@@ -35,16 +35,17 @@ GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
 W_MARKET = float(os.getenv("W_MARKET", "0.5"))
 CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "60"))
 TILT_W = float(os.getenv("TILT_W", "0.25"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "0.22"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.25"))  # legacy pick_call(): min |momentum+fib score|
 MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))
 FLIP_SCORE = float(os.getenv("FLIP_SCORE", "99"))  # old flip trigger off by default
 CALL_AFTER = int(os.getenv("CALL_AFTER", "99999"))  # old momentum trigger off by default
 CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "1.5"))
 W_MOM = float(os.getenv("W_MOM", "0.35"))
-W_RSI = float(os.getenv("W_RSI", "0.10"))
+W_RSI = float(os.getenv("W_RSI", "0"))  # unused: RSI no longer affects the call
 W_FIB = float(os.getenv("W_FIB", "0.35"))
-W_TREND = float(os.getenv("W_TREND", "0.10"))
-W_PROB = float(os.getenv("W_PROB", "0.10"))
+W_TREND = float(os.getenv("W_TREND", "0"))  # unused: trend no longer affects the call
+W_PROB = float(os.getenv("W_PROB", "0"))  # unused: market/strike probability no longer affects the call
+MOM_TILT_W = float(os.getenv("MOM_TILT_W", "0"))  # share of cross-asset tilt inside momentum (0 = pure ETH momentum)
 RSI_N = int(os.getenv("RSI_N", "14"))
 RSI_BLOCK = float(os.getenv("RSI_BLOCK", "20"))  # UP held if RSI < this, DOWN held if RSI > 100 minus this
 RSI_GRACE = float(os.getenv("RSI_GRACE", "10"))  # max secs RSI can delay the first-to-cross call
@@ -60,19 +61,20 @@ FINAL_SCALE = float(os.getenv("FINAL_SCALE", "3"))
 MAX_BYTES = int(float(os.getenv("MAX_MB", "7.5")) * 1024 * 1024)
 
 # ---- combined call settings ----
-CALL_MODE = os.getenv("CALL_MODE", "combined")  # "kalshi" restores the old trigger only
-W_CORE = float(os.getenv("W_CORE", "0.5"))  # weight of the existing composite score
-W_VOTE = float(os.getenv("W_VOTE", "0.5"))  # weight of the indicator vote average
-COMBO_MIN = float(os.getenv("COMBO_MIN", "0.30"))  # combined score needed to call
-COMBO_OPP = int(os.getenv("COMBO_OPP", "1"))  # max indicators allowed to vote against
-CONF_MIN = int(os.getenv("CONF_MIN", "3"))  # tally display only
+CALL_MODE = os.getenv("CALL_MODE", "combined")  # kept for compatibility; the Kalshi % trigger was removed
+W_CORE = float(os.getenv("W_CORE", "1.0"))  # weight of the momentum+Fibonacci score in the combined score
+W_VOTE = float(os.getenv("W_VOTE", "0"))  # weight of the mom/fib vote average in the combined score (0 = off)
+COMBO_MIN = float(os.getenv("COMBO_MIN", "0.30"))  # combined (momentum+Fibonacci, -1..1) score needed to call
+COMBO_STRONG = float(os.getenv("COMBO_STRONG", "0.65"))  # a lone signal this strong may call if the other is neutral
+COMBO_OPP = int(os.getenv("COMBO_OPP", "0"))  # max of the two signals allowed to vote against
+CONF_MIN = int(os.getenv("CONF_MIN", "1"))  # signals (of 2) that must vote for the side; 2 = both must agree
 EMA_DEAD = float(os.getenv("EMA_DEAD", "0.00005"))  # EMA gap as a fraction of price
 MACD_DEAD = float(os.getenv("MACD_DEAD", "0.00002"))
 BB_UP = float(os.getenv("BB_UP", "0.65"))
 BB_DN = float(os.getenv("BB_DN", "0.35"))
 ATR_N = int(os.getenv("ATR_N", "14"))
 ATR_Z = float(os.getenv("ATR_Z", "0.5"))
-CONF_FULL = float(os.getenv("CONF_FULL", "0.6"))  # combined score that counts as full strength
+CONF_FULL = float(os.getenv("CONF_FULL", "0.7"))  # combined score that counts as full strength
 CONF_VOTE_W = float(os.getenv("CONF_VOTE_W", "0.4"))  # weight of badge agreement in confidence
 
 # ---- fast flip settings ----
@@ -85,14 +87,15 @@ FAST_FLIP_HOLD = float(os.getenv("FAST_FLIP_HOLD", "2.0"))  # secs the setup mus
 FAST_FLIP_AGE = float(os.getenv("FAST_FLIP_AGE", "10"))  # min secs since the last call
 FAST_FLIP_CUTOFF = int(os.getenv("FAST_FLIP_CUTOFF", "30"))  # no fast flips this close to expiry
 FAST_FLIP_MAX = int(os.getenv("FAST_FLIP_MAX", "2"))  # max fast flips per window
-FAST_FLIP_NEED_MKT = int(os.getenv("FAST_FLIP_NEED_MKT", "0"))  # 1 = Kalshi must also lean the new way
+FAST_FLIP_NEED_MKT = int(os.getenv("FAST_FLIP_NEED_MKT", "0"))  # unused (market no longer affects the call)
 SELL_FLIP = int(os.getenv("SELL_FLIP", "1"))  # 1 = a SELL signal flips the call to the other side and BUYs it
 SELL_CUTOFF = int(os.getenv("SELL_CUTOFF", "10"))  # no sell/reversal flips inside this many secs of expiry
 
 # ---- reversal flip settings (market odds + strike model + price vs strike) ----
 REV_FLIP = int(os.getenv("REV_FLIP", "1"))
-REV_MKT = float(os.getenv("REV_MKT", "60"))  # Kalshi % on the new side
-REV_PM = float(os.getenv("REV_PM", "65"))  # strike model % on the new side
+REV_MOM = float(os.getenv("REV_MOM", "0.40"))  # momentum toward the new side for a reversal flip
+REV_MKT = float(os.getenv("REV_MKT", "60"))  # unused (market no longer affects the call)
+REV_PM = float(os.getenv("REV_PM", "65"))  # unused (strike model no longer affects the call)
 REV_HOLD = float(os.getenv("REV_HOLD", "3"))  # secs the reversal must hold
 REV_MAX = int(os.getenv("REV_MAX", "3"))  # max total flips per window
 
@@ -440,19 +443,44 @@ def momentum_fast(sym="ETH", win=10):
     return max(-1.0, min(1.0, 0.65 * now + 0.35 * gain))
 
 
-def composite(mom, fib, trend, blend, rsi_s=0.0):
-    prob = max(-1.0, min(1.0, (blend - 50) / 50))
-    return (W_MOM * mom + W_FIB * fib + W_TREND * trend + W_PROB * prob + W_RSI * rsi_s), prob
+def composite(mom, fib):
+    """Momentum + Fibonacci only, normalised to -1..1."""
+    w = W_MOM + W_FIB
+    return (W_MOM * mom + W_FIB * fib) / w if w > 0 else 0.0
 
 
-def pick_call(score, mom, fib, trend, prob):
-    """First momentum decides. Fib and trend only veto a call that fights them hard."""
+def pick_call(score, mom, fib):
+    """Legacy momentum trigger (off by default). Momentum decides; Fibonacci vetoes a hard fight."""
     sgn = 1 if mom > 0 else -1
-    if abs(mom) < MOM_MIN or score * sgn <= 0:
+    if abs(mom) < MOM_MIN or score * sgn < MIN_SCORE:
         return None
-    if fib * sgn < -0.5 or trend * sgn < -0.5:
+    if fib * sgn < -0.5:
         return None
     return ("UP" if sgn > 0 else "DOWN"), 50 + 50 * min(1.0, abs(mom))
+
+
+def decide_call(mom, fib, fib_ready=True):
+    """Call decision from momentum and Fibonacci only.
+    Returns (side or None, combined score, mom vote, fib vote).
+    Needs |combined| >= COMBO_MIN, at most COMBO_OPP signals against, CONF_MIN signals for the side,
+    and either both signals agree, or the stronger one clears COMBO_STRONG with the other neutral."""
+    mv = 1 if mom >= MOM_MIN else -1 if mom <= -MOM_MIN else 0
+    fv = None if not fib_ready else 1 if fib >= FIB_AGREE else -1 if fib <= -FIB_AGREE else 0
+    score = composite(mom, fib if fib_ready else 0.0)
+    vs = [v for v in (mv, fv) if v is not None]
+    vscore = sum(vs) / len(vs) if vs else 0.0
+    comb = W_CORE * score + W_VOTE * vscore
+    if not fib_ready or comb == 0:
+        return None, comb, mv, fv
+    sgn = 1 if comb > 0 else -1
+    side = "UP" if sgn > 0 else "DOWN"
+    against = sum(1 for v in vs if v == -sgn)
+    for_ = sum(1 for v in vs if v == sgn)
+    both = for_ == 2
+    strong = max(mom * sgn, fib * sgn) >= COMBO_STRONG
+    ok = (abs(comb) >= COMBO_MIN and against <= COMBO_OPP and for_ >= CONF_MIN
+          and fib * sgn >= -0.5 and (both or strong))
+    return (side if ok else None), comb, mv, fv
 
 
 def side_pct(side, yes):
@@ -463,10 +491,10 @@ def side_pct(side, yes):
 
 
 def combo_conf(side, comb, votes):
-    """Confidence 1-99 from the combined score and badge agreement.
+    """Confidence 1-99 from the combined score and momentum/Fibonacci agreement.
     votes = {name: [vote, text]}."""
     sgn = 1 if side == "UP" else -1
-    vs = [v[0] for v in votes.values() if v[0] is not None]
+    vs = [votes[k][0] for k in ("mom", "fib") if k in votes and votes[k][0] is not None]
     agree = sum(v * sgn for v in vs) / len(vs) if vs else 0.0
     strength = max(-1.0, min(1.0, comb * sgn / CONF_FULL))
     x = (1 - CONF_VOTE_W) * strength + CONF_VOTE_W * agree
@@ -1086,13 +1114,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         cap = "" if "Fibonacci" in why else f" (max {RSI_GRACE:.0f}s)"
         lines.append(f"**Hold** {c['rsi_block']} call waiting on {why}{cap}")
     elif side is not None and c.get("fib_call") is not None:
-        over = [n for n, f in (("RSI", c.get("rsi_over")), ("Fibonacci", c.get("fib_over"))) if f]
-        if over:
-            lines.append(f"**Entry** called despite {' and '.join(over)}")
-        elif c.get("rsi_call") is None:
-            lines.append("**Entry** Fibonacci agreed (RSI warming up)")
-        else:
-            lines.append("**Entry** RSI and Fibonacci agreed")
+        lines.append("**Entry** Momentum and Fibonacci call")
     if c.get("flips"):
         lines.append(f"**Flips** {c['flips']} this window")
     if price:
@@ -1282,79 +1304,44 @@ def tick(state):
 
     series = series_10s("ETH")
     fib, fib_lvl = fib_signal(series)
-    trend = trend_signal(series, tilt)
-    r = rsi(series)
+    trend = trend_signal(series, tilt)  # display only
+    r = rsi(series)  # display only
     cur["rsi"] = round(r, 1) if r is not None else None
     rsi_s = max(-1.0, min(1.0, (r - 50) / 50)) if r is not None else 0.0
-    mom = 0.7 * momentum_fast("ETH") + 0.3 * math.tanh(tilt / 1.5)
+    mom = (1 - MOM_TILT_W) * momentum_fast("ETH") + MOM_TILT_W * math.tanh(tilt / 1.5)
     who = "buyers" if mom > 0.1 else "sellers" if mom < -0.1 else "even"
-    score, prob = composite(mom, fib, trend, blend, rsi_s)
+    score = composite(mom, fib)
+    prob = max(-1.0, min(1.0, (blend - 50) / 50))  # display only
     cur["score"] = round(score, 3)
     cur["fib"] = fib_lvl
     cur["sig"] = {"mom": round(mom, 2), "fib": round(fib, 2), "trend": round(trend, 2),
                   "prob": round(prob, 2)}
     prev_side, prev_flip = cur["side"], cur.get("flipped")
 
-    # ---- indicator votes + combined call ----
+    # ---- votes: EMA/Boll/ATR/MACD are display only; the call uses momentum and Fibonacci ----
     votes = {"ema": vote_ema(series), "boll": vote_boll(series),
              "atr": vote_atr(series, price, strike, secs_left), "macd": vote_macd(series)}
-    ready = [v for v, _ in votes.values() if v is not None]
-    all_ready = len(ready) == 4
-    c_up, c_dn = ready.count(1), ready.count(-1)
-    vscore = sum(ready) / len(ready) if ready else 0.0
-    comb = W_CORE * score + W_VOTE * vscore
     cur["votes"] = {k: [v, t] for k, (v, t) in votes.items()}
+    cside, comb, mv, fv = decide_call(mom, fib, fib_lvl is not None)
+    cur["votes"]["mom"] = [mv, f"{mom:+.2f}, {momentum_level(cur)} ({who})"]
+    cur["votes"]["fib"] = [fv, f"retrace {fib_lvl}% ({fib:+.2f})" if fib_lvl else "forming"]
+    ready = [v for v in (mv, fv) if v is not None]
+    all_ready = fv is not None
+    c_up, c_dn = ready.count(1), ready.count(-1)
     cur["tally"] = [c_up, c_dn, len(ready) - c_up - c_dn]
-    # Momentum and Fibonacci badges: shown and used in confidence, not in the tally or the ready gate
-    cur["votes"]["mom"] = [1 if mom >= MOM_MIN else -1 if mom <= -MOM_MIN else 0,
-                           f"{mom:+.2f}, {momentum_level(cur)} ({who})"]
-    cur["votes"]["fib"] = [None if fib_lvl is None else 1 if fib >= FIB_AGREE else -1 if fib <= -FIB_AGREE else 0,
-                           f"retrace {fib_lvl}% ({fib:+.2f})" if fib_lvl else "forming"]
     cur["comb"] = round(comb, 3)
 
-    if CALL_MODE == "combined" and all_ready and cur["side"] is None and secs_left > CALL_CUTOFF:
-        sgn = 1 if comb > 0 else -1
-        cside = "UP" if sgn > 0 else "DOWN"
-        against = sum(1 for v in ready if v == -sgn)
-        good = (abs(comb) >= COMBO_MIN and against <= COMBO_OPP and fib * sgn >= -0.5
-                and rsi_ok(cside, r))
-        if not good:
+    if CALL_MODE and all_ready and cur["side"] is None and secs_left > CALL_CUTOFF:
+        if cside is None:
             cur.pop("comb_dir", None)
         elif cur.get("comb_dir") != cside:
             cur["comb_dir"], cur["comb_t"] = cside, now
         elif now - cur["comb_t"] >= CONFIRM_SECONDS:
             cur.update(side=cside, conf=combo_conf(cside, comb, cur["votes"]), locked=True,
                        called_at=round(elapsed), src="COMBINED",
+                       rsi_call=None, fib_call=round(fib, 2), rsi_over=False, fib_over=False,
                        votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
                        comb_call=cur["comb"])
-
-    # first side to reach TRIGGER_PCT on Kalshi owns the call (Kalshi mode, or while indicators warm up).
-    # Fibonacci must agree before the call fires (no timeout); RSI can delay it up to RSI_GRACE seconds.
-    if cur["side"] is None and secs_left > CALL_CUTOFF and (CALL_MODE == "kalshi" or not all_ready):
-        if not cur.get("first_side"):
-            fs0 = pct_trigger(yes)
-            if fs0:
-                cur["first_side"], cur["first_t"] = fs0, now
-        fs = cur.get("first_side")
-        if fs:
-            rsi_agree = rsi_ok(fs, r)
-            fib_agree = fib_ok(fs, fib)
-            waited = now - cur["first_t"]
-            rsi_pass = rsi_agree or waited >= RSI_GRACE
-            fib_pass = fib_agree  # no timeout: Fibonacci must agree
-            if rsi_pass and fib_pass:
-                cur.pop("rsi_block", None)
-                cur.pop("hold_why", None)
-                cur.update(side=fs, conf=combo_conf(fs, comb, cur["votes"]), locked=True,
-                           called_at=round(elapsed), src="KALSHI",
-                           rsi_call=cur["rsi"], fib_call=round(fib, 2),
-                           rsi_over=not rsi_agree, fib_over=not fib_agree,
-                           votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
-                           comb_call=cur["comb"])
-            else:
-                cur["rsi_block"] = fs
-                cur["hold_why"] = " and ".join(
-                    n for n, ok in (("RSI", rsi_pass), ("Fibonacci", fib_pass)) if not ok)
 
     # old momentum trigger (off while CALL_AFTER=99999)
     if cur["side"] is None and CALL_AFTER <= elapsed and secs_left > CALL_CUTOFF:
@@ -1366,7 +1353,7 @@ def tick(state):
             fm = {"dir": lead, "t": now}  # a new side takes the first-mover slot
         cur["first"] = fm
         if fm and now - fm["t"] >= CONFIRM_SECONDS:
-            pick = pick_call(score, mom, fib, trend, prob)
+            pick = pick_call(score, mom, fib)
             if pick:
                 side, _ = pick
                 cur.update(side=side, conf=combo_conf(side, comb, cur["votes"]), locked=True,
@@ -1380,12 +1367,11 @@ def tick(state):
             and elapsed - cur.get("called_at", elapsed) >= FAST_FLIP_AGE):
         new_side = "DOWN" if cur["side"] == "UP" else "UP"
         ns = 1 if new_side == "UP" else -1
-        backing_old = sum(1 for v in ready if v == -ns)
+        backing_old = sum(1 for v in ready if v == -ns)  # of momentum/Fibonacci
         new_conf = combo_conf(new_side, comb, cur["votes"])
         ok = (comb * ns >= FAST_FLIP_COMB and mom * ns >= FAST_FLIP_MOM
               and new_conf >= FAST_FLIP_CONF and backing_old <= FAST_FLIP_OPP
-              and fib * ns >= FIB_AGREE and rsi_ok(new_side, r)
-              and (not FAST_FLIP_NEED_MKT or (yes - 50) * ns > 0))
+              and fib * ns >= FIB_AGREE)
         if not ok:
             cur.pop("ff_t", None)
         else:
@@ -1397,7 +1383,7 @@ def tick(state):
     if (SELL_FLIP and cur["side"] and cur["side"] == prev_side and cur.get("flipped")
             and secs_left > SELL_CUTOFF and cur.get("flips", 0) < REV_MAX):
         sgn = 1 if cur["side"] == "UP" else -1
-        if (yes - 50) * sgn < 0 and price and strike and (price - strike) * sgn < 0:
+        if mom * sgn <= -MOM_MIN and fib * sgn <= -FIB_AGREE:
             flip_call(cur, "DOWN" if cur["side"] == "UP" else "UP",
                       comb, r, fib, elapsed, now, "SELL_FLIP")
 
@@ -1405,17 +1391,17 @@ def tick(state):
     if cur["side"] and cur["side"] == prev_side and not cur.get("flipped"):
         sgn = 1 if cur["side"] == "UP" else -1
         aged = elapsed - cur.get("called_at", elapsed) >= FLIP_MIN_AGE
-        market_against = (yes - 50) * sgn < 0  # Kalshi has actually moved to the other side
+        mom_against = mom * sgn <= -MOM_MIN  # momentum has actually moved to the other side
         sell = FLIP_SCORE < 99 and score * sgn < -FLIP_SCORE  # old flip trigger (off while FLIP_SCORE=99)
-        # harder SELL trigger: a held reversal in the composite score
-        if score * sgn < -FLIP_HARD and aged and market_against:
+        # harder SELL trigger: a held reversal in the momentum+Fibonacci score
+        if score * sgn < -FLIP_HARD and aged and mom_against:
             cur.setdefault("flip_since", now)
             if now - cur["flip_since"] >= FLIP_HOLD:
                 sell = True
         else:
             cur.pop("flip_since", None)  # reversal broke, timer resets
-        # Fibonacci failed-swing SELL: a deep retrace against the call, with Kalshi also on the other side
-        if aged and fib * sgn < -0.7 and market_against:
+        # Fibonacci failed-swing SELL: a deep retrace against the call, with momentum also on the other side
+        if aged and fib * sgn < -0.7 and mom_against:
             sell = True
         if sell:
             if SELL_FLIP and secs_left > SELL_CUTOFF:
@@ -1424,19 +1410,13 @@ def tick(state):
             else:
                 cur["flipped"] = True  # too close to expiry (or SELL_FLIP=0): plain SELL
 
-    # ---- reversal flip: market, strike model and price all say the call is wrong ----
+    # ---- reversal flip: momentum and Fibonacci both say the call is wrong ----
     if (REV_FLIP and cur["side"] and cur["side"] == prev_side
             and secs_left > SELL_CUTOFF and cur.get("flips", 0) < REV_MAX):
         ns = -1 if cur["side"] == "UP" else 1
         new_side = "UP" if ns > 0 else "DOWN"
-        up_m = min(max(yes, 1), 99)
-        mkt_new = up_m if ns > 0 else 100 - up_m
-        pm_new = None if pm is None else (pm if ns > 0 else 100 - pm)
-        px_ok = bool(price and strike and (price - strike) * ns > 0)
         aged = elapsed - cur.get("called_at", elapsed) >= FLIP_MIN_AGE
-        ok = (aged and px_ok and mkt_new >= REV_MKT
-              and pm_new is not None and pm_new >= REV_PM
-              and mom * ns >= 0 and trend * ns >= 0)
+        ok = (aged and mom * ns >= REV_MOM and fib * ns >= FIB_AGREE and comb * ns >= COMBO_MIN)
         if not ok:
             cur.pop("rev_t", None)
         else:
