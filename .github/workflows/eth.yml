@@ -1,1 +1,36 @@
+on:
+  workflow_dispatch:
+  schedule:
+    # Restart every 6 hours so the bot is always running
+    - cron: "0 */6 * * *"
 
+# Don't stack runs: let the current one finish, then start the next
+concurrency:
+  group: eth-call-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RUN_SECONDS: "20400"
+        run: python eth.py
