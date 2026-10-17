@@ -151,7 +151,7 @@ class C:
     atr_scale = _e("ATR_SCALE", 1.25)        # approx true range / mean abs 10s change
     fib_min_range = _e("FIB_MIN_RANGE", 0.0002)
     early_s = _e("EARLY_S", 300.0)
-    call_window = _e("CALL_WINDOW", 60.0)    # new calls only in the first N seconds of the 15m window
+    call_window = _e("CALL_WINDOW", 300.0)    # new calls only in the first N seconds of the 15m window
     early_min_s = _e("EARLY_MIN_S", 3.0)
     early_ready = _e("EARLY_READY", 5)
     early_agree = _e("EARLY_AGREE", 3)
