@@ -896,16 +896,14 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
         cur["fc"] = {"p_up": round(pu, 3), "exp": round(ss["exp_avg"], 2),
                      "lo": round(ss["exp_avg"] - ss["std"], 2),
                      "hi": round(ss["exp_avg"] + ss["std"], 2), "at": round(elapsed)}
-
-    if secs_left <= C.final_cutoff:               # new calls only; the locked branch above (exits) never reaches here
-        cur["gate"], cur["lock_why"] = f"final {C.final_cutoff:g}s: no new calls", None
-        cur.pop("cand", None)
-        return
-  if elapsed > C.call_window:                   # fast-call mode: no new calls after the first 60s
-        cur["gate"], cur["lock_why"] = f"call window closed: calls only in the first {C.call_window:g}s", None
-        cur.pop("cand", None)
-        return
-    if elapsed < C.early_min_s:
+secs_left <= C.final_cutoff: ...
+    cur["gate"] ... final ...
+    cur.pop("cand", None)
+    return
+if elapsed > C.call_window: ...
+    cur["gate"] ... call window closed ...
+    cur.pop("cand", None)
+    return
         cur["gate"], cur["lock_why"] = "window just opened, waiting for first quotes", None
         cur.pop("cand", None)
         return
