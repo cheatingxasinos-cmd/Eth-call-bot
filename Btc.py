@@ -900,7 +900,10 @@ def maybe_call(cur, ctx, q, secs_left, elapsed, t, fq):
         cur["gate"], cur["lock_why"] = f"final {C.final_cutoff:g}s: no new calls", None
         cur.pop("cand", None)
         return
-
+  if elapsed > C.call_window:                   # fast-call mode: no new calls after the first 60s
+        cur["gate"], cur["lock_why"] = f"call window closed: calls only in the first {C.call_window:g}s", None
+        cur.pop("cand", None)
+        return
     if elapsed < C.early_min_s:
         cur["gate"], cur["lock_why"] = "window just opened, waiting for first quotes", None
         cur.pop("cand", None)
