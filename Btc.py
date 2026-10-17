@@ -101,12 +101,12 @@ class C:
     call_max = _e("CALL_MAX", 900.0)          # call any time in the window
     vote_min_ready = _e("VOTE_MIN_READY", 6)  # all six indicators must be warmed up
     call_hold = _e("CALL_HOLD", 8.0)          # seconds the vote must hold (time debounce)
-    call_min_agree = _e("CALL_MIN_AGREE", 4)       # indicators that must agree to call
+    call_min_agree = _e("CALL_MIN_AGREE", 3)       # indicators that must agree to call
     call_max_against = _e("CALL_MAX_AGAINST", 1)   # indicators allowed to point the other way
-    warn_min_opp = _e("WARN_MIN_OPP", 2)      # indicators against before a warning can start
+    warn_min_opp = _e("WARN_MIN_OPP", 3)      # indicators against before a warning can start
     warn_hold = _e("WARN_HOLD", 4.0)          # seconds that count must hold
     warn_clear = _e("WARN_CLEAR", 3.0)        # seconds below that count before it clears
-    sell_min_opp = _e("SELL_MIN_OPP", 5)      # indicators against needed for SELL
+    sell_min_opp = _e("SELL_MIN_OPP", 6)      # indicators against needed for SELL
     sell_hold = _e("SELL_HOLD", 2.0)          # seconds the SELL condition must hold
     recover_hold = _e("RECOVER_HOLD", 2.0)    # seconds opposition must be gone before SELL clears
     quote_max_age = _e("QUOTE_MAX_AGE", 3.0)  # Kalshi quote must be this fresh to call
@@ -129,7 +129,7 @@ class C:
     fast_p = _e("FAST_P", 0.80)          # model win prob that unlocks the short hold
     fast_hold = _e("FAST_HOLD", 3.0)     # seconds to hold when the model is strong
     # edge-first calling, sizing and risk
-    min_ev = _e("MIN_EV", 4.0)               # min edge in cents after fee and haircut
+    min_ev = _e("MIN_EV", 2.0)               # min edge in cents after fee and haircut
     p_haircut = _e("P_HAIRCUT", 0.03)        # shave the model's win prob before judging it
     bankroll = _e("BANKROLL", 100.0)        # starting paper bankroll, dollars
     kelly_frac = _e("KELLY_FRAC", 0.25)
@@ -150,7 +150,7 @@ class C:
     min_entry = _e("MIN_ENTRY", 20.0)        # no calls priced below this many cents (long shots)
     atr_scale = _e("ATR_SCALE", 1.25)        # approx true range / mean abs 10s change
     fib_min_range = _e("FIB_MIN_RANGE", 0.0002)
-    early_s = _e("EARLY_S", 60.0)
+    early_s = _e("EARLY_S", 300.0)
     call_window = _e("CALL_WINDOW", 60.0)    # new calls only in the first N seconds of the 15m window
     early_min_s = _e("EARLY_MIN_S", 3.0)
     early_ready = _e("EARLY_READY", 5)
