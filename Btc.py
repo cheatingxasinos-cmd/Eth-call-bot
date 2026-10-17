@@ -131,7 +131,7 @@ class C:
     # edge-first calling, sizing and risk
     min_ev = _e("MIN_EV", 4.0)               # min edge in cents after fee and haircut
     p_haircut = _e("P_HAIRCUT", 0.03)        # shave the model's win prob before judging it
-    bankroll = _e("BANKROLL", 1000.0)        # starting paper bankroll, dollars
+    bankroll = _e("BANKROLL", 100.0)        # starting paper bankroll, dollars
     kelly_frac = _e("KELLY_FRAC", 0.25)
     max_stake_pct = _e("MAX_STAKE_PCT", 0.02)   # hard cap per window, fraction of bankroll
     max_contracts = _e("MAX_CONTRACTS", 200)
