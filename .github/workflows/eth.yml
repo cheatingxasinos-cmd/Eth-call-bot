@@ -1,4 +1,5 @@
-name: eth 15m signal bot
+name: Eth-call-bot
+
 on:
   workflow_dispatch:
   schedule:
@@ -34,4 +35,5 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RUN_SECONDS: "20400"
+          PYTHONUNBUFFERED: "1"
         run: python eth.py
