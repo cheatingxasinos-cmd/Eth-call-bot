@@ -9,7 +9,7 @@ on:
 # Don't stack runs: let the current one finish, then start the next
 concurrency:
   group: eth-call-bot
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -30,6 +30,15 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Test webhook and Kalshi
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          echo "Discord status:"
+          curl -sS -o /dev/null -w "%{http_code}\n" -H "Content-Type: application/json" -d '{"content":"webhook test from GitHub"}' "$DISCORD_WEBHOOK_URL" || true
+          echo "Kalshi markets:"
+          curl -sS "https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker=KXETH15M&status=open&limit=3" | head -c 300 || true
 
       - name: Run bot
         env:
