@@ -1,4 +1,5 @@
 name: Eth-call-bot
+
 on:
   workflow_dispatch:
   schedule:
