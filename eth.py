@@ -1201,7 +1201,7 @@ def send_async(embed, message_id, cur, store=None, text_only=False):
             if store is not None:
                 store["message_id"] = mid
         except Exception as e:
-            print("send error", e)
+            print("send error", repr(e), flush=True)
         finally:
             SEND_LOCK.release()
 
@@ -1235,7 +1235,7 @@ def settle_pending(state):
                       p["message_id"], cur=p, outcome="win" if win else "loss")
             save_state(state)
         except Exception as e:
-            print("settle error", e)
+            print("settle error", repr(e), flush=True)
 
 
 def flip_call(cur, new_side, comb, r, fib, elapsed, now, src):
@@ -1470,13 +1470,26 @@ def tick(state):
 
 def main():
     state = load_state()
+    print("bot started", flush=True)
+    try:
+        m = open_market()
+        print("open market:", m["ticker"] if m else None, flush=True)
+    except Exception as e:
+        print("open_market error", repr(e), flush=True)
     end = time.time() + RUN_SECONDS
+    last_beat = 0
     while time.time() < end:
         t0 = time.time()
         try:
             tick(state)
         except Exception as e:
-            print("tick error", e)
+            print("tick error", repr(e), flush=True)
+        if time.time() - last_beat >= 60:
+            last_beat = time.time()
+            cur = state.get("current")
+            print("alive | market:", cur and cur.get("ticker"),
+                  "| side:", cur and cur.get("side"),
+                  "| message:", cur and cur.get("message_id"), flush=True)
         time.sleep(max(0.0, POLL - (time.time() - t0)))
 
 
