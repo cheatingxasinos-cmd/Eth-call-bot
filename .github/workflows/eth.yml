@@ -1,4 +1,4 @@
-name: Eth-call-bot
+name: eth 15m signal bot
 on:
   workflow_dispatch:
   schedule:
