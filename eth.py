@@ -9,10 +9,12 @@ import statistics
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 try:
@@ -42,13 +44,18 @@ LIVE_SCALE = float(os.getenv("LIVE_SCALE", "1.0"))
 FINAL_SCALE = float(os.getenv("FINAL_SCALE", "3"))
 MAX_BYTES = int(float(os.getenv("MAX_MB", "7.5")) * 1024 * 1024)
 
-# ---- call settings: EMA trend cross + price vs strike, locked once made ----
-CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "0"))  # no new call inside this many secs of expiry
+# ---- call settings: EMA trend cross + price vs strike ----
+CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "0"))  # no new call or flip inside this many secs of expiry
 CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "1.5"))  # secs the setup must hold
 EMA_FAST = int(os.getenv("EMA_FAST", "3"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "8"))
 EMA_DEAD = float(os.getenv("EMA_DEAD", "0.00005"))  # gap/price needed to count as a trend
 EMA_FULL = float(os.getenv("EMA_FULL", "0.0005"))  # gap/price that counts as 100% confidence
+
+# ---- flip settings: a locked call flips ONLY when every indicator votes the other way ----
+FLIP_CONFIRM_SECONDS = float(os.getenv("FLIP_CONFIRM_SECONDS", str(CONFIRM_SECONDS)))
+FLIP_COOLDOWN = float(os.getenv("FLIP_COOLDOWN", "20"))  # min secs since the last call or flip
+MAX_FLIPS = int(os.getenv("MAX_FLIPS", "2"))  # max flips per 15m window
 
 # ---- display-only indicator settings ----
 MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))  # momentum badge threshold
@@ -59,18 +66,59 @@ ATR_N = int(os.getenv("ATR_N", "14"))
 ATR_Z = float(os.getenv("ATR_Z", "0.5"))
 
 
+# ---------- http: shared pooled sessions, timeouts, retries ----------
+def _make_session(retries):
+    s = requests.Session()
+    ad = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=retries)
+    s.mount("https://", ad)
+    s.mount("http://", ad)
+    s.headers["User-Agent"] = "eth-call-bot/1.0"
+    return s
+
+
+# Data reads (GET only): retry on connection errors, 429 and 5xx with short backoff.
+DATA = _make_session(Retry(total=2, connect=2, read=1, backoff_factor=0.15,
+                           status_forcelist=(429, 500, 502, 503, 504),
+                           allowed_methods=frozenset(["GET"]),
+                           respect_retry_after_header=True))
+# Discord: no automatic retries (a blind POST retry could double-post). send() handles retries itself.
+HOOK = _make_session(0)
+
+KALSHI_TIMEOUT = (3.05, 6)
+PRICE_TIMEOUT = (2, 3)
+HOOK_TIMEOUT = (5, 30)
+
+PRICE_POOL = ThreadPoolExecutor(8, thread_name_prefix="px")
+TICK_POOL = ThreadPoolExecutor(2, thread_name_prefix="tick")
+
+
+def get_json(url, params=None, timeout=KALSHI_TIMEOUT):
+    r = DATA.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
 # ---------- state ----------
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE) as f:
+                s = json.load(f)
+            s.setdefault("history", [])
+            s.setdefault("current", None)
+            s.setdefault("pending", [])
+            return s
+        except Exception as e:
+            print("state load error, starting fresh", repr(e), flush=True)
     return {"history": [], "current": None, "pending": []}
 
 
 def save_state(s):
     s["history"] = s["history"][-500:]
-    with open(STATE_FILE, "w") as f:
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(s, f, indent=1)
+    os.replace(tmp, STATE_FILE)  # atomic, so a crash can never leave a half-written file
 
 
 # ---------- kalshi data ----------
@@ -95,18 +143,15 @@ def ts(iso):
 
 
 def open_market():
-    r = requests.get(f"{KALSHI}/markets",
-                     params={"series_ticker": SERIES, "status": "open", "limit": 20}, timeout=10)
-    r.raise_for_status()
+    data = get_json(f"{KALSHI}/markets",
+                    params={"series_ticker": SERIES, "status": "open", "limit": 20})
     now = time.time()
-    ms = [m for m in r.json().get("markets", []) if ts(m["close_time"]) > now]
+    ms = [m for m in data.get("markets", []) if ts(m["close_time"]) > now]
     return min(ms, key=lambda m: ts(m["close_time"])) if ms else None
 
 
 def get_market(ticker):
-    r = requests.get(f"{KALSHI}/markets/{ticker}", timeout=10)
-    r.raise_for_status()
-    return r.json()["market"]
+    return get_json(f"{KALSHI}/markets/{ticker}")["market"]
 
 
 # ---------- crypto prices (ETH, BTC) ----------
@@ -116,19 +161,19 @@ PRICES = {s: deque(maxlen=1200) for s in WEIGHTS}
 
 
 def _cb(pair):
-    return float(requests.get(f"https://api.coinbase.com/v2/prices/{pair}/spot",
-                              timeout=5).json()["data"]["amount"])
+    return float(get_json(f"https://api.coinbase.com/v2/prices/{pair}/spot",
+                          timeout=PRICE_TIMEOUT)["data"]["amount"])
 
 
 def _kr(pair):
-    r = requests.get("https://api.kraken.com/0/public/Ticker",
-                     params={"pair": pair}, timeout=5).json()["result"]
+    r = get_json("https://api.kraken.com/0/public/Ticker",
+                 params={"pair": pair}, timeout=PRICE_TIMEOUT)["result"]
     return float(next(iter(r.values()))["c"][0])
 
 
 def _bs(pair):
-    return float(requests.get(f"https://www.bitstamp.net/api/v2/ticker/{pair}/",
-                              timeout=5).json()["last"])
+    return float(get_json(f"https://www.bitstamp.net/api/v2/ticker/{pair}/",
+                          timeout=PRICE_TIMEOUT)["last"])
 
 
 SOURCES = {
@@ -149,10 +194,14 @@ def all_prices():
     """{sym: (median_price, n_exchanges)}; (None, 0) if every source failed."""
     jobs = [(s, fn, pair) for s, srcs in SOURCES.items() for fn, pair in srcs]
     got = {s: [] for s in SOURCES}
-    with ThreadPoolExecutor(len(jobs)) as ex:
-        for sym, p in ex.map(_safe, jobs):
+    futs = [PRICE_POOL.submit(_safe, j) for j in jobs]
+    try:
+        for f in as_completed(futs, timeout=6):
+            sym, p = f.result()
             if p:
                 got[sym].append(p)
+    except Exception:
+        pass  # a slow exchange never stalls the loop; use whatever came back
     return {s: ((statistics.median(v), len(v)) if v else (None, 0)) for s, v in got.items()}
 
 
@@ -405,6 +454,35 @@ def ema_conf(side, gap):
     return max(1.0, min(99.0, 50 + 49 * (gap * sgn / EMA_FULL)))
 
 
+def maybe_flip(cur, now, secs_left, elapsed, price, gap):
+    """Flip a locked call ONLY when every indicator votes the opposite way.
+    Any WAIT (None) or NEUTRAL (0) vote blocks the flip. Needs a fresh price this tick,
+    the setup held for FLIP_CONFIRM_SECONDS, the cooldown passed, and flips under MAX_FLIPS."""
+    side = cur.get("side")
+    votes = cur.get("votes") or {}
+    flips = cur.get("flips", 0)
+    if (not side or not price or not votes or secs_left <= CALL_CUTOFF or flips >= MAX_FLIPS
+            or now - cur.get("call_t", 0) < FLIP_COOLDOWN):
+        cur.pop("flip_dir", None)
+        return False
+    target = -1 if side == "UP" else 1
+    if not all(v[0] == target for v in votes.values()):
+        cur.pop("flip_dir", None)
+        return False
+    new_side = "DOWN" if side == "UP" else "UP"
+    if cur.get("flip_dir") != new_side:
+        cur["flip_dir"], cur["flip_t"] = new_side, now
+        return False
+    if now - cur["flip_t"] < FLIP_CONFIRM_SECONDS:
+        return False
+    cur.update(side=new_side, conf=ema_conf(new_side, gap), called_at=round(elapsed), call_t=now,
+               flips=flips + 1, buy_shown=False,
+               votes_call=copy.deepcopy(votes), tally_call=list(cur["tally"]),
+               comb_call=cur["comb"])
+    cur.pop("flip_dir", None)
+    return True
+
+
 # ---------- stats ----------
 def stats(history):
     n = len(history)
@@ -588,7 +666,7 @@ def render_frames(cur, outcome, S, n):
     d.ellipse([k(24), k(24), k(24) + lg, k(24) + lg], outline=(255, 255, 255, 80), width=lw(1.5))
     d.text((k(98), k(54)), "ETH 15 min", font=F(30), fill=WHITE, anchor="lm")
 
-    # flip counter pill (calls are locked now, so this only shows for old saved state)
+    # flip counter pill (shows once a call has flipped)
     nflips = cur.get("flips", 0)
     if nflips and not waiting:
         tw0 = d.textlength("ETH 15 min", font=F(30)) / u
@@ -904,6 +982,8 @@ def chart_file(cur, outcome=None):
         if len(res[0]) <= MAX_BYTES or S <= 1:
             return res
         S *= 0.75
+
+Part 2 (paste it right under Part 1)
 # ---------- discord ----------
 def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None, pm=None):
     side = c["side"]
@@ -940,6 +1020,8 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         lines = [
             f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry)",
         ]
+        if c.get("flips"):
+            lines.append(f"**Flips:** {c['flips']} (flipped because every indicator agreed)")
         # live confidence, recalculated every tick, shown under the entry value
         if not outcome:
             live_conf = c.get("live_conf")
@@ -993,7 +1075,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
             lines.append(f"**EMA gap** {cb:+.1f}bp")
 
     if side is not None:
-        lines.append("**Entry** EMA trend cross confirmed by price vs strike, locked")
+        lines.append("**Entry** EMA trend cross confirmed by price vs strike. Flips only when all indicators agree")
     if price:
         lines.append(f"**Price** ${price:,.2f} (median of {n_ex} exch)")
     lines.append(f"**Strike** {c['strike']:,.2f} | {max(int(secs_left), 0)}s left")
@@ -1008,6 +1090,10 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
     }
 
 
+def _backoff(attempt):
+    return min(8.0, 0.5 * (2 ** attempt)) + random.random() * 0.25
+
+
 def send(embed, message_id=None, cur=None, outcome=None, text_only=False):
     payload = {"embeds": [embed]}
     f_data = None
@@ -1019,19 +1105,33 @@ def send(embed, message_id=None, cur=None, outcome=None, text_only=False):
         embed["image"] = {"url": f"attachment://{f_data[1]}"}
         if message_id:
             payload["attachments"] = []  # replace the old image only when uploading a new one
-    for _ in range(3):
-        kw = {"timeout": 60}
+    for attempt in range(5):
+        kw = {"timeout": HOOK_TIMEOUT}
         if f_data:
             kw["files"] = {"files[0]": (f_data[1], f_data[0], f_data[2])}
             kw["data"] = {"payload_json": json.dumps(payload)}
         else:
             kw["json"] = payload
-        if message_id:
-            r = requests.patch(f"{WEBHOOK}/messages/{message_id}", **kw)
-        else:
-            r = requests.post(WEBHOOK, params={"wait": "true"}, **kw)
+        try:
+            if message_id:
+                r = HOOK.patch(f"{WEBHOOK}/messages/{message_id}", **kw)
+            else:
+                r = HOOK.post(WEBHOOK, params={"wait": "true"}, **kw)
+        except requests.RequestException:
+            # an edit is safe to repeat; a new post might already have gone through, so don't repeat it
+            if message_id and attempt < 4:
+                time.sleep(_backoff(attempt))
+                continue
+            raise
         if r.status_code == 429:
-            time.sleep(r.json().get("retry_after", 1) + 0.1)
+            try:
+                wait = float(r.json().get("retry_after", 1))
+            except Exception:
+                wait = 1.0
+            time.sleep(min(wait, 10.0) + 0.1)
+            continue
+        if r.status_code >= 500 and message_id and attempt < 4:
+            time.sleep(_backoff(attempt))
             continue
         r.raise_for_status()
         return r.json()["id"]
@@ -1099,6 +1199,8 @@ def settle_pending(state):
 
 
 def tick(state):
+    # start the price fetch now so it runs in parallel with the Kalshi calls
+    px_f = TICK_POOL.submit(all_prices)
     settle_pending(state)
     m = open_market()
     cur = state["current"]
@@ -1118,11 +1220,12 @@ def tick(state):
     if m is None:
         return
 
+    px = px_f.result()
+    now = time.time()
     close_ts = ts(m["close_time"])
     secs_left = close_ts - now
     elapsed = 900 - secs_left
     yes = yes_pct(m)
-    px = all_prices()
     for s, (p, _) in px.items():
         record_price(s, p)
     price, n_ex = px["ETH"]
@@ -1154,7 +1257,7 @@ def tick(state):
     cur["sig"] = {"mom": round(mom, 2), "fib": round(fib, 2)}
     prev_side = cur["side"]
 
-    # ---- indicator votes (display only, except EMA which drives the call) ----
+    # ---- indicator votes (EMA drives the first call; all six must agree to flip it) ----
     mv = 1 if mom >= MOM_MIN else -1 if mom <= -MOM_MIN else 0
     fv = (None if fib_lvl is None else 1 if fib >= FIB_AGREE else -1 if fib <= -FIB_AGREE else 0)
     votes = {"ema": vote_ema(series), "boll": vote_boll(series),
@@ -1169,17 +1272,21 @@ def tick(state):
     cside, gap = ema_call(series, price, strike)
     cur["comb"] = round(gap * 1e4, 2)   # EMA gap in bp
 
-    # ---- the call: EMA trend + price vs strike, held CONFIRM_SECONDS, then locked ----
-    if cur["side"] is None and secs_left > CALL_CUTOFF:
-        if cside is None:
-            cur.pop("comb_dir", None)
-        elif cur.get("comb_dir") != cside:
-            cur["comb_dir"], cur["comb_t"] = cside, now
-        elif now - cur["comb_t"] >= CONFIRM_SECONDS:
-            cur.update(side=cside, conf=ema_conf(cside, gap), locked=True,
-                       called_at=round(elapsed), src="EMA",
-                       votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
-                       comb_call=cur["comb"])
+    # ---- the call: EMA trend + price vs strike, held CONFIRM_SECONDS ----
+    if cur["side"] is None:
+        if secs_left > CALL_CUTOFF:
+            if cside is None:
+                cur.pop("comb_dir", None)
+            elif cur.get("comb_dir") != cside:
+                cur["comb_dir"], cur["comb_t"] = cside, now
+            elif now - cur["comb_t"] >= CONFIRM_SECONDS:
+                cur.update(side=cside, conf=ema_conf(cside, gap), locked=True,
+                           called_at=round(elapsed), call_t=now, src="EMA",
+                           votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
+                           comb_call=cur["comb"])
+    else:
+        # ---- flip: only when ALL indicators show the opposite side ----
+        maybe_flip(cur, now, secs_left, elapsed, price, gap)
 
     if cur["side"]:
         cur["live_conf"] = round(ema_conf(cur["side"], gap), 1)
@@ -1195,6 +1302,8 @@ def tick(state):
     ev = None
     if cur["side"] and not prev_side:
         ev = f"New call: {cur['side']}"
+    elif cur["side"] and prev_side and cur["side"] != prev_side:
+        ev = f"FLIP: {prev_side} to {cur['side']} (all indicators agree)"
     elif old_who and who != old_who and who != "even" and since_post >= MIN_GAP:
         ev = f"Momentum shift: {who} gaining"
     ev = ev or cur.get("pending_ev")
@@ -1230,19 +1339,25 @@ def main():
         print("open_market error", repr(e), flush=True)
     end = time.time() + RUN_SECONDS
     last_beat = 0
+    fails = 0
     while time.time() < end:
         t0 = time.time()
         try:
             tick(state)
+            fails = 0
         except Exception as e:
+            fails += 1
             print("tick error", repr(e), flush=True)
         if time.time() - last_beat >= 60:
             last_beat = time.time()
             cur = state.get("current")
             print("alive | market:", cur and cur.get("ticker"),
                   "| side:", cur and cur.get("side"),
+                  "| flips:", cur and cur.get("flips", 0),
                   "| message:", cur and cur.get("message_id"), flush=True)
-        time.sleep(max(0.0, POLL - (time.time() - t0)))
+        # after repeated failures, back off instead of hammering the APIs
+        delay = POLL if fails == 0 else min(5.0, POLL * (2 ** min(fails, 4)))
+        time.sleep(max(0.0, delay - (time.time() - t0)))
 
 
 if __name__ == "__main__":
