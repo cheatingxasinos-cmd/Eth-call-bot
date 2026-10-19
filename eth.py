@@ -904,8 +904,6 @@ def chart_file(cur, outcome=None):
         if len(res[0]) <= MAX_BYTES or S <= 1:
             return res
         S *= 0.75
-
-Part 2 of 2 (continues directly after chart_file)
 # ---------- discord ----------
 def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None, pm=None):
     side = c["side"]
