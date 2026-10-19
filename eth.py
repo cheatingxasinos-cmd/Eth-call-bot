@@ -33,71 +33,30 @@ RUN_SECONDS = int(os.getenv("RUN_SECONDS", str(345 * 60)))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
 W_MARKET = float(os.getenv("W_MARKET", "0.5"))
-CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "60"))
 TILT_W = float(os.getenv("TILT_W", "0.25"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "0.25"))  # legacy pick_call(): min |momentum+fib score|
-MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))
-FLIP_SCORE = float(os.getenv("FLIP_SCORE", "99"))  # old flip trigger off by default
-CALL_AFTER = int(os.getenv("CALL_AFTER", "99999"))  # old momentum trigger off by default
-CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "1.5"))
-W_MOM = float(os.getenv("W_MOM", "0.35"))
-W_RSI = float(os.getenv("W_RSI", "0"))  # unused: RSI no longer affects the call
-W_FIB = float(os.getenv("W_FIB", "0.35"))
-W_TREND = float(os.getenv("W_TREND", "0"))  # unused: trend no longer affects the call
-W_PROB = float(os.getenv("W_PROB", "0"))  # unused: market/strike probability no longer affects the call
-MOM_TILT_W = float(os.getenv("MOM_TILT_W", "0"))  # share of cross-asset tilt inside momentum (0 = pure ETH momentum)
 RSI_N = int(os.getenv("RSI_N", "14"))
-RSI_BLOCK = float(os.getenv("RSI_BLOCK", "20"))  # UP held if RSI < this, DOWN held if RSI > 100 minus this
-RSI_GRACE = float(os.getenv("RSI_GRACE", "10"))  # max secs RSI can delay the first-to-cross call
-FIB_AGREE = float(os.getenv("FIB_AGREE", "0.15"))  # Fibonacci score must be at least this far in the call's direction
+FIB_AGREE = float(os.getenv("FIB_AGREE", "0.15"))  # display bias threshold for Fibonacci
 FIB_LEVELS = (0.236, 0.382, 0.5, 0.618, 0.786)
-TRIGGER_PCT = float(os.getenv("TRIGGER_PCT", "50.1"))
-FLIP_HARD = float(os.getenv("FLIP_HARD", "0.45"))
-FLIP_HOLD = float(os.getenv("FLIP_HOLD", "8"))
-FLIP_MIN_AGE = float(os.getenv("FLIP_MIN_AGE", "20"))
 LOGO_PATH = os.getenv("LOGO_PATH", "eth_logo.png")
 LIVE_SCALE = float(os.getenv("LIVE_SCALE", "1.0"))
 FINAL_SCALE = float(os.getenv("FINAL_SCALE", "3"))
 MAX_BYTES = int(float(os.getenv("MAX_MB", "7.5")) * 1024 * 1024)
 
-# ---- combined call settings ----
-CALL_MODE = os.getenv("CALL_MODE", "combined")  # kept for compatibility; the Kalshi % trigger was removed
-W_CORE = float(os.getenv("W_CORE", "1.0"))  # weight of the momentum+Fibonacci score in the combined score
-W_VOTE = float(os.getenv("W_VOTE", "0"))  # weight of the mom/fib vote average in the combined score (0 = off)
-COMBO_MIN = float(os.getenv("COMBO_MIN", "0.30"))  # combined (momentum+Fibonacci, -1..1) score needed to call
-COMBO_STRONG = float(os.getenv("COMBO_STRONG", "0.65"))  # a lone signal this strong may call if the other is neutral
-COMBO_OPP = int(os.getenv("COMBO_OPP", "0"))  # max of the two signals allowed to vote against
-CONF_MIN = int(os.getenv("CONF_MIN", "1"))  # signals (of 2) that must vote for the side; 2 = both must agree
-EMA_DEAD = float(os.getenv("EMA_DEAD", "0.00005"))  # EMA gap as a fraction of price
+# ---- call settings: EMA trend cross + price vs strike, locked once made ----
+CALL_CUTOFF = int(os.getenv("CALL_CUTOFF", "0"))  # no new call inside this many secs of expiry
+CONFIRM_SECONDS = float(os.getenv("CONFIRM_SECONDS", "1.5"))  # secs the setup must hold
+EMA_FAST = int(os.getenv("EMA_FAST", "3"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "8"))
+EMA_DEAD = float(os.getenv("EMA_DEAD", "0.00005"))  # gap/price needed to count as a trend
+EMA_FULL = float(os.getenv("EMA_FULL", "0.0005"))  # gap/price that counts as 100% confidence
+
+# ---- display-only indicator settings ----
+MOM_MIN = float(os.getenv("MOM_MIN", "0.10"))  # momentum badge threshold
 MACD_DEAD = float(os.getenv("MACD_DEAD", "0.00002"))
 BB_UP = float(os.getenv("BB_UP", "0.65"))
 BB_DN = float(os.getenv("BB_DN", "0.35"))
 ATR_N = int(os.getenv("ATR_N", "14"))
 ATR_Z = float(os.getenv("ATR_Z", "0.5"))
-CONF_FULL = float(os.getenv("CONF_FULL", "0.7"))  # combined score that counts as full strength
-CONF_VOTE_W = float(os.getenv("CONF_VOTE_W", "0.4"))  # weight of badge agreement in confidence
-
-# ---- fast flip settings ----
-FAST_FLIP = int(os.getenv("FAST_FLIP", "1"))  # 0 turns flips off
-FAST_FLIP_COMB = float(os.getenv("FAST_FLIP_COMB", "0.50"))  # combined score toward the new side
-FAST_FLIP_MOM = float(os.getenv("FAST_FLIP_MOM", "0.60"))  # momentum toward the new side
-FAST_FLIP_CONF = float(os.getenv("FAST_FLIP_CONF", "85"))  # confidence of the new side
-FAST_FLIP_OPP = int(os.getenv("FAST_FLIP_OPP", "0"))  # votes still backing the old call
-FAST_FLIP_HOLD = float(os.getenv("FAST_FLIP_HOLD", "2.0"))  # secs the setup must hold
-FAST_FLIP_AGE = float(os.getenv("FAST_FLIP_AGE", "10"))  # min secs since the last call
-FAST_FLIP_CUTOFF = int(os.getenv("FAST_FLIP_CUTOFF", "30"))  # no fast flips this close to expiry
-FAST_FLIP_MAX = int(os.getenv("FAST_FLIP_MAX", "2"))  # max fast flips per window
-FAST_FLIP_NEED_MKT = int(os.getenv("FAST_FLIP_NEED_MKT", "0"))  # unused (market no longer affects the call)
-SELL_FLIP = int(os.getenv("SELL_FLIP", "1"))  # 1 = a SELL signal flips the call to the other side and BUYs it
-SELL_CUTOFF = int(os.getenv("SELL_CUTOFF", "10"))  # no sell/reversal flips inside this many secs of expiry
-
-# ---- reversal flip settings (market odds + strike model + price vs strike) ----
-REV_FLIP = int(os.getenv("REV_FLIP", "1"))
-REV_MOM = float(os.getenv("REV_MOM", "0.40"))  # momentum toward the new side for a reversal flip
-REV_MKT = float(os.getenv("REV_MKT", "60"))  # unused (market no longer affects the call)
-REV_PM = float(os.getenv("REV_PM", "65"))  # unused (strike model no longer affects the call)
-REV_HOLD = float(os.getenv("REV_HOLD", "3"))  # secs the reversal must hold
-REV_MAX = int(os.getenv("REV_MAX", "3"))  # max total flips per window
 
 
 # ---------- state ----------
@@ -201,7 +160,7 @@ def eth_price():
     return all_prices()["ETH"]
 
 
-# ---------- prediction ----------
+# ---------- price history + market context ----------
 def record_price(sym, price):
     if price:
         PRICES[sym].append((time.time(), price))
@@ -289,6 +248,7 @@ def predict(yes_mkt, price, strike, secs_left, tilt=0.0):
     return W_MARKET * yes_mkt + (1 - W_MARKET) * pm, pm
 
 
+# ---------- display-only indicators ----------
 def _fib_score(d):
     """Retracement depth of the last swing (0 = at the extreme, 1 = full retrace).
     Positive = swing direction likely continues."""
@@ -319,27 +279,12 @@ def fib_signal(prices):
     return (1 if up_swing else -1) * _fib_score(d), f"{lvl * 100:.1f}".rstrip("0").rstrip(".")
 
 
-def fib_ok(side, f):
-    """True only if the Fibonacci score points the same way as the side."""
-    sgn = 1 if side == "UP" else -1
-    return f * sgn >= FIB_AGREE
-
-
 def fib_bias(f):
-    if f >= 0.15:
+    if f >= FIB_AGREE:
         return "bullish"
-    if f <= -0.15:
+    if f <= -FIB_AGREE:
         return "bearish"
     return "neutral"
-
-
-def trend_signal(prices, tilt):
-    if len(prices) < 8:
-        ema = 0.0
-    else:
-        e3, e8 = _ema(prices, 3)[-1], _ema(prices, 8)[-1]
-        ema = math.tanh(math.log(e3 / e8) / (vol("ETH") * math.sqrt(30)))
-    return 0.5 * ema + 0.5 * math.tanh(tilt / 1.5)
 
 
 def rsi(prices, n=None):
@@ -354,24 +299,6 @@ def rsi(prices, n=None):
         ag = (ag * (n - 1) + max(c, 0)) / n
         al = (al * (n - 1) + max(-c, 0)) / n
     return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
-
-
-def rsi_ok(side, r):
-    """True if RSI doesn't strongly fight the side. No RSI data yet means no hold."""
-    if r is None:
-        return True
-    return r >= RSI_BLOCK if side == "UP" else r <= 100 - RSI_BLOCK
-
-
-# ---------- indicator votes (EMA 9/21, Bollinger, ATR, MACD) ----------
-# Each returns (vote, text). vote is +1 (UP), -1 (DOWN), 0 (NEUTRAL) or None while warming up.
-def vote_ema(p):
-    if len(p) < 21:
-        return None, "warming up"
-    e9, e21 = _ema(p, 9)[-1], _ema(p, 21)[-1]
-    gap = (e9 - e21) / p[-1]
-    v = 1 if gap > EMA_DEAD else -1 if gap < -EMA_DEAD else 0
-    return v, f"EMA9 {'above' if e9 > e21 else 'below'} EMA21 ({gap * 1e4:+.1f}bp)"
 
 
 def vote_boll(p, n=20, k=2.0):
@@ -429,7 +356,7 @@ def _pressure(p):
 
 
 def momentum_fast(sym="ETH", win=10):
-    """Positive = buyers gaining, negative = sellers gaining (time-based, raw ticks)."""
+    """Positive = buyers gaining, negative = sellers gaining (time-based, raw ticks). Display only."""
     pts = list(PRICES[sym])
     if len(pts) < 6:
         return 0.0
@@ -443,73 +370,39 @@ def momentum_fast(sym="ETH", win=10):
     return max(-1.0, min(1.0, 0.65 * now + 0.35 * gain))
 
 
-def composite(mom, fib):
-    """Momentum + Fibonacci only, normalised to -1..1."""
-    w = W_MOM + W_FIB
-    return (W_MOM * mom + W_FIB * fib) / w if w > 0 else 0.0
+# ---------- the call: EMA trend cross + price vs strike ----------
+def vote_ema(p):
+    if len(p) < EMA_SLOW + 1:
+        return None, "warming up"
+    ef, es = _ema(p, EMA_FAST)[-1], _ema(p, EMA_SLOW)[-1]
+    gap = (ef - es) / p[-1]
+    v = 1 if gap > EMA_DEAD else -1 if gap < -EMA_DEAD else 0
+    return v, f"EMA{EMA_FAST} {'above' if ef > es else 'below'} EMA{EMA_SLOW} ({gap * 1e4:+.1f}bp)"
 
 
-def pick_call(score, mom, fib):
-    """Legacy momentum trigger (off by default). Momentum decides; Fibonacci vetoes a hard fight."""
-    sgn = 1 if mom > 0 else -1
-    if abs(mom) < MOM_MIN or score * sgn < MIN_SCORE:
-        return None
-    if fib * sgn < -0.5:
-        return None
-    return ("UP" if sgn > 0 else "DOWN"), 50 + 50 * min(1.0, abs(mom))
+def ema_gap(p):
+    if len(p) < EMA_SLOW + 1:
+        return 0.0
+    return (_ema(p, EMA_FAST)[-1] - _ema(p, EMA_SLOW)[-1]) / p[-1]
 
 
-def decide_call(mom, fib, fib_ready=True):
-    """Call decision from momentum and Fibonacci only.
-    Returns (side or None, combined score, mom vote, fib vote).
-    Needs |combined| >= COMBO_MIN, at most COMBO_OPP signals against, CONF_MIN signals for the side,
-    and either both signals agree, or the stronger one clears COMBO_STRONG with the other neutral."""
-    mv = 1 if mom >= MOM_MIN else -1 if mom <= -MOM_MIN else 0
-    fv = None if not fib_ready else 1 if fib >= FIB_AGREE else -1 if fib <= -FIB_AGREE else 0
-    score = composite(mom, fib if fib_ready else 0.0)
-    vs = [v for v in (mv, fv) if v is not None]
-    vscore = sum(vs) / len(vs) if vs else 0.0
-    comb = W_CORE * score + W_VOTE * vscore
-    if not fib_ready or comb == 0:
-        return None, comb, mv, fv
-    sgn = 1 if comb > 0 else -1
-    side = "UP" if sgn > 0 else "DOWN"
-    against = sum(1 for v in vs if v == -sgn)
-    for_ = sum(1 for v in vs if v == sgn)
-    both = for_ == 2
-    strong = max(mom * sgn, fib * sgn) >= COMBO_STRONG
-    ok = (abs(comb) >= COMBO_MIN and against <= COMBO_OPP and for_ >= CONF_MIN
-          and fib * sgn >= -0.5 and (both or strong))
-    return (side if ok else None), comb, mv, fv
+def ema_call(p, price, strike):
+    """(side or None, gap). The EMA trend and price vs strike must agree."""
+    v, _ = vote_ema(p)
+    gap = ema_gap(p)
+    if not v or not price or not strike:
+        return None, gap
+    if v == 1 and price > strike:
+        return "UP", gap
+    if v == -1 and price < strike:
+        return "DOWN", gap
+    return None, gap
 
 
-def side_pct(side, yes):
-    """Button % of the called side (same clamp as the chart), minus 5 points."""
-    up = min(max(yes, 1), 99)
-    pct = up if side == "UP" else 100 - up
-    return max(1.0, pct - 5)
-
-
-def combo_conf(side, comb, votes):
-    """Confidence 1-99 from the combined score and momentum/Fibonacci agreement.
-    votes = {name: [vote, text]}."""
+def ema_conf(side, gap):
+    """Confidence 1-99: 50 at no gap, 99 at EMA_FULL. Can drop below 50 if the trend turns."""
     sgn = 1 if side == "UP" else -1
-    vs = [votes[k][0] for k in ("mom", "fib") if k in votes and votes[k][0] is not None]
-    agree = sum(v * sgn for v in vs) / len(vs) if vs else 0.0
-    strength = max(-1.0, min(1.0, comb * sgn / CONF_FULL))
-    x = (1 - CONF_VOTE_W) * strength + CONF_VOTE_W * agree
-    return max(1.0, min(99.0, 50 + 49 * x))
-
-
-def pct_trigger(yes):
-    """First side to reach TRIGGER_PCT on Kalshi wins the call. UP = YES %, DOWN = NO %."""
-    up = min(max(yes, 1), 99)
-    dn = 100 - up
-    if up >= TRIGGER_PCT:
-        return "UP"
-    if dn >= TRIGGER_PCT:
-        return "DOWN"
-    return None
+    return max(1.0, min(99.0, 50 + 49 * (gap * sgn / EMA_FULL)))
 
 
 # ---------- stats ----------
@@ -695,7 +588,7 @@ def render_frames(cur, outcome, S, n):
     d.ellipse([k(24), k(24), k(24) + lg, k(24) + lg], outline=(255, 255, 255, 80), width=lw(1.5))
     d.text((k(98), k(54)), "ETH 15 min", font=F(30), fill=WHITE, anchor="lm")
 
-    # flip counter pill
+    # flip counter pill (calls are locked now, so this only shows for old saved state)
     nflips = cur.get("flips", 0)
     if nflips and not waiting:
         tw0 = d.textlength("ETH 15 min", font=F(30)) / u
@@ -908,7 +801,7 @@ def render_frames(cur, outcome, S, n):
     d.text((tx, k(610)), l1, font=F(17), fill=WHITE, anchor="lm")
     d.text((k(92), k(634)), l2, font=F(13, False), fill=MUTED, anchor="lm")
 
-    # ---- indicator vote badges + confluence tally + confidence ----
+    # ---- indicator vote badges + tally + confidence ----
     done = outcome in ("win", "loss")
     vt = (cur.get("votes_call") if done else None) or cur.get("votes") or {}
     tl = (cur.get("tally_call") if done else None) or cur.get("tally")
@@ -1012,7 +905,7 @@ def chart_file(cur, outcome=None):
             return res
         S *= 0.75
 
-
+Part 2 of 2 (continues directly after chart_file)
 # ---------- discord ----------
 def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None, pm=None):
     side = c["side"]
@@ -1023,9 +916,8 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
     ]
 
     if side is None:
-        mom_now = abs((c.get("sig") or {}).get("mom", 0))
         lines = [
-            f"**Call:** ⚪ NO CALL (momentum {mom_now * 100:.0f}, needs {MOM_MIN * 100:.0f}+ held for {CONFIRM_SECONDS:.1f}s)",
+            f"**Call:** ⚪ NO CALL (waiting for EMA{EMA_FAST}/{EMA_SLOW} trend to agree with price vs strike)",
             "**Action:** WAIT, no position",
             f"**Kalshi** YES {yes:.0f}% / NO {100 - yes:.0f}%",
         ]
@@ -1043,18 +935,12 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
             tag, color = "HOLD", GREEN if side == "UP" else RED
         if outcome:
             action = tag
-        elif c.get("flip_t") and time.time() - c["flip_t"] < 30:
-            action = f"SELL {c.get('flip_from')} → BUY {side}"
-        elif c.get("flipped"):
-            action = "SELL"
         elif not c.get("buy_shown"):
             action = "BUY"
         else:
             action = "HOLD"
-        fl = fib_level(c)
-        fib_txt = f" | Fibonacci retracement at {fl}% + trend" if fl and not outcome else ""
         lines = [
-            f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry){fib_txt} | momentum is {momentum_level(c)}",
+            f"**Call:** {arrow} {side} ({conf:.0f}% confidence at entry)",
         ]
         # live confidence, recalculated every tick, shown under the entry value
         if not outcome:
@@ -1074,7 +960,7 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         arrows = " / ".join(f"{sym} {'▲' if z >= 0 else '▼'}" for sym, z in mk["z"].items())
         lines.append(f"**Basket** {arrows} (agreement {mk['breadth'] * 100:.0f}%)")
 
-    # Signals line: Fibonacci (level, score, bias) plus RSI.
+    # Signals line: Fibonacci (level, score, bias) plus RSI. Display only.
     sg = c.get("sig")
     if sg:
         fl = c.get("fib")
@@ -1087,14 +973,13 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         rsi_part = f" | RSI {rs:.0f}" if rs is not None else " | RSI warming up"
         lines.append(f"**Signals** {fib_part}{rsi_part}")
 
-    # Public vote panel (Momentum, Fibonacci, EMA 9/21, Bollinger, ATR, MACD) plus confluence
-    # and combined score. On the settled post it shows the votes frozen at entry.
+    # Indicator panel. On the settled post it shows the votes frozen at entry.
     done = outcome in ("win", "loss")
     vt = (c.get("votes_call") if done else None) or c.get("votes")
     tally = (c.get("tally_call") if done else None) or c.get("tally")
     if vt and tally:
-        names = {"mom": "Momentum", "fib": "Fibonacci", "ema": "EMA 9/21", "boll": "Bollinger",
-                 "atr": "ATR", "macd": "MACD"}
+        names = {"ema": "EMA trend (call)", "mom": "Momentum", "fib": "Fibonacci",
+                 "boll": "Bollinger", "atr": "ATR", "macd": "MACD"}
         lab = lambda v: "⚪ WARMING" if v is None else "🟢 UP" if v > 0 else "🔴 DOWN" if v < 0 else "⚪ NEUTRAL"
         lines.append("**Indicators at entry**" if done and c.get("votes_call") else "**Indicators**")
         for key, nm in names.items():
@@ -1103,20 +988,14 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
             v, txt = vt[key]
             lines.append(f"{lab(v)} · **{nm}** {txt}")
         u, d_, n_ = tally
-        cb = c.get("comb_call") if done and c.get("comb_call") is not None else c.get("comb")
         verdict = f" → **{side}**" if side else " → no call yet"
-        lines.append(f"**Confluence** UP {u} / DOWN {d_} / NEUTRAL {n_}{verdict}")
+        lines.append(f"**Indicator tally** UP {u} / DOWN {d_} / NEUTRAL {n_}{verdict}")
+        cb = c.get("comb_call") if done and c.get("comb_call") is not None else c.get("comb")
         if cb is not None:
-            lines.append(f"**Combined score** {cb:+.2f} (call at ±{COMBO_MIN:.2f})")
+            lines.append(f"**EMA gap** {cb:+.1f}bp")
 
-    if side is None and c.get("rsi_block"):
-        why = c.get("hold_why") or ""
-        cap = "" if "Fibonacci" in why else f" (max {RSI_GRACE:.0f}s)"
-        lines.append(f"**Hold** {c['rsi_block']} call waiting on {why}{cap}")
-    elif side is not None and c.get("fib_call") is not None:
-        lines.append("**Entry** Momentum and Fibonacci call")
-    if c.get("flips"):
-        lines.append(f"**Flips** {c['flips']} this window")
+    if side is not None:
+        lines.append("**Entry** EMA trend cross confirmed by price vs strike, locked")
     if price:
         lines.append(f"**Price** ${price:,.2f} (median of {n_ex} exch)")
     lines.append(f"**Strike** {c['strike']:,.2f} | {max(int(secs_left), 0)}s left")
@@ -1129,23 +1008,6 @@ def build_embed(c, state, yes, price, n_ex, secs_left, outcome=None, blend=None,
         "footer": {"text": "Signals only, not financial advice"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-
-
-_build_embed_raw = build_embed
-
-
-def build_embed(*a, **kw):
-    """Same embed, minus anything that hints at how a call is triggered."""
-    e = _build_embed_raw(*a, **kw)
-    out = []
-    for ln in e["description"].split("\n"):
-        if ln.startswith("**Call:** ⚪ NO CALL"):
-            ln = "**Call:** ⚪ NO CALL yet"
-        elif ln.startswith("**Call:**"):
-            ln = ln.split(" | ")[0]  # trims the tail; Fibonacci shows in the Signals line instead
-        out.append(ln)
-    e["description"] = "\n".join(out)
-    return e
 
 
 def send(embed, message_id=None, cur=None, outcome=None, text_only=False):
@@ -1238,24 +1100,6 @@ def settle_pending(state):
             print("settle error", repr(e), flush=True)
 
 
-def flip_call(cur, new_side, comb, r, fib, elapsed, now, src):
-    """Switch the whole call to new_side and restart it in BUY mode."""
-    cur.setdefault("calls", []).append(
-        {"side": cur["side"], "conf": cur.get("conf"), "at": cur.get("called_at")})
-    cur.update(flip_from=cur["side"], side=new_side,
-               conf=combo_conf(new_side, comb, cur["votes"]),
-               called_at=round(elapsed), src=src,
-               flips=cur.get("flips", 0) + 1, flip_t=now,
-               flipped=False, buy_shown=False,
-               fib_call=round(fib, 2), rsi_call=cur["rsi"],
-               rsi_over=False, fib_over=False,
-               votes_call=copy.deepcopy(cur["votes"]),
-               tally_call=list(cur["tally"]), comb_call=cur["comb"])
-    cur.pop("flip_since", None)
-    cur.pop("ff_t", None)
-    cur.pop("rev_t", None)
-
-
 def tick(state):
     settle_pending(state)
     m = open_market()
@@ -1303,129 +1147,44 @@ def tick(state):
     cur["read"] = {"ETH": blend}
 
     series = series_10s("ETH")
-    fib, fib_lvl = fib_signal(series)
-    trend = trend_signal(series, tilt)  # display only
-    r = rsi(series)  # display only
+    fib, fib_lvl = fib_signal(series)   # display only
+    r = rsi(series)                     # display only
     cur["rsi"] = round(r, 1) if r is not None else None
-    rsi_s = max(-1.0, min(1.0, (r - 50) / 50)) if r is not None else 0.0
-    mom = (1 - MOM_TILT_W) * momentum_fast("ETH") + MOM_TILT_W * math.tanh(tilt / 1.5)
+    mom = momentum_fast("ETH")          # display only
     who = "buyers" if mom > 0.1 else "sellers" if mom < -0.1 else "even"
-    score = composite(mom, fib)
-    prob = max(-1.0, min(1.0, (blend - 50) / 50))  # display only
-    cur["score"] = round(score, 3)
     cur["fib"] = fib_lvl
-    cur["sig"] = {"mom": round(mom, 2), "fib": round(fib, 2), "trend": round(trend, 2),
-                  "prob": round(prob, 2)}
-    prev_side, prev_flip = cur["side"], cur.get("flipped")
+    cur["sig"] = {"mom": round(mom, 2), "fib": round(fib, 2)}
+    prev_side = cur["side"]
 
-    # ---- votes: EMA/Boll/ATR/MACD are display only; the call uses momentum and Fibonacci ----
+    # ---- indicator votes (display only, except EMA which drives the call) ----
+    mv = 1 if mom >= MOM_MIN else -1 if mom <= -MOM_MIN else 0
+    fv = (None if fib_lvl is None else 1 if fib >= FIB_AGREE else -1 if fib <= -FIB_AGREE else 0)
     votes = {"ema": vote_ema(series), "boll": vote_boll(series),
              "atr": vote_atr(series, price, strike, secs_left), "macd": vote_macd(series)}
     cur["votes"] = {k: [v, t] for k, (v, t) in votes.items()}
-    cside, comb, mv, fv = decide_call(mom, fib, fib_lvl is not None)
     cur["votes"]["mom"] = [mv, f"{mom:+.2f}, {momentum_level(cur)} ({who})"]
     cur["votes"]["fib"] = [fv, f"retrace {fib_lvl}% ({fib:+.2f})" if fib_lvl else "forming"]
-    ready = [v for v in (mv, fv) if v is not None]
-    all_ready = fv is not None
-    c_up, c_dn = ready.count(1), ready.count(-1)
-    cur["tally"] = [c_up, c_dn, len(ready) - c_up - c_dn]
-    cur["comb"] = round(comb, 3)
+    vs = [v for v, _ in cur["votes"].values() if v is not None]
+    c_up, c_dn = vs.count(1), vs.count(-1)
+    cur["tally"] = [c_up, c_dn, len(vs) - c_up - c_dn]
 
-    if CALL_MODE and all_ready and cur["side"] is None and secs_left > CALL_CUTOFF:
+    cside, gap = ema_call(series, price, strike)
+    cur["comb"] = round(gap * 1e4, 2)   # EMA gap in bp
+
+    # ---- the call: EMA trend + price vs strike, held CONFIRM_SECONDS, then locked ----
+    if cur["side"] is None and secs_left > CALL_CUTOFF:
         if cside is None:
             cur.pop("comb_dir", None)
         elif cur.get("comb_dir") != cside:
             cur["comb_dir"], cur["comb_t"] = cside, now
         elif now - cur["comb_t"] >= CONFIRM_SECONDS:
-            cur.update(side=cside, conf=combo_conf(cside, comb, cur["votes"]), locked=True,
-                       called_at=round(elapsed), src="COMBINED",
-                       rsi_call=None, fib_call=round(fib, 2), rsi_over=False, fib_over=False,
+            cur.update(side=cside, conf=ema_conf(cside, gap), locked=True,
+                       called_at=round(elapsed), src="EMA",
                        votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
                        comb_call=cur["comb"])
 
-    # old momentum trigger (off while CALL_AFTER=99999)
-    if cur["side"] is None and CALL_AFTER <= elapsed and secs_left > CALL_CUTOFF:
-        lead = 1 if mom >= MOM_MIN else -1 if mom <= -MOM_MIN else 0
-        fm = cur.get("first")
-        if not lead:
-            fm = None  # momentum faded, slot resets
-        elif fm is None or fm["dir"] != lead:
-            fm = {"dir": lead, "t": now}  # a new side takes the first-mover slot
-        cur["first"] = fm
-        if fm and now - fm["t"] >= CONFIRM_SECONDS:
-            pick = pick_call(score, mom, fib)
-            if pick:
-                side, _ = pick
-                cur.update(side=side, conf=combo_conf(side, comb, cur["votes"]), locked=True,
-                           called_at=round(elapsed), src="ETH",
-                           votes_call=copy.deepcopy(cur["votes"]), tally_call=list(cur["tally"]),
-                           comb_call=cur["comb"])
-
-    # ---- fast flip: change the call only on very high confidence AND momentum ----
-    if (FAST_FLIP and cur["side"] and cur["side"] == prev_side and all_ready
-            and secs_left > FAST_FLIP_CUTOFF and cur.get("flips", 0) < FAST_FLIP_MAX
-            and elapsed - cur.get("called_at", elapsed) >= FAST_FLIP_AGE):
-        new_side = "DOWN" if cur["side"] == "UP" else "UP"
-        ns = 1 if new_side == "UP" else -1
-        backing_old = sum(1 for v in ready if v == -ns)  # of momentum/Fibonacci
-        new_conf = combo_conf(new_side, comb, cur["votes"])
-        ok = (comb * ns >= FAST_FLIP_COMB and mom * ns >= FAST_FLIP_MOM
-              and new_conf >= FAST_FLIP_CONF and backing_old <= FAST_FLIP_OPP
-              and fib * ns >= FIB_AGREE)
-        if not ok:
-            cur.pop("ff_t", None)
-        else:
-            cur.setdefault("ff_t", now)
-            if now - cur["ff_t"] >= FAST_FLIP_HOLD:
-                flip_call(cur, new_side, comb, r, fib, elapsed, now, "FAST_FLIP")
-
-    # ---- stuck SELL: a call sitting on plain SELL flips once it is safe and the market agrees ----
-    if (SELL_FLIP and cur["side"] and cur["side"] == prev_side and cur.get("flipped")
-            and secs_left > SELL_CUTOFF and cur.get("flips", 0) < REV_MAX):
-        sgn = 1 if cur["side"] == "UP" else -1
-        if mom * sgn <= -MOM_MIN and fib * sgn <= -FIB_AGREE:
-            flip_call(cur, "DOWN" if cur["side"] == "UP" else "UP",
-                      comb, r, fib, elapsed, now, "SELL_FLIP")
-
-    # ---- SELL signals: flip the whole call to the other side and BUY it ----
-    if cur["side"] and cur["side"] == prev_side and not cur.get("flipped"):
-        sgn = 1 if cur["side"] == "UP" else -1
-        aged = elapsed - cur.get("called_at", elapsed) >= FLIP_MIN_AGE
-        mom_against = mom * sgn <= -MOM_MIN  # momentum has actually moved to the other side
-        sell = FLIP_SCORE < 99 and score * sgn < -FLIP_SCORE  # old flip trigger (off while FLIP_SCORE=99)
-        # harder SELL trigger: a held reversal in the momentum+Fibonacci score
-        if score * sgn < -FLIP_HARD and aged and mom_against:
-            cur.setdefault("flip_since", now)
-            if now - cur["flip_since"] >= FLIP_HOLD:
-                sell = True
-        else:
-            cur.pop("flip_since", None)  # reversal broke, timer resets
-        # Fibonacci failed-swing SELL: a deep retrace against the call, with momentum also on the other side
-        if aged and fib * sgn < -0.7 and mom_against:
-            sell = True
-        if sell:
-            if SELL_FLIP and secs_left > SELL_CUTOFF:
-                flip_call(cur, "DOWN" if cur["side"] == "UP" else "UP",
-                          comb, r, fib, elapsed, now, "SELL_FLIP")
-            else:
-                cur["flipped"] = True  # too close to expiry (or SELL_FLIP=0): plain SELL
-
-    # ---- reversal flip: momentum and Fibonacci both say the call is wrong ----
-    if (REV_FLIP and cur["side"] and cur["side"] == prev_side
-            and secs_left > SELL_CUTOFF and cur.get("flips", 0) < REV_MAX):
-        ns = -1 if cur["side"] == "UP" else 1
-        new_side = "UP" if ns > 0 else "DOWN"
-        aged = elapsed - cur.get("called_at", elapsed) >= FLIP_MIN_AGE
-        ok = (aged and mom * ns >= REV_MOM and fib * ns >= FIB_AGREE and comb * ns >= COMBO_MIN)
-        if not ok:
-            cur.pop("rev_t", None)
-        else:
-            cur.setdefault("rev_t", now)
-            if now - cur["rev_t"] >= REV_HOLD:
-                flip_call(cur, new_side, comb, r, fib, elapsed, now, "REV_FLIP")
-
     if cur["side"]:
-        cur["live_conf"] = round(combo_conf(cur["side"], comb, cur["votes"]), 1)
+        cur["live_conf"] = round(ema_conf(cur["side"], gap), 1)
 
     cur["price"] = price
     if price:
@@ -1438,11 +1197,6 @@ def tick(state):
     ev = None
     if cur["side"] and not prev_side:
         ev = f"New call: {cur['side']}"
-    elif prev_side and cur["side"] != prev_side:
-        label = {"SELL_FLIP": "Sell flip", "REV_FLIP": "Reversal flip"}.get(cur.get("src"), "Fast flip")
-        ev = f"{label}: SELL {prev_side} → BUY {cur['side']} (confidence {cur['conf']:.0f}%)"
-    elif cur.get("flipped") and not prev_flip:
-        ev = "Signal flipped against the call"
     elif old_who and who != old_who and who != "even" and since_post >= MIN_GAP:
         ev = f"Momentum shift: {who} gaining"
     ev = ev or cur.get("pending_ev")
