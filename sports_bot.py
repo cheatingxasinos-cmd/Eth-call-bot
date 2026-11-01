@@ -4,8 +4,9 @@ import json
 import math
 import os
 import random
+import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -14,17 +15,27 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
+ESPN = "https://site.api.espn.com/apis/site/v2/sports"
 
 # Kalshi game-winner series. VERIFY these tickers on Kalshi. Override with SERIES env (comma list).
 SERIES = [s.strip() for s in os.getenv(
     "SERIES", "KXNBAGAME,KXNFLGAME,KXMLBGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXEPLGAME,KXMLSGAME"
 ).split(",") if s.strip()]
 
+# Kalshi series -> ESPN scoreboard path
+ESPN_LEAGUES = {
+    "KXNBAGAME": "basketball/nba", "KXNFLGAME": "football/nfl", "KXMLBGAME": "baseball/mlb",
+    "KXNHLGAME": "hockey/nhl", "KXNCAAFGAME": "football/college-football",
+    "KXNCAAMBGAME": "basketball/mens-college-basketball", "KXEPLGAME": "soccer/eng.1",
+    "KXMLSGAME": "soccer/usa.1"}
+
 POLL = float(os.getenv("POLL_SECONDS", "30"))
 MIN_ROI = float(os.getenv("MIN_ROI", "0.02"))          # EV / price needed to post
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.06"))    # skip thin markets (bid/ask gap in dollars)
 PMIN, PMAX = float(os.getenv("PMIN", "0.08")), float(os.getenv("PMAX", "0.92"))
 HOURS_AHEAD = float(os.getenv("HOURS_AHEAD", "36"))    # markets closing within this many hours
+ESPN_W = float(os.getenv("ESPN_W", "0.6"))             # weight of ESPN odds in the blend
+ESPN_TTL = float(os.getenv("ESPN_TTL", "300"))         # seconds to cache ESPN scoreboards
 TOP_N = int(os.getenv("TOP_N", "3"))
 KELLY_FRAC = float(os.getenv("KELLY_FRAC", "0.25"))
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", str(345 * 60)))
@@ -100,7 +111,128 @@ def fee(p):
     return math.ceil(0.07 * p * (1 - p) * 100) / 100
 
 
-# ---------- EV from sibling markets ----------
+# ---------- espn odds (public, no key) ----------
+ESPN_CACHE = {}
+
+
+def american_to_prob(v):
+    if v is None:
+        return None
+    s = str(v).strip().upper()
+    if s in ("EVEN", "EV", "PK"):
+        return 0.5
+    try:
+        n = float(s.replace("+", ""))
+    except ValueError:
+        return None
+    if n == 0:
+        return None
+    return 100 / (n + 100) if n > 0 else -n / (-n + 100)
+
+
+def _ml(o, side):
+    t = o.get(f"{side}TeamOdds") or {}
+    if t.get("moneyLine") is not None:
+        return t["moneyLine"]
+    m = (o.get("moneyline") or {}).get(side) or {}
+    for k in ("close", "open"):
+        v = (m.get(k) or {}).get("odds")
+        if v is not None:
+            return v
+    return None
+
+
+def _draw(o):
+    d = o.get("drawOdds") or {}
+    if d.get("moneyLine") is not None:
+        return d["moneyLine"]
+    m = (o.get("moneyline") or {}).get("draw") or {}
+    for k in ("close", "open"):
+        v = (m.get(k) or {}).get("odds")
+        if v is not None:
+            return v
+    return None
+
+
+def _words(s):
+    return {w for w in re.findall(r"[a-z]+", (s or "").lower()) if len(w) >= 3}
+
+
+def team_tokens(t):
+    return _words(" ".join(str(t.get(k, "")) for k in ("displayName", "location", "name", "shortDisplayName")))
+
+
+def espn_games(series):
+    """Today's and tomorrow's games with a de-vigged moneyline, cached for ESPN_TTL seconds."""
+    path = ESPN_LEAGUES.get(series)
+    if not path:
+        return []
+    c = ESPN_CACHE.get(series)
+    if c and time.time() - c[0] < ESPN_TTL:
+        return c[1]
+    games, seen = [], set()
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y%m%d")
+    for day in (None, tomorrow):
+        try:
+            data = get_json(f"{ESPN}/{path}/scoreboard", {"dates": day} if day else None)
+        except Exception as e:
+            print("espn error", series, repr(e), flush=True)
+            continue
+        for ev in data.get("events", []):
+            if ev.get("id") in seen:
+                continue
+            seen.add(ev.get("id"))
+            try:
+                comp = ev["competitions"][0]
+                odds = comp.get("odds") or []
+                if not odds:
+                    continue
+                o = odds[0]
+                teams = {c_["homeAway"]: c_["team"] for c_ in comp["competitors"]}
+                ph, pa = american_to_prob(_ml(o, "home")), american_to_prob(_ml(o, "away"))
+                if ph is None or pa is None:
+                    continue
+                parts = {"home": ph, "away": pa}
+                pd_ = american_to_prob(_draw(o))
+                if pd_ is not None:
+                    parts["draw"] = pd_
+                tot = sum(parts.values())
+                games.append({"start": ts(ev["date"]), "fair": {k: v / tot for k, v in parts.items()},
+                              "home": team_tokens(teams["home"]), "away": team_tokens(teams["away"])})
+            except Exception:
+                continue
+    ESPN_CACHE[series] = (time.time(), games)
+    return games
+
+
+def match_espn(m, games, end):
+    """Return (side, game) if this Kalshi market clearly pays on one ESPN team (or the draw)."""
+    sub = (m.get("yes_sub_title") or "").lower().strip()
+    subt, title = _words(sub), _words(m.get("title"))
+    best = None
+    for g in games:
+        if not (-3600 < end - g["start"] < 48 * 3600):
+            continue
+        if sub in ("tie", "draw"):
+            if "draw" not in g["fair"] or not (g["home"] & title and g["away"] & title):
+                continue
+            cand = ("draw", g)
+        else:
+            sh, sa = len(subt & g["home"]), len(subt & g["away"])
+            if sh == sa:
+                continue
+            side = "home" if sh > sa else "away"
+            other = g["away"] if side == "home" else g["home"]
+            if not (other & title):
+                continue
+            cand = (side, g)
+        if best is not None:
+            return None  # ambiguous
+        best = cand
+    return best
+
+
+# ---------- EV ----------
 def evaluate(m, p_yes):
     ya, yb = dollars(m, "yes_ask"), dollars(m, "yes_bid")
     best = None
@@ -115,16 +247,21 @@ def evaluate(m, p_yes):
     return best
 
 
+LAST_LOG = [0.0]
+
+
 def scan():
-    """Group markets by game. Fair price = each outcome's bid/ask midpoint, rescaled so all
-    outcomes of the game add to 100%. A pick is a side whose price lags that fair value."""
+    """Fair value = ESPN moneyline (de-vigged) blended with Kalshi's sibling-market midpoint.
+    Falls back to the Kalshi-only value when ESPN has no matching line."""
     picks, now = [], time.time()
+    n_mk = n_match = 0
     for series in SERIES:
         try:
             mkts = kalshi_markets(series)
         except Exception as e:
             print("scan error", series, repr(e), flush=True)
             continue
+        games = espn_games(series)
         events = {}
         for m in mkts:
             events.setdefault(m.get("event_ticker") or m["ticker"], []).append(m)
@@ -148,13 +285,25 @@ def scan():
                     continue
                 if not (0 < end - now < HOURS_AHEAD * 3600):
                     continue
-                r = evaluate(m, mid / tot)
+                n_mk += 1
+                kfair = mid / tot
+                fair, src = kfair, "Kalshi"
+                hit = match_espn(m, games, end)
+                if hit:
+                    side, g = hit
+                    fair = ESPN_W * g["fair"][side] + (1 - ESPN_W) * kfair
+                    src = "ESPN+Kalshi"
+                    n_match += 1
+                r = evaluate(m, fair)
                 if r and r["roi"] >= MIN_ROI:
                     title = (m.get("title") or "").replace(" Winner?", "")
                     picks.append({**r, "ticker": m["ticker"], "series": series,
                                   "team": m.get("yes_sub_title") or m["ticker"], "title": title,
                                   "game": title or m["ticker"], "commence": end,
-                                  "p_yes": mid / tot, "books": len(ms)})
+                                  "p_yes": fair, "books": len(ms), "src": src})
+    if now - LAST_LOG[0] >= 300:
+        LAST_LOG[0] = now
+        print(f"scan: {n_mk} markets, {n_match} matched to ESPN, {len(picks)} picks", flush=True)
     return sorted(picks, key=lambda x: -x["roi"])
 
 
@@ -214,6 +363,7 @@ def render_frames(p, outcome, S, n):
     W, H = int(CW * S), int(CH * S)
     accent = {"win": C_UP, "loss": C_DN}.get(outcome)
     price, fair = p["price"], p["p"]
+    src = p.get("src", "Kalshi")
     edge = (fair - price) * 100
     side_col = C_UP if p["side"] == "YES" else C_DN
     pts = p.get("pts") or [[time.time(), price, fair]]
@@ -258,7 +408,7 @@ def render_frames(p, outcome, S, n):
     # ---- stat cards ----
     ev_c = C_UP if edge >= 0 else C_DN
     cards = [("KALSHI PRICE", f"{price * 100:.0f}c", ORG, p["side"] + " ask", None),
-             ("IMPLIED FAIR", f"{fair * 100:.1f}%", CYAN, "from sibling markets", None),
+             ("IMPLIED FAIR", f"{fair * 100:.1f}%", CYAN, src + " blend", None),
              ("EDGE", f"{edge:+.1f} pts", ev_c, f"EV {p['ev'] * 100:+.1f}c after fees", edge >= 0)]
     cwid = (672 - 20) / 3
     for i, (lab, val, col, sub, arrow) in enumerate(cards):
@@ -410,7 +560,7 @@ def render_frames(p, outcome, S, n):
     _arrow(d, k(64), k(813), p["side"] == "YES", k(15), (255, 255, 255, 255))
     d.text((k(380), k(800)), f"BUY {p['side']} at {price * 100:.0f}c · {1 / price:.2f}x payout",
            font=F(21), fill=WHITE, anchor="mm")
-    d.text((k(380), k(828)), f"{p['books']}-way market · {p['ticker'][-14:]}", font=F(12, False),
+    d.text((k(380), k(828)), f"{src} · {p['ticker'][-14:]}", font=F(12, False),
            fill=(255, 255, 255, 215), anchor="mm")
 
     # ---- animated frames ----
@@ -468,8 +618,8 @@ def build_embed(p, state, outcome=None):
     who = p["team"] if p["side"] == "YES" else f"against {p['team']}"
     lines = [f"**Game:** {p['game']}",
              f"**Pick:** Buy **{p['side']}** at {p['price'] * 100:.0f}c ({who})",
-             f"**Implied fair prob:** {p['p'] * 100:.1f}% vs price {p['price'] * 100:.0f}c "
-             f"(from {p['books']} sibling markets)",
+             f"**Fair win prob:** {p['p'] * 100:.1f}% vs price {p['price'] * 100:.0f}c "
+             f"(source: {p.get('src', 'Kalshi')})",
              f"**EV:** {p['ev']:+.3f} per $1 contract after fees ({p['roi'] * 100:+.1f}% ROI)",
              f"**Suggested stake:** {p['kelly'] * 100:.1f}% of bankroll (quarter Kelly)",
              f"**Closes about:** <t:{int(p['commence'])}:R>", f"**Market:** `{p['ticker']}`"]
@@ -556,7 +706,7 @@ def tick(state):
         if t in state["open"]:
             old = state["open"][t]
             if now < old["commence"]:
-                old.update({k: p[k] for k in ("p", "price", "ev", "roi", "kelly", "books")})
+                old.update({k: p[k] for k in ("p", "price", "ev", "roi", "kelly", "books", "src")})
                 old["pts"] = (old.get("pts", []) + [[round(now), round(p["price"], 4), round(p["p"], 4)]])[-600:]
                 if now - old.get("last_edit", 0) >= EDIT_SECONDS:
                     try:
