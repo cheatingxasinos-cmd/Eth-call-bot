@@ -3,8 +3,6 @@ import io
 import json
 import math
 import os
-import re
-import statistics
 import time
 from datetime import datetime, timezone
 
@@ -14,24 +12,18 @@ from urllib3.util.retry import Retry
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
-ODDS_KEY = os.environ["ODDS_API_KEY"]
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
-ODDS = "https://api.the-odds-api.com/v4"
 
-# Kalshi series ticker -> Odds API sport key. VERIFY the Kalshi tickers against your account.
-SPORTS = json.loads(os.getenv("SPORTS_JSON", json.dumps({
-    "KXNBAGAME": "basketball_nba", "KXNFLGAME": "americanfootball_nfl",
-    "KXMLBGAME": "baseball_mlb", "KXNHLGAME": "icehockey_nhl",
-    "KXNCAAFGAME": "americanfootball_ncaaf", "KXNCAAMBGAME": "basketball_ncaab",
-    "KXEPLGAME": "soccer_epl", "KXMLSGAME": "soccer_usa_mls"})))
+# Kalshi game-winner series. VERIFY these tickers on Kalshi. Override with SERIES env (comma list).
+SERIES = [s.strip() for s in os.getenv(
+    "SERIES", "KXNBAGAME,KXNFLGAME,KXMLBGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXEPLGAME,KXMLSGAME"
+).split(",") if s.strip()]
 
-POLL = float(os.getenv("POLL_SECONDS", "60"))
-ODDS_TTL = float(os.getenv("ODDS_TTL", "600"))        # each refresh costs ~2 API credits per sport
-REGIONS = os.getenv("ODDS_REGIONS", "us,eu")          # eu brings in Pinnacle
-MIN_ROI = float(os.getenv("MIN_ROI", "0.04"))         # EV / price needed to post
-MIN_BOOKS = int(os.getenv("MIN_BOOKS", "4"))
+POLL = float(os.getenv("POLL_SECONDS", "30"))
+MIN_ROI = float(os.getenv("MIN_ROI", "0.02"))          # EV / price needed to post
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.06"))    # skip thin markets (bid/ask gap in dollars)
 PMIN, PMAX = float(os.getenv("PMIN", "0.08")), float(os.getenv("PMAX", "0.92"))
-HOURS_AHEAD = float(os.getenv("HOURS_AHEAD", "24"))
+HOURS_AHEAD = float(os.getenv("HOURS_AHEAD", "36"))    # markets closing within this many hours
 TOP_N = int(os.getenv("TOP_N", "3"))
 KELLY_FRAC = float(os.getenv("KELLY_FRAC", "0.25"))
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", str(345 * 60)))
@@ -86,7 +78,7 @@ def save_state(s):
     os.replace(STATE_FILE + ".tmp", STATE_FILE)
 
 
-# ---------- kalshi ----------
+# ---------- kalshi (public, no key) ----------
 def dollars(m, key):
     v = m.get(key + "_dollars")
     v = float(v) if v is not None else (float(m[key]) / 100 if m.get(key) is not None else None)
@@ -107,57 +99,7 @@ def fee(p):
     return math.ceil(0.07 * p * (1 - p) * 100) / 100
 
 
-# ---------- fair odds ----------
-ODDS_CACHE = {}
-
-
-def odds_events(sport):
-    c = ODDS_CACHE.get(sport)
-    if c and time.time() - c[0] < ODDS_TTL:
-        return c[1]
-    ev = get_json(f"{ODDS}/sports/{sport}/odds",
-                  {"apiKey": ODDS_KEY, "regions": REGIONS, "markets": "h2h", "oddsFormat": "decimal"})
-    ODDS_CACHE[sport] = (time.time(), ev)
-    return ev
-
-
-def fair_probs(event):
-    """De-vig every book, then blend Pinnacle (if present) with the cross-book median."""
-    books = {}
-    for b in event.get("bookmakers", []):
-        mk = next((m for m in b["markets"] if m["key"] == "h2h"), None)
-        if not mk:
-            continue
-        inv = {o["name"]: 1 / o["price"] for o in mk["outcomes"] if o["price"] > 1}
-        tot = sum(inv.values())
-        if len(inv) >= 2 and tot > 0:
-            books[b["key"]] = {n: v / tot for n, v in inv.items()}
-    if len(books) < MIN_BOOKS:
-        return {}
-    out = {}
-    for n in set().union(*[set(v) for v in books.values()]):
-        med = statistics.median(v[n] for v in books.values() if n in v)
-        sharp = books.get("pinnacle", {}).get(n)
-        out[n] = 0.6 * sharp + 0.4 * med if sharp is not None else med
-    return out
-
-
-def toks(s):
-    return {t for t in re.findall(r"[a-z]+", (s or "").lower()) if len(t) >= 4}
-
-
-def match_team(m, ev):
-    """Which team does this YES contract pay on? None if unclear. THE fragile step, so test it."""
-    sub, title = toks(m.get("yes_sub_title")), toks(m.get("title"))
-    h, a = ev["home_team"], ev["away_team"]
-    hit_h, hit_a = bool(sub & toks(h)), bool(sub & toks(a))
-    if hit_h == hit_a:
-        return None  # no match or ambiguous
-    name, other = (h, a) if hit_h else (a, h)
-    return name if (title & toks(other)) else None
-
-
-# ---------- EV ----------
+# ---------- EV from sibling markets ----------
 def evaluate(m, p_yes):
     ya, yb = dollars(m, "yes_ask"), dollars(m, "yes_bid")
     best = None
@@ -173,27 +115,45 @@ def evaluate(m, p_yes):
 
 
 def scan():
-    picks = []
-    for series, sport in SPORTS.items():
+    """Group markets by game. Fair price = each outcome's bid/ask midpoint, rescaled so all
+    outcomes of the game add to 100%. A pick is a side whose price lags that fair value."""
+    picks, now = [], time.time()
+    for series in SERIES:
         try:
-            mkts, evs = kalshi_markets(series), odds_events(sport)
+            mkts = kalshi_markets(series)
         except Exception as e:
             print("scan error", series, repr(e), flush=True)
             continue
-        evs = [e for e in evs if 0 < ts(e["commence_time"]) - time.time() < HOURS_AHEAD * 3600]
-        fairs = {e["id"]: fair_probs(e) for e in evs}
+        events = {}
         for m in mkts:
-            hits = [(e, n) for e in evs if (n := match_team(m, e))]
-            if len(hits) != 1:
+            events.setdefault(m.get("event_ticker") or m["ticker"], []).append(m)
+        for ms in events.values():
+            if len(ms) < 2:
                 continue
-            e, name = hits[0]
-            p = fairs[e["id"]].get(name)
-            r = evaluate(m, p) if p is not None else None
-            if r and r["roi"] >= MIN_ROI:
-                picks.append({**r, "ticker": m["ticker"], "series": series, "team": name,
-                              "title": m.get("title", ""), "game": f'{e["away_team"]} at {e["home_team"]}',
-                              "commence": ts(e["commence_time"]), "p_yes": p,
-                              "books": len(e.get("bookmakers", []))})
+            q = []
+            for m in ms:
+                b, a = dollars(m, "yes_bid"), dollars(m, "yes_ask")
+                if b is None or a is None or a < b or a - b > MAX_SPREAD:
+                    q = None
+                    break
+                q.append((m, (a + b) / 2))
+            if not q:
+                continue
+            tot = sum(mid for _, mid in q)
+            for m, mid in q:
+                try:
+                    end = ts(m.get("expected_expiration_time") or m["close_time"])
+                except Exception:
+                    continue
+                if not (0 < end - now < HOURS_AHEAD * 3600):
+                    continue
+                r = evaluate(m, mid / tot)
+                if r and r["roi"] >= MIN_ROI:
+                    title = (m.get("title") or "").replace(" Winner?", "")
+                    picks.append({**r, "ticker": m["ticker"], "series": series,
+                                  "team": m.get("yes_sub_title") or m["ticker"], "title": title,
+                                  "game": title or m["ticker"], "commence": end,
+                                  "p_yes": mid / tot, "books": len(ms)})
     return sorted(picks, key=lambda x: -x["roi"])
 
 
@@ -249,12 +209,12 @@ def render_frames(p, outcome, S, n):
     edge = (p["p"] - p["price"]) * 100
 
     # header
-    d.text((k(24), k(46)), f"{p['team']} · {p['side']}", font=F(30), fill=WHITE, anchor="lm")
-    d.text((k(24), k(80)), p["game"], font=F(14, False), fill=MUTED, anchor="lm")
+    d.text((k(24), k(46)), f"{p['team']} · {p['side']}", font=F(26), fill=WHITE, anchor="lm")
+    d.text((k(24), k(80)), p["game"][:60], font=F(14, False), fill=MUTED, anchor="lm")
     if outcome:
         btxt, bcol = outcome.upper(), accent
     else:
-        btxt, bcol = "Starts " + _hhmm(p["commence"] - time.time()), (255, 255, 255)
+        btxt, bcol = "Closes " + _hhmm(p["commence"] - time.time()), (255, 255, 255)
     bw = d.textlength(btxt, font=F(20)) / S + 36
     d.rounded_rectangle([k(696 - bw), k(28), k(696), k(76)], radius=k(16), fill=(255, 255, 255, 26),
                         outline=bcol + (190,), width=lw(2))
@@ -263,7 +223,7 @@ def render_frames(p, outcome, S, n):
     # price row
     d.text((k(24), k(124)), f"Kalshi price ({p['side']})", font=F(15, False), fill=MUTED, anchor="ls")
     d.text((k(24), k(166)), f"{p['price'] * 100:.0f}c", font=F(32), fill=ORG + (255,), anchor="ls")
-    d.text((k(260), k(124)), "Fair probability", font=F(15, False), fill=MUTED, anchor="ls")
+    d.text((k(260), k(124)), "Implied fair", font=F(15, False), fill=MUTED, anchor="ls")
     d.text((k(260), k(166)), f"{p['p'] * 100:.1f}%", font=F(32), fill=CYAN + (255,), anchor="ls")
     ec = C_UP if edge >= 0 else C_DN
     d.text((k(500), k(124)), "Edge", font=F(15, False), fill=MUTED, anchor="ls")
@@ -304,7 +264,7 @@ def render_frames(p, outcome, S, n):
         d.text((PX0 + k(6), ey - k(9)), f"ENTRY {p['entry_price'] * 100:.0f}c", font=F(10),
                fill=AMBER + (255,), anchor="lm")
     d.text((PX0 + k(6), PY0 - k(10)), "Kalshi price", font=F(11), fill=ORG + (255,), anchor="lm")
-    d.text((PX0 + k(90), PY0 - k(10)), "Book fair prob", font=F(11), fill=CYAN + (255,), anchor="lm")
+    d.text((PX0 + k(90), PY0 - k(10)), "Implied fair", font=F(11), fill=CYAN + (255,), anchor="lm")
     lx, lpy, lfy = X(pts[-1][0]), Y(pts[-1][1] * 100), Y(pts[-1][2] * 100)
     for cy, c in ((lpy, ORG), (lfy, CYAN)):
         d.ellipse([lx - k(4), cy - k(4), lx + k(4), cy + k(4)], fill=c + (255,))
@@ -330,7 +290,7 @@ def render_frames(p, outcome, S, n):
                         outline=(accent + (255,)) if accent else None, width=lw(3))
     d.text((k(360), k(574)), f"BUY {p['side']} at {p['price'] * 100:.0f}c, pays 100c", font=F(20),
            fill=WHITE, anchor="mm")
-    d.text((k(360), k(600)), f"{p['books']} books · ticker {p['ticker'][-14:]}", font=F(12, False),
+    d.text((k(360), k(600)), f"{p['books']}-way market · {p['ticker'][-14:]}", font=F(12, False),
            fill=(255, 255, 255, 215), anchor="mm")
 
     frames = []
@@ -385,17 +345,18 @@ def build_embed(p, state, outcome=None):
     who = p["team"] if p["side"] == "YES" else f"against {p['team']}"
     lines = [f"**Game:** {p['game']}",
              f"**Pick:** Buy **{p['side']}** at {p['price'] * 100:.0f}c ({who})",
-             f"**Fair win prob:** {p['p'] * 100:.1f}% vs price {p['price'] * 100:.0f}c ({p['books']} books)",
+             f"**Implied fair prob:** {p['p'] * 100:.1f}% vs price {p['price'] * 100:.0f}c "
+             f"(from {p['books']} sibling markets)",
              f"**EV:** {p['ev']:+.3f} per $1 contract after fees ({p['roi'] * 100:+.1f}% ROI)",
              f"**Suggested stake:** {p['kelly'] * 100:.1f}% of bankroll (quarter Kelly)",
-             f"**Starts:** <t:{int(p['commence'])}:R>", f"**Market:** `{p['ticker']}`"]
+             f"**Closes about:** <t:{int(p['commence'])}:R>", f"**Market:** `{p['ticker']}`"]
     if outcome in ("win", "loss"):
         title = f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} | {p['game']}"
         color = GREEN if outcome == "win" else RED
         lines.insert(0, f"**Result:** {p['pnl']:+.2f}u")
     else:
         title, color = f"{'🆙' if p['side'] == 'YES' else '⬇️'} +EV: {p['team']} {p['side']}", GREEN
-    return {"title": title, "description": "\n".join(lines), "color": color,
+    return {"title": title[:250], "description": "\n".join(lines), "color": color,
             "fields": [{"name": "Record", "value": rec, "inline": True},
                        {"name": "P&L", "value": pnl, "inline": True},
                        {"name": "Avg predicted EV", "value": avg, "inline": True}],
@@ -442,7 +403,7 @@ def post(p, state, outcome=None):
 # ---------- core ----------
 def settle(state):
     for t, p in list(state["open"].items()):
-        if time.time() < p["commence"] + 1800:
+        if time.time() < p["commence"]:
             continue
         try:
             res = kalshi_market(t).get("result")
