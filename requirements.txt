@@ -1,4 +1,2 @@
 requests
 pillow
-websocket-client
-cryptography
