@@ -40,9 +40,10 @@ TOP_N = int(os.getenv("TOP_N", "5"))
 MAX_OPEN = int(os.getenv("MAX_OPEN", "25"))
 KELLY_FRAC = float(os.getenv("KELLY_FRAC", "0.25"))
 MAX_STAKE = float(os.getenv("MAX_STAKE", "0.05"))
-MIN_GROWTH = float(os.getenv("MIN_GROWTH", "0.0002"))
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.015"))
-UNCERT = float(os.getenv("UNCERT", "0.01"))
+MIN_GROWTH = float(os.getenv("MIN_GROWTH", "0.0001"))
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.01"))
+UNCERT = float(os.getenv("UNCERT", "0.005"))
+HOURLY = float(os.getenv("HOURLY_SECONDS", "3600"))
 REQUIRE_BOOK = os.getenv("REQUIRE_BOOK", "1" if ODDS_KEY else "0") == "1"
 ARB_MIN = float(os.getenv("ARB_MIN", "0.01"))          # min locked profit per set, in dollars
 ARB_REPEAT = float(os.getenv("ARB_REPEAT", "1800"))    # seconds before re-alerting the same game
@@ -312,8 +313,9 @@ def in_window(m, now):
 
 
 def scan():
-    """Returns (picks, marks, arbs). marks[ticker] = (fair_yes, margin, yes_ask, yes_bid) for live updates."""
-    picks, marks, arbs, now = [], {}, [], time.time()
+    """Returns (picks, relaxed, marks, arbs).
+    marks[ticker] = (fair_yes, margin, yes_ask, yes_bid) for live updates of open picks."""
+    picks, relaxed, marks, arbs, now = [], [], {}, [], time.time()
     st = {"markets": 0, "no_quote": 0, "wide": 0, "no_book": 0, "no_edge": 0, "thin": 0, "matched": 0}
     near = None
     for series in SERIES:
@@ -372,25 +374,30 @@ def scan():
                 if near is None or raw > near[0]:
                     near = (raw, m["ticker"], src)
                 r = evaluate(m, fair, margin)
-                if not r:
-                    st["no_edge"] += 1
-                    continue
-                if r["growth"] < MIN_GROWTH or r["edge"] < MIN_EDGE:
-                    st["thin"] += 1
-                    continue
                 title = (m.get("title") or "").replace(" Winner?", "")
-                picks.append({**r, "ticker": m["ticker"], "series": series, "event": ev_key,
-                              "team": m.get("yes_sub_title") or m["ticker"], "title": title,
-                              "game": title or m["ticker"], "commence": end,
-                              "p_yes": fair, "books": len(ms), "src": src})
+                base_pick = {"ticker": m["ticker"], "series": series, "event": ev_key,
+                             "team": m.get("yes_sub_title") or m["ticker"], "title": title,
+                             "game": title or m["ticker"], "commence": end,
+                             "p_yes": fair, "books": len(ms), "src": src}
+                if r and r["growth"] >= MIN_GROWTH and r["edge"] >= MIN_EDGE:
+                    picks.append({**r, **base_pick})
+                    continue
+                r0 = evaluate(m, fair, 0.0)   # relaxed: no safety margin, EV must still be positive
+                if r0 and r0["ev"] > 0:
+                    relaxed.append({**r0, **base_pick, "src": src + " (low confidence)",
+                                    "lowconf": True})
+                    st["thin"] += 1
+                else:
+                    st["no_edge"] += 1
     if now - LAST_LOG[0] >= 120:
         LAST_LOG[0] = now
         nr = f"{near[0] * 100:+.1f}c on {near[1]} ({near[2]})" if near else "n/a"
         print(f"scan: {st['markets']} markets | book-matched {st['matched']} | no quote {st['no_quote']} | "
               f"wide {st['wide']} | no book {st['no_book']} | no edge {st['no_edge']} | "
-              f"thin {st['thin']} | PICKS {len(picks)} | ARBS {len(arbs)} | "
+              f"thin {st['thin']} | PICKS {len(picks)} | LOWCONF {len(relaxed)} | ARBS {len(arbs)} | "
               f"api {'DOWN' if API_DOWN[0] else 'ok'} | best raw edge {nr}", flush=True)
-    return sorted(picks, key=lambda x: -x["growth"]), marks, arbs
+    return (sorted(picks, key=lambda x: -x["growth"]),
+            sorted(relaxed, key=lambda x: -x["growth"]), marks, arbs)
 
 
 # ---------- chart ----------
@@ -491,7 +498,7 @@ def render_frames(p, outcome, S, n):
 
     ev_c = C_UP if edge >= 0 else C_DN
     cards = [("KALSHI PRICE", f"{price * 100:.0f}c", ORG, p["side"] + " ask", None),
-             ("IMPLIED FAIR", f"{fair * 100:.1f}%", CYAN, src + " blend", None),
+             ("IMPLIED FAIR", f"{fair * 100:.1f}%", CYAN, src[:22] + " blend", None),
              ("EDGE", f"{edge:+.1f} pts", ev_c, f"EV {p['ev'] * 100:+.1f}c after fees", edge >= 0)]
     cwid = (672 - 20) / 3
     for i, (lab, val, col, sub, arrow) in enumerate(cards):
@@ -634,7 +641,7 @@ def render_frames(p, outcome, S, n):
     _arrow(d, k(64), k(813), p["side"] == "YES", k(15), (255, 255, 255, 255))
     d.text((k(380), k(800)), f"BUY {p['side']} at {price * 100:.0f}c · {1 / price:.2f}x payout",
            font=F(21), fill=WHITE, anchor="mm")
-    d.text((k(380), k(828)), f"{src} · {p['ticker'][-14:]}", font=F(12, False),
+    d.text((k(380), k(828)), f"{src[:24]} · {p['ticker'][-14:]}", font=F(12, False),
            fill=(255, 255, 255, 215), anchor="mm")
 
     frames = []
@@ -709,6 +716,8 @@ def build_embed(p, state, outcome=None):
         lines.insert(0, f"**Result:** {p['pnl']:+.2f}u")
     else:
         title, color = f"{'🆙' if p['side'] == 'YES' else '⬇️'} PICK: {p['team']} {p['side']}", GREEN
+        if p.get("lowconf"):
+            title, color = "⚠️ LOW CONFIDENCE " + title, GREY
     arb_txt = f"{state['arb_count']} found | {state['arb_locked']:+.2f}u locked" if state["arb_count"] else "none yet"
     return {"title": title[:250], "description": "\n".join(lines), "color": color,
             "fields": [{"name": "Record (win %)", "value": rec, "inline": True},
@@ -769,6 +778,25 @@ def post_arb(a, state):
     send(embed)
 
 
+def post_status(state, best, posted):
+    rec, pnl, avg, last, calib = stats(state["history"])
+    lean = (f"Best lean: {best['team']} {best['side']} at {best['price'] * 100:.0f}c "
+            f"(EV {best['ev']:+.3f})") if best else "No positive-EV market this hour."
+    extra = f"\nPosted a low-confidence pick: {posted['team']} {posted['side']}" if posted else ""
+    embed = {"title": "🕐 Hourly status",
+             "description": f"Open picks: {len(state['open'])}\n"
+                            f"MoneyLine credits today: {BUDGET['used']}/{DAILY_CREDITS} | "
+                            f"API {'DOWN (Kalshi-only)' if API_DOWN[0] else 'ok'}\n"
+                            f"Arbs found: {state['arb_count']}\n{lean}{extra}",
+             "color": GREY,
+             "fields": [{"name": "Record (win %)", "value": rec, "inline": True},
+                        {"name": "Last 20", "value": last, "inline": True},
+                        {"name": "Calibration", "value": calib, "inline": True}],
+             "footer": {"text": "Signals only, not financial advice"},
+             "timestamp": datetime.now(timezone.utc).isoformat()}
+    send(embed)
+
+
 # ---------- core ----------
 def settle(state):
     for t, p in list(state["open"].items()):
@@ -805,7 +833,8 @@ def refresh_open(state, marks, now):
         price = a if yes else 1 - b
         if not (0 < price < 1):
             continue
-        p_ = (fair if yes else 1 - fair) - margin
+        m_ = 0.0 if old.get("lowconf") else margin
+        p_ = (fair if yes else 1 - fair) - m_
         c = price + fee(price)
         old.update({"price": price, "p": p_, "ev": p_ - c, "roi": (p_ - c) / price, "edge": p_ - price})
         old["pts"] = (old.get("pts", []) + [[round(now), round(price, 4), round(p_, 4)]])[-600:]
@@ -819,7 +848,7 @@ def refresh_open(state, marks, now):
 
 def tick(state):
     settle(state)
-    picks, marks, arbs = scan()
+    picks, relaxed, marks, arbs = scan()
     now = time.time()
     refresh_open(state, marks, now)
 
@@ -855,6 +884,36 @@ def tick(state):
         state["open"][t] = p
         locked.add(p["event"])
         fresh += 1
+
+    # hourly floor: low-confidence pick if the hour had none, then a status update
+    if fresh:
+        state["last_pick"] = now
+    posted = None
+    if now - state.get("last_pick", 0) >= HOURLY:
+        for p in relaxed:
+            t = p["ticker"]
+            if t in state["open"] or t in done or p["event"] in locked or len(state["open"]) >= MAX_OPEN:
+                continue
+            p["pts"] = [[round(now), round(p["price"], 4), round(p["p"], 4)]]
+            p["entry_price"], p["last_edit"] = p["price"], now
+            p["p0"], p["ev0"] = p["p"], p["ev"]
+            try:
+                post(p, state)
+            except Exception as e:
+                print("low-confidence send error", repr(e), flush=True)
+                break
+            state["open"][t] = p
+            locked.add(p["event"])
+            state["last_pick"] = now
+            posted = p
+            break
+    if now - state.get("last_status", 0) >= HOURLY:
+        try:
+            post_status(state, relaxed[0] if relaxed else None, posted)
+            state["last_status"] = now
+        except Exception as e:
+            print("status send error", repr(e), flush=True)
+
     state["budget"] = dict(BUDGET)
     save_state(state)
 
