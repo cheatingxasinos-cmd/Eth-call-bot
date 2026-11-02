@@ -473,10 +473,15 @@ def injury_probe():
 
 
 # ---------- pick scoring ----------
-def evaluate(m, p_yes, margin):
+def evaluate(m, p_yes, margin, yes_only=False):
+    """yes_only=True for two-team games: the opposing team's own YES market covers the other side,
+    so a pick is always 'buy YES on the team we like' instead of 'NO against the other team'."""
     ya, yb = dollars(m, "yes_ask"), dollars(m, "yes_bid")
+    sides = [("YES", p_yes, ya)]
+    if not yes_only:
+        sides.append(("NO", 1 - p_yes, None if yb is None else 1 - yb))
     best = None
-    for side, p, price in (("YES", p_yes, ya), ("NO", 1 - p_yes, None if yb is None else 1 - yb)):
+    for side, p, price in sides:
         if price is None or not (PMIN <= price <= PMAX):
             continue
         p = p - margin
@@ -493,11 +498,14 @@ def evaluate(m, p_yes, margin):
     return best
 
 
-def lean(m, p_yes):
+def lean(m, p_yes, yes_only=False):
     """Best side to lean on, even if EV is negative (watchlist only)."""
     ya, yb = dollars(m, "yes_ask"), dollars(m, "yes_bid")
+    sides = [("YES", p_yes, ya)]
+    if not yes_only:
+        sides.append(("NO", 1 - p_yes, None if yb is None else 1 - yb))
     best = None
-    for side, p, price in (("YES", p_yes, ya), ("NO", 1 - p_yes, None if yb is None else 1 - yb)):
+    for side, p, price in sides:
         if price is None or not (PMIN <= price <= PMAX):
             continue
         ev = p - (price + fee(price))
@@ -579,6 +587,9 @@ def scan():
                     continue
                 mids[m["ticker"]] = (a + b) / 2
             tot = sum(v for v in mids.values() if v) if all_ok and len(ms) >= 2 else None
+            # two-team game (no draw): a "NO" on one team is shown as a YES on the other team
+            subs = [(x.get("yes_sub_title") or "").lower().strip() for x in ms]
+            two_way = len(ms) == 2 and not any(s in ("tie", "draw") for s in subs)
             for m in ms:
                 if not in_window(m, now):
                     continue
@@ -609,14 +620,14 @@ def scan():
                 label = full_name(m.get("yes_sub_title"), league, book_name) if m.get("yes_sub_title") else m["ticker"]
                 title = full_game((m.get("title") or "").replace(" Winner?", ""), league)
                 game = f"{league} | {title}" if title else f"{league} | {m['ticker']}"
-                lz = lean(m, fair)
+                lz = lean(m, fair, two_way)
                 if lz:
                     leans.append({**lz, "team": label, "game": game,
                                   "ticker": m["ticker"], "event": ev_key, "src": src})
                 raw = max(fair - a, b - fair)
                 if near is None or raw > near[0]:
                     near = (raw, m["ticker"], src)
-                r = evaluate(m, fair, margin)
+                r = evaluate(m, fair, margin, two_way)
                 base_pick = {"ticker": m["ticker"], "series": series, "event": ev_key,
                              "team": label, "title": title,
                              "game": game, "commence": end,
@@ -624,7 +635,7 @@ def scan():
                 if r and r["growth"] >= MIN_GROWTH and r["edge"] >= MIN_EDGE:
                     picks.append({**r, **base_pick})
                     continue
-                r0 = evaluate(m, fair, 0.0)   # relaxed: no safety margin, EV must still be positive
+                r0 = evaluate(m, fair, 0.0, two_way)   # relaxed: no safety margin, EV must still be positive
                 if r0 and r0["ev"] > 0:
                     relaxed.append({**r0, **base_pick, "src": src + " (low confidence)",
                                     "lowconf": True})
@@ -748,10 +759,11 @@ def render_frames(p, outcome, S, n):
     base.paste(grad, (int(k(CX0)), int(k(CY0))), ring)
     d = ImageDraw.Draw(base, "RGBA")
 
-    # header
+    # header: shows the team we are backing (a NO only appears on 3-way markets like soccer)
     cx, cy = k(50), k(52)
     d.polygon([(cx, cy - k(7)), (cx + k(7), cy), (cx, cy + k(7)), (cx - k(7), cy)], fill=NEON_C + (255,))
-    _sp(d, (k(66), k(52)), f"{p['team'].upper()[:40]}  {p['side']}", M(16), NEON_C + (255,), k(1))
+    head = p["team"] if p["side"] == "YES" else f"{p['team']} NO"
+    _sp(d, (k(66), k(52)), head.upper()[:40], M(16), NEON_C + (255,), k(1))
     _sp(d, (k(44), k(76)), p["game"][:72], M(9, False), MUTED, k(0.5))
     left = p["commence"] - time.time()
     if outcome is None:
@@ -877,8 +889,11 @@ def render_frames(p, outcome, S, n):
     d.rounded_rectangle([k(44), k(404), k(756), k(446)], radius=k(14), fill=side_col + (238,),
                         outline=(accent + (255,)) if accent else None, width=lw(3))
     _arrow(d, k(72), k(425), p["side"] == "YES", k(11), tc)
-    d.text((k(410), k(418)), f"BUY {p['side']} at {price * 100:.0f}c  |  {1 / price:.2f}x payout",
-           font=M(15), fill=tc, anchor="mm")
+    if p["side"] == "YES":
+        bar = f"BET {p['team'].upper()[:26]} at {price * 100:.0f}c  |  {1 / price:.2f}x payout"
+    else:
+        bar = f"BUY NO at {price * 100:.0f}c  |  {1 / price:.2f}x payout"
+    d.text((k(410), k(418)), bar, font=M(15), fill=tc, anchor="mm")
     d.text((k(410), k(435)), p["ticker"][-26:], font=M(8, False), fill=tc, anchor="mm")
 
     frames = []
@@ -938,9 +953,12 @@ def stats(h):
 
 def build_embed(p, state, outcome=None):
     rec, pnl, avg, last, calib = stats(state["history"])
-    who = p["team"] if p["side"] == "YES" else f"against {p['team']}"
+    if p["side"] == "YES":
+        pick_line = f"**Pick:** Bet on **{p['team']}** (Buy YES at {p['price'] * 100:.0f}c)"
+    else:   # only 3-way markets (soccer) and old open picks can still land here
+        pick_line = f"**Pick:** Buy **NO** at {p['price'] * 100:.0f}c ({p['team']} not to win)"
     lines = [f"**Game:** {p['game']}",
-             f"**Pick:** Buy **{p['side']}** at {p['price'] * 100:.0f}c ({who})",
+             pick_line,
              f"**Fair win prob:** {p['p'] * 100:.1f}% vs price {p['price'] * 100:.0f}c "
              f"(source: {p.get('src', 'Kalshi')})",
              f"**Edge:** {p['edge'] * 100:+.1f} pts | **Growth score:** {p.get('growth', 0) * 1000:+.2f}",
@@ -952,7 +970,8 @@ def build_embed(p, state, outcome=None):
         color = GREEN if outcome == "win" else RED
         lines.insert(0, f"**Result:** {p['pnl']:+.2f}u")
     else:
-        title, color = f"{'🆙' if p['side'] == 'YES' else '⬇️'} PICK: {p['team']} {p['side']}", GREEN
+        title = f"🆙 PICK: {p['team']}" if p["side"] == "YES" else f"⬇️ PICK: {p['team']} NOT to win"
+        color = GREEN
         if p.get("lowconf"):
             title, color = "⚠️ LOW CONFIDENCE " + title, GREY
     arb_txt = f"{state['arb_count']} found | {state['arb_locked']:+.2f}u locked" if state["arb_count"] else "none yet"
