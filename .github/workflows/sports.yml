@@ -26,8 +26,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: sports_state.json
-          key: sports-state-${{ github.run_id }}
-          restore-keys: sports-state-
+          key: sports-state-v2-${{ github.run_id }}
+          restore-keys: sports-state-v2-
 
       - name: Run bot
         run: python sports_bot.py
@@ -46,4 +46,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: sports_state.json
-          key: sports-state-${{ github.run_id }}
+          key: sports-state-v2-${{ github.run_id }}
