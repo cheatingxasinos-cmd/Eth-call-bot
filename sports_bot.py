@@ -18,26 +18,28 @@ ODDS_KEY = os.environ.get("ODDS_API_KEY", "")
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 ODDS_API = "https://api.the-odds-api.com/v4/sports"
 
-# Kalshi game-winner series. Override with SERIES env (comma list).
+# Kalshi series scanned every tick (free, no key).
 SERIES = [s.strip() for s in os.getenv(
     "SERIES", "KXNBAGAME,KXNFLGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXEPLGAME,KXMLSGAME"
 ).split(",") if s.strip()]
+# Only these series spend Odds API credits (keeps the free 500/month plan alive).
+ODDS_SERIES = {s.strip() for s in os.getenv(
+    "ODDS_SERIES", "KXNBAGAME,KXNFLGAME,KXNHLGAME").split(",") if s.strip()}
 
-# Kalshi series -> The Odds API sport key
 ODDS_SPORTS = {
     "KXNBAGAME": "basketball_nba", "KXNFLGAME": "americanfootball_nfl",
     "KXMLBGAME": "baseball_mlb", "KXNHLGAME": "icehockey_nhl",
     "KXNCAAFGAME": "americanfootball_ncaaf", "KXNCAAMBGAME": "basketball_ncaab",
     "KXEPLGAME": "soccer_epl", "KXMLSGAME": "soccer_usa_mls"}
 
-BOOKS = os.getenv("ODDS_BOOKS", "draftkings").strip()   # "" = average all US books
+BOOKS = os.getenv("ODDS_BOOKS", "draftkings").strip()
 SRC_LABEL = "DraftKings" if BOOKS == "draftkings" else "Books"
-POLL = float(os.getenv("POLL_SECONDS", "30"))
+POLL = float(os.getenv("POLL_SECONDS", "15"))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))
 PMIN, PMAX = float(os.getenv("PMIN", "0.15")), float(os.getenv("PMAX", "0.92"))
 HOURS_AHEAD = float(os.getenv("HOURS_AHEAD", "48"))
-BOOK_W = float(os.getenv("BOOK_W", "0.75"))            # weight of sportsbook odds in the blend
-ODDS_TTL = float(os.getenv("ODDS_TTL", "1800"))        # seconds between odds refreshes (protects quota)
+BOOK_W = float(os.getenv("BOOK_W", "0.75"))
+ODDS_TTL = float(os.getenv("ODDS_TTL", "21600"))
 TOP_N = int(os.getenv("TOP_N", "5"))
 MAX_OPEN = int(os.getenv("MAX_OPEN", "25"))
 KELLY_FRAC = float(os.getenv("KELLY_FRAC", "0.25"))
@@ -45,7 +47,9 @@ MAX_STAKE = float(os.getenv("MAX_STAKE", "0.05"))
 MIN_GROWTH = float(os.getenv("MIN_GROWTH", "0.0002"))
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.015"))
 UNCERT = float(os.getenv("UNCERT", "0.01"))
-REQUIRE_BOOK = os.getenv("REQUIRE_BOOK", "1") == "1"
+REQUIRE_BOOK = os.getenv("REQUIRE_BOOK", "1" if ODDS_KEY else "0") == "1"
+ARB_MIN = float(os.getenv("ARB_MIN", "0.01"))          # min locked profit per set, in dollars
+ARB_REPEAT = float(os.getenv("ARB_REPEAT", "1800"))    # seconds before re-alerting the same game
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", str(345 * 60)))
 STATE_FILE = os.getenv("STATE_FILE", "sports_state.json")
 EDIT_SECONDS = float(os.getenv("EDIT_SECONDS", "120"))
@@ -66,7 +70,7 @@ def _session(retries):
 
 DATA = _session(Retry(total=2, backoff_factor=0.2, status_forcelist=(429, 500, 502, 503, 504),
                       allowed_methods=frozenset(["GET"]), respect_retry_after_header=True))
-HOOK = _session(0)  # no blind POST retries, so a post can never double
+HOOK = _session(0)
 
 
 def get_json(url, params=None, timeout=(3.05, 10)):
@@ -84,11 +88,14 @@ def load_state():
     try:
         with open(STATE_FILE) as f:
             s = json.load(f)
-        s.setdefault("history", [])
-        s.setdefault("open", {})
-        return s
     except Exception:
-        return {"history": [], "open": {}}
+        s = {}
+    s.setdefault("history", [])
+    s.setdefault("open", {})
+    s.setdefault("arbs", {})
+    s.setdefault("arb_count", 0)
+    s.setdefault("arb_locked", 0.0)
+    return s
 
 
 def save_state(s):
@@ -115,14 +122,13 @@ def kalshi_market(ticker):
 
 
 def fee(p):
-    """Kalshi taker fee for one contract, rounded up to the cent (conservative for 1 contract)."""
+    """Kalshi taker fee for one contract, rounded up to the cent."""
     return math.ceil(0.07 * p * (1 - p) * 100) / 100
 
 
-# ---------- sportsbook odds (The Odds API) ----------
+# ---------- sportsbook odds (The Odds API, optional) ----------
 ODDS_CACHE = {}
 
-# generic words that appear in many team names and cause false ties when matching
 STOP = {"state", "university", "college", "the", "city", "united", "fc", "sc", "new", "los", "san",
         "saint", "north", "south", "east", "west", "tech", "univ", "and", "vs"}
 
@@ -147,9 +153,8 @@ def _words(s):
 
 
 def odds_games(series):
-    """De-vigged moneyline from the chosen sportsbook(s), cached for ODDS_TTL seconds."""
     key = ODDS_SPORTS.get(series)
-    if not key or not ODDS_KEY:
+    if not key or not ODDS_KEY or series not in ODDS_SERIES:
         return []
     c = ODDS_CACHE.get(series)
     if c and time.time() - c[0] < ODDS_TTL:
@@ -163,7 +168,7 @@ def odds_games(series):
         data = get_json(f"{ODDS_API}/{key}/odds", params)
     except Exception as e:
         print("odds error", series, repr(e), flush=True)
-        ODDS_CACHE[series] = (time.time(), [])  # back off so errors do not burn quota
+        ODDS_CACHE[series] = (time.time(), [])
         return []
     games = []
     for ev in data:
@@ -203,7 +208,6 @@ def odds_games(series):
 
 
 def match_game(m, games, end):
-    """Return (side, game) if this Kalshi market clearly pays on one team (or the draw)."""
     sub = (m.get("yes_sub_title") or "").lower().strip()
     subt, title = _words(sub), _words(m.get("title"))
     best = None
@@ -224,31 +228,55 @@ def match_game(m, games, end):
                 continue
             cand = (side, g)
         if best is not None:
-            return None  # ambiguous
+            return None
         best = cand
     return best
 
 
 # ---------- pick scoring ----------
 def evaluate(m, p_yes, margin):
-    """Rank by expected log growth of bankroll at a capped fractional-Kelly stake.
-    p is shaved by `margin` so only edges that survive model error are kept."""
     ya, yb = dollars(m, "yes_ask"), dollars(m, "yes_bid")
     best = None
     for side, p, price in (("YES", p_yes, ya), ("NO", 1 - p_yes, None if yb is None else 1 - yb)):
         if price is None or not (PMIN <= price <= PMAX):
             continue
         p = p - margin
-        c = price + fee(price)          # all-in cost per contract
+        c = price + fee(price)
         if c >= 1 or p <= c:
             continue
-        w = 1 - c                       # profit if it wins
+        w = 1 - c
         f = min(MAX_STAKE, KELLY_FRAC * (p - c) / w)
         g = p * math.log(1 + f * w / c) + (1 - p) * math.log(1 - f)
         cand = {"side": side, "p": p, "price": price, "ev": p - c, "roi": (p - c) / price,
                 "edge": p - price, "kelly": f, "growth": g}
         if best is None or g > best["growth"]:
             best = cand
+    return best
+
+
+# ---------- arbitrage (keyless) ----------
+def find_arb(ms, now):
+    """Mutually exclusive, exhaustive outcomes of one game that can be locked for profit after fees."""
+    n = len(ms)
+    if n < 2 or n > 3 or not all(in_window(m, now) for m in ms):
+        return None
+    subs = [(m.get("yes_sub_title") or "").lower().strip() for m in ms]
+    if n == 3 and not any(s in ("tie", "draw") for s in subs):
+        return None  # three outcomes but no draw leg: not guaranteed exhaustive
+    asks = [dollars(m, "yes_ask") for m in ms]
+    bids = [dollars(m, "yes_bid") for m in ms]
+    best = None
+    if all(a is not None for a in asks):
+        cost = sum(a + fee(a) for a in asks)
+        if 1 - cost >= ARB_MIN:
+            best = {"kind": "Buy YES on every outcome", "profit": 1 - cost,
+                    "legs": [(m, "YES", a) for m, a in zip(ms, asks)]}
+    if all(b is not None for b in bids):
+        cost = sum((1 - b) + fee(1 - b) for b in bids)
+        profit = (n - 1) - cost
+        if profit >= ARB_MIN and (best is None or profit > best["profit"]):
+            best = {"kind": "Buy NO on every outcome", "profit": profit,
+                    "legs": [(m, "NO", 1 - b) for m, b in zip(ms, bids)]}
     return best
 
 
@@ -264,8 +292,8 @@ def in_window(m, now):
 
 
 def scan():
-    """Fair value = sportsbook moneyline (de-vigged) blended with Kalshi's sibling-market midpoint."""
-    picks, now = [], time.time()
+    """Returns (picks, marks, arbs). marks[ticker] = (fair_yes, margin, yes_ask, yes_bid) for live updates."""
+    picks, marks, arbs, now = [], {}, [], time.time()
     st = {"markets": 0, "no_quote": 0, "wide": 0, "no_book": 0, "no_edge": 0, "thin": 0, "matched": 0}
     near = None
     for series in SERIES:
@@ -274,12 +302,16 @@ def scan():
         except Exception as e:
             print("scan error", series, repr(e), flush=True)
             continue
-        # only spend odds quota on sports that have markets closing soon
         games = odds_games(series) if any(in_window(m, now) for m in mkts) else []
         events = {}
         for m in mkts:
             events.setdefault(m.get("event_ticker") or m["ticker"], []).append(m)
-        for ms in events.values():
+        for ev_key, ms in events.items():
+            arb = find_arb(ms, now)
+            if arb:
+                arb["event"] = ev_key
+                arb["title"] = (ms[0].get("title") or ev_key).replace(" Winner?", "")
+                arbs.append(arb)
             mids, all_ok = {}, True
             for m in ms:
                 b, a = dollars(m, "yes_bid"), dollars(m, "yes_ask")
@@ -315,6 +347,7 @@ def scan():
                 elif REQUIRE_BOOK:
                     st["no_book"] += 1
                     continue
+                marks[m["ticker"]] = (fair, margin, a, b)
                 raw = max(fair - a, b - fair)
                 if near is None or raw > near[0]:
                     near = (raw, m["ticker"], src)
@@ -326,7 +359,7 @@ def scan():
                     st["thin"] += 1
                     continue
                 title = (m.get("title") or "").replace(" Winner?", "")
-                picks.append({**r, "ticker": m["ticker"], "series": series,
+                picks.append({**r, "ticker": m["ticker"], "series": series, "event": ev_key,
                               "team": m.get("yes_sub_title") or m["ticker"], "title": title,
                               "game": title or m["ticker"], "commence": end,
                               "p_yes": fair, "books": len(ms), "src": src})
@@ -335,8 +368,8 @@ def scan():
         nr = f"{near[0] * 100:+.1f}c on {near[1]} ({near[2]})" if near else "n/a"
         print(f"scan: {st['markets']} markets | book-matched {st['matched']} | no quote {st['no_quote']} | "
               f"wide {st['wide']} | no book {st['no_book']} | no edge {st['no_edge']} | "
-              f"thin {st['thin']} | PICKS {len(picks)} | best raw edge {nr}", flush=True)
-    return sorted(picks, key=lambda x: -x["growth"])
+              f"thin {st['thin']} | PICKS {len(picks)} | ARBS {len(arbs)} | best raw edge {nr}", flush=True)
+    return sorted(picks, key=lambda x: -x["growth"]), marks, arbs
 
 
 # ---------- chart ----------
@@ -402,7 +435,6 @@ def render_frames(p, outcome, S, n):
     t0 = pts[0][0]
     t1 = max(pts[-1][0], t0 + 120)
 
-    # background: gradient plus stars
     g = Image.linear_gradient("L").resize((W, H))
     base = ImageOps.colorize(g, (13, 31, 31), (10, 10, 10)).convert("RGBA")
     d = ImageDraw.Draw(base, "RGBA")
@@ -412,7 +444,6 @@ def render_frames(p, outcome, S, n):
         r = k(rng.choice((0.6, 0.9, 1.2)))
         d.ellipse([sx - r, sy - r, sx + r, sy + r], fill=(255, 255, 255, rng.randint(40, 110)))
 
-    # ---- header ----
     team = p["team"][:22]
     init = "".join(w[0] for w in p["team"].split()[:2]).upper() or "?"
     d.ellipse([k(24), k(24), k(88), k(88)], fill=side_col + (255,), outline=(255, 255, 255, 120), width=lw(2))
@@ -437,7 +468,6 @@ def render_frames(p, outcome, S, n):
     else:
         d.text((k(bx0 + bw / 2), k(54)), btxt, font=fb, fill=bcol + (255,), anchor="mm")
 
-    # ---- stat cards ----
     ev_c = C_UP if edge >= 0 else C_DN
     cards = [("KALSHI PRICE", f"{price * 100:.0f}c", ORG, p["side"] + " ask", None),
              ("IMPLIED FAIR", f"{fair * 100:.1f}%", CYAN, src + " blend", None),
@@ -454,7 +484,6 @@ def render_frames(p, outcome, S, n):
         if arrow is not None:
             _arrow(d, k(x0 + cwid - 22), k(140), arrow, k(9), col + (255,))
 
-    # ---- chart panel ----
     d.rounded_rectangle([k(12), k(196), k(708), k(562)], radius=k(18), fill=(255, 255, 255, 14),
                         outline=(255, 255, 255, 28), width=lw(1))
     d.text((k(26), k(214)), "PRICE vs FAIR VALUE", font=F(11), fill=MUTED, anchor="lm")
@@ -488,7 +517,6 @@ def render_frames(p, outcome, S, n):
         lbl = datetime.fromtimestamp(t0 + (t1 - t0) * fr, timezone.utc).strftime("%H:%M")
         d.text((x, k(546)), lbl + (" UTC" if i == 3 else ""), font=F(10, False), fill=MUTED, anchor="mm")
 
-    # area under price, plus shaded edge between the lines
     if len(pts) > 1:
         d.polygon([(x, Y(v)) for x, v in zip(xs, pv)] + [(xs[-1], PY1), (xs[0], PY1)], fill=ORG + (26,))
         for i in range(len(pts) - 1):
@@ -512,13 +540,11 @@ def render_frames(p, outcome, S, n):
         d.text((xs[lo_i], min(PY1 - k(6), Y(pv[lo_i]) + k(9))), f"L {pv[lo_i]:.1f}", font=F(9),
                fill=C_DN + (230,), anchor="mm")
 
-    # entry marker
     ey = Y(entry)
     _dots(d, PX0, ey, PX1, ey, AMBER + (210,), lw(1.2), k(5), k(4))
     _arrow(d, PX0 + k(10), ey - k(12), p["side"] == "YES", k(6), AMBER + (255,))
     d.text((PX0 + k(22), ey - k(12)), f"ENTRY {entry:.0f}c", font=F(10), fill=AMBER + (255,), anchor="lm")
 
-    # live tags at the right edge
     lx = xs[-1]
     py_, fy_ = Y(pv[-1]), Y(fv[-1])
     fy2 = fy_
@@ -530,7 +556,6 @@ def render_frames(p, outcome, S, n):
     for cy_, c in ((py_, ORG), (fy_, CYAN)):
         d.ellipse([lx - k(4), cy_ - k(4), lx + k(4), cy_ + k(4)], fill=c + (255,))
 
-    # edge strip
     ES0, ES1 = k(484), k(520)
     em = (ES0 + ES1) / 2
     d.rounded_rectangle([PX0, ES0, PX1, ES1], radius=k(6), fill=(255, 255, 255, 10))
@@ -548,7 +573,6 @@ def render_frames(p, outcome, S, n):
     if outcome:
         d.text(((PX0 + PX1) / 2, (PY0 + PY1) / 2), outcome.upper(), font=F(96), fill=accent + (80,), anchor="mm")
 
-    # ---- EV meter ----
     mx0, mx1 = k(24), k(696)
     zx = mx0 + (mx1 - mx0) * 0.4
     roi = p["roi"]
@@ -563,7 +587,6 @@ def render_frames(p, outcome, S, n):
     d.text((zx, k(630)), "0", font=F(9, False), fill=MUTED, anchor="mm")
     d.text((mx1, k(630)), "+15%", font=F(9, False), fill=MUTED, anchor="rm")
 
-    # ---- payoff bar ----
     d.text((mx0, k(652)), "PAYOFF PER CONTRACT", font=F(11), fill=MUTED, anchor="lm")
     rw = (mx1 - mx0) * price
     d.rectangle([mx0, k(662), mx0 + rw, k(688)], fill=C_DN + (200,))
@@ -571,7 +594,6 @@ def render_frames(p, outcome, S, n):
     d.text((mx0 + k(10), k(675)), f"RISK {price * 100:.0f}c", font=F(12), fill=WHITE, anchor="lm")
     d.text((mx1 - k(10), k(675)), f"WIN {(1 - price) * 100:.0f}c", font=F(12), fill=WHITE, anchor="rm")
 
-    # ---- badges ----
     blue = (60, 90, 140)
     badges = [("EV", f"{p['ev']:+.3f}", C_UP if p["ev"] > 0 else C_DN),
               ("ROI", f"{p['roi'] * 100:+.1f}%", C_UP if p["roi"] > 0 else C_DN),
@@ -586,7 +608,6 @@ def render_frames(p, outcome, S, n):
         d.text((x0 + k(bwn / 2), k(722)), nm, font=F(10, False), fill=(255, 255, 255, 215), anchor="mm")
         d.text((x0 + k(bwn / 2), k(742)), lab, font=F(13), fill=WHITE, anchor="mm")
 
-    # ---- buy button ----
     d.rounded_rectangle([k(24), k(774), k(696), k(852)], radius=k(28), fill=side_col + (255,),
                         outline=(accent + (255,)) if accent else None, width=lw(3))
     _arrow(d, k(64), k(813), p["side"] == "YES", k(15), (255, 255, 255, 255))
@@ -595,7 +616,6 @@ def render_frames(p, outcome, S, n):
     d.text((k(380), k(828)), f"{src} · {p['ticker'][-14:]}", font=F(12, False),
            fill=(255, 255, 255, 215), anchor="mm")
 
-    # ---- animated frames ----
     frames = []
     for f in range(n):
         t = f / n if n > 1 else 0.25
@@ -615,7 +635,6 @@ def render_frames(p, outcome, S, n):
 
 
 def chart_file(p, outcome=None):
-    """(bytes, filename, mime). Live = animated GIF, settled = PNG. Shrinks if too big."""
     animated = outcome is None
     S = LIVE_SCALE if animated else FINAL_SCALE
     while True:
@@ -634,19 +653,26 @@ def chart_file(p, outcome=None):
 
 # ---------- discord ----------
 def stats(h):
+    """Overall record + win %, last 20, calibration (predicted vs actual win %), P&L, avg EV."""
     n = len(h)
     if not n:
-        return "n/a", "n/a", "n/a"
+        return "n/a", "n/a", "n/a", "n/a", "n/a"
     w = sum(1 for x in h if x["win"])
+    last = h[-20:]
+    lw_ = sum(1 for x in last if x["win"])
     pnl = sum(x["pnl"] for x in h)
     stake = sum(x["price"] for x in h)
     avg_ev = sum(x["ev"] for x in h) / n
+    pred = sum(x["p"] for x in h) / n
     return (f"{w}W-{n - w}L ({w / n * 100:.0f}%)",
-            f"{pnl:+.2f}u ({pnl / stake * 100:+.1f}% ROI)", f"{avg_ev:+.3f}u/bet predicted")
+            f"{pnl:+.2f}u ({pnl / stake * 100:+.1f}% ROI)",
+            f"{avg_ev:+.3f}u/bet predicted",
+            f"{lw_}W-{len(last) - lw_}L ({lw_ / len(last) * 100:.0f}%)",
+            f"predicted {pred * 100:.0f}% vs actual {w / n * 100:.0f}%")
 
 
 def build_embed(p, state, outcome=None):
-    rec, pnl, avg = stats(state["history"])
+    rec, pnl, avg, last, calib = stats(state["history"])
     who = p["team"] if p["side"] == "YES" else f"against {p['team']}"
     lines = [f"**Game:** {p['game']}",
              f"**Pick:** Buy **{p['side']}** at {p['price'] * 100:.0f}c ({who})",
@@ -662,10 +688,14 @@ def build_embed(p, state, outcome=None):
         lines.insert(0, f"**Result:** {p['pnl']:+.2f}u")
     else:
         title, color = f"{'🆙' if p['side'] == 'YES' else '⬇️'} PICK: {p['team']} {p['side']}", GREEN
+    arb_txt = f"{state['arb_count']} found | {state['arb_locked']:+.2f}u locked" if state["arb_count"] else "none yet"
     return {"title": title[:250], "description": "\n".join(lines), "color": color,
-            "fields": [{"name": "Record", "value": rec, "inline": True},
+            "fields": [{"name": "Record (win %)", "value": rec, "inline": True},
+                       {"name": "Last 20", "value": last, "inline": True},
                        {"name": "P&L", "value": pnl, "inline": True},
-                       {"name": "Avg predicted EV", "value": avg, "inline": True}],
+                       {"name": "Calibration", "value": calib, "inline": True},
+                       {"name": "Avg predicted EV", "value": avg, "inline": True},
+                       {"name": "Arbs", "value": arb_txt, "inline": True}],
             "footer": {"text": "Signals only, not financial advice"},
             "timestamp": datetime.now(timezone.utc).isoformat()}
 
@@ -676,7 +706,7 @@ def send(embed, message_id=None, pick=None, outcome=None):
         f_data = chart_file(pick, outcome)
         embed["image"] = {"url": f"attachment://{f_data[1]}"}
         if message_id:
-            payload["attachments"] = []  # swap out the old image
+            payload["attachments"] = []
     for attempt in range(5):
         kw = {"timeout": (5, 30)}
         if f_data:
@@ -706,6 +736,18 @@ def post(p, state, outcome=None):
     p["message_id"] = send(build_embed(p, state, outcome), p.get("message_id"), pick=p, outcome=outcome)
 
 
+def post_arb(a, state):
+    legs = "\n".join(f"• **{side}** {m.get('yes_sub_title') or m['ticker']} at {price * 100:.0f}c "
+                     f"(`{m['ticker']}`)" for m, side, price in a["legs"])
+    embed = {"title": f"💰 ARB: {a['title']}"[:250],
+             "description": f"**{a['kind']}**\n{legs}\n"
+                            f"**Locked profit:** about {a['profit'] * 100:.1f}c per set after fees\n"
+                            "Top-of-book prices only. Check the size available before sizing up.",
+             "color": GREEN, "footer": {"text": "Signals only, not financial advice"},
+             "timestamp": datetime.now(timezone.utc).isoformat()}
+    send(embed)
+
+
 # ---------- core ----------
 def settle(state):
     for t, p in list(state["open"].items()):
@@ -718,9 +760,12 @@ def settle(state):
             continue
         if res not in ("yes", "no"):
             continue
+        entry = p.get("entry_price", p["price"])
         p["win"] = (res == "yes") == (p["side"] == "YES")
-        p["pnl"] = round((1.0 if p["win"] else 0.0) - p["price"] - fee(p["price"]), 4)
-        state["history"].append({k: p[k] for k in ("ticker", "side", "win", "pnl", "price", "ev", "p")})
+        p["pnl"] = round((1.0 if p["win"] else 0.0) - entry - fee(entry), 4)
+        state["history"].append({"ticker": t, "event": p.get("event"), "side": p["side"], "win": p["win"],
+                                 "pnl": p["pnl"], "price": entry, "ev": p.get("ev0", p["ev"]),
+                                 "p": p.get("p0", p["p"]), "src": p.get("src")})
         del state["open"][t]
         try:
             post(p, state, "win" if p["win"] else "loss")
@@ -729,39 +774,75 @@ def settle(state):
         save_state(state)
 
 
+def refresh_open(state, marks, now):
+    """Update open picks on their OWN side only, so a pick can never flip."""
+    for t, old in state["open"].items():
+        if now >= old["commence"] or t not in marks:
+            continue
+        fair, margin, a, b = marks[t]
+        yes = old["side"] == "YES"
+        price = a if yes else 1 - b
+        if not (0 < price < 1):
+            continue
+        p_ = (fair if yes else 1 - fair) - margin
+        c = price + fee(price)
+        old.update({"price": price, "p": p_, "ev": p_ - c, "roi": (p_ - c) / price, "edge": p_ - price})
+        old["pts"] = (old.get("pts", []) + [[round(now), round(price, 4), round(p_, 4)]])[-600:]
+        if now - old.get("last_edit", 0) >= EDIT_SECONDS:
+            try:
+                post(old, state)
+                old["last_edit"] = now
+            except Exception as e:
+                print("edit error", repr(e), flush=True)
+
+
 def tick(state):
     settle(state)
-    picks = scan()
+    picks, marks, arbs = scan()
+    now = time.time()
+    refresh_open(state, marks, now)
+
+    # arbitrage alerts (once per game per ARB_REPEAT seconds)
+    sent = 0
+    for a in sorted(arbs, key=lambda x: -x["profit"]):
+        if sent >= 3 or now - state["arbs"].get(a["event"], 0) < ARB_REPEAT:
+            continue
+        try:
+            post_arb(a, state)
+            state["arbs"][a["event"]] = now
+            state["arb_count"] += 1
+            state["arb_locked"] += a["profit"]
+            sent += 1
+        except Exception as e:
+            print("arb send error", repr(e), flush=True)
+    state["arbs"] = {k_: v for k_, v in state["arbs"].items() if now - v < 86400}
+
+    # new picks: one pick per game, never the opposite side or the other team
     done = {h["ticker"] for h in state["history"]}
-    fresh, now = 0, time.time()
+    locked = {h.get("event") for h in state["history"] if h.get("event")}
+    locked |= {p.get("event") for p in state["open"].values() if p.get("event")}
+    fresh = 0
     for p in picks:
         t = p["ticker"]
-        if t in state["open"]:
-            old = state["open"][t]
-            if now < old["commence"]:
-                old.update({k: p[k] for k in ("p", "price", "ev", "roi", "kelly", "books", "src",
-                                              "growth", "edge")})
-                old["pts"] = (old.get("pts", []) + [[round(now), round(p["price"], 4), round(p["p"], 4)]])[-600:]
-                if now - old.get("last_edit", 0) >= EDIT_SECONDS:
-                    try:
-                        post(old, state)
-                        old["last_edit"] = now
-                    except Exception as e:
-                        print("edit error", repr(e), flush=True)
-        elif t not in done and fresh < TOP_N and len(state["open"]) < MAX_OPEN:
-            p["pts"] = [[round(now), round(p["price"], 4), round(p["p"], 4)]]
-            p["entry_price"], p["last_edit"] = p["price"], now
-            post(p, state)
-            state["open"][t] = p
-            fresh += 1
+        if t in state["open"] or t in done or p["event"] in locked:
+            continue
+        if fresh >= TOP_N or len(state["open"]) >= MAX_OPEN:
+            continue
+        p["pts"] = [[round(now), round(p["price"], 4), round(p["p"], 4)]]
+        p["entry_price"], p["last_edit"] = p["price"], now
+        p["p0"], p["ev0"] = p["p"], p["ev"]
+        post(p, state)
+        state["open"][t] = p
+        locked.add(p["event"])
+        fresh += 1
     save_state(state)
 
 
 def main():
     state = load_state()
     if not ODDS_KEY:
-        print("WARNING: ODDS_API_KEY is not set, so no sportsbook odds will load and no picks will post",
-              flush=True)
+        print("No ODDS_API_KEY set: Kalshi-only mode (arb alerts work, few edge picks). "
+              "Add a key for sportsbook-matched picks.", flush=True)
     print("sports bot started", flush=True)
     end, fails = time.time() + RUN_SECONDS, 0
     while time.time() < end:
