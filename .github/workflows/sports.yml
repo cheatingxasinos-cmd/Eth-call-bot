@@ -37,8 +37,9 @@ jobs:
           DAILY_CREDITS: "330"
           MONTHLY_CREDITS: "9900"
           CALL_COST: "1"
-          REQUIRE_BOOK: "0"O
+          REQUIRE_BOOK: "0"
           ODDS_TTL: "3600"
+
       - name: Save bot state
         if: always()
         uses: actions/cache/save@v4
