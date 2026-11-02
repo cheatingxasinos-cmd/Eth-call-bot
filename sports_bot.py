@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 ODDS_KEY = os.environ.get("MONEYLINE_API_KEY", "")
 ML_URL = os.getenv("MONEYLINE_URL", "https://mlapi.bet/v1/edge/ev")
+ML_BASE = os.getenv("MONEYLINE_BASE", "https://mlapi.bet")
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 
 # Kalshi series scanned every tick (free, no key).
@@ -38,6 +39,8 @@ MIN_EDGE = float(os.getenv("MIN_EDGE", "0.01"))
 UNCERT = float(os.getenv("UNCERT", "0.005"))
 PICK_FLOOR = float(os.getenv("PICK_FLOOR_SECONDS", "300"))  # post a low-confidence pick if none in this long
 STATUS_EVERY = float(os.getenv("STATUS_SECONDS", "3600"))   # status update interval
+WATCH_EVERY = float(os.getenv("WATCH_SECONDS", "3600"))     # hourly watchlist interval
+WATCH_N = int(os.getenv("WATCH_N", "3"))                    # games on the watchlist
 REQUIRE_BOOK = os.getenv("REQUIRE_BOOK", "0") == "1"
 ARB_MIN = float(os.getenv("ARB_MIN", "0.01"))          # min locked profit per set, in dollars
 ARB_REPEAT = float(os.getenv("ARB_REPEAT", "1800"))    # seconds before re-alerting the same game
@@ -48,8 +51,19 @@ LIVE_SCALE = float(os.getenv("LIVE_SCALE", "1.0"))
 FINAL_SCALE = float(os.getenv("FINAL_SCALE", "2"))
 MAX_BYTES = int(float(os.getenv("MAX_MB", "7.5")) * 1024 * 1024)
 GREEN, RED, GREY = 0x00FF00, 0xFF3B30, 0x808080
+
+# MoneyLine credit controls
+ODDS_TTL = float(os.getenv("ODDS_TTL", "2700"))           # seconds between MoneyLine refreshes
+DAILY_CREDITS = int(os.getenv("DAILY_CREDITS", "32"))     # hard cap per UTC day
+MONTHLY_CREDITS = int(os.getenv("MONTHLY_CREDITS", "1000"))
+CALL_COST = int(os.getenv("CALL_COST", "1"))              # credits per page fetched
+MIN_REMAINING = int(os.getenv("MIN_REMAINING", "20"))     # stop calling when account is this low
+ML_PAGES = int(os.getenv("ML_PAGES", "1"))                # pages (25 bets each) fetched per refresh
+STALE_MAX = float(os.getenv("STALE_MAX", "7200"))         # reuse old odds this long when over budget
+EDGE_MAX_AGE = float(os.getenv("EDGE_MAX_AGE", "10800"))  # ignore MoneyLine bets calculated longer ago
+BUDGET = {"day": "", "used": 0, "month": "", "month_used": 0, "remaining": None}
 API_DOWN = [False]
-ML_DEBUG = [True]
+LOADED = [0]
 
 
 # ---------- http ----------
@@ -88,6 +102,7 @@ def load_state():
     s.setdefault("arbs", {})
     s.setdefault("arb_count", 0)
     s.setdefault("arb_locked", 0.0)
+    s.setdefault("budget", {})
     return s
 
 
@@ -119,7 +134,9 @@ def fee(p):
     return math.ceil(0.07 * p * (1 - p) * 100) / 100
 
 
-# ---------- sportsbook odds (MoneyLine probe) ----------
+# ---------- sportsbook fair values (MoneyLine EV bets, credit-capped) ----------
+ODDS_CACHE = {}
+
 STOP = {"state", "university", "college", "the", "city", "united", "fc", "sc", "new", "los", "san",
         "saint", "north", "south", "east", "west", "tech", "univ", "and", "vs"}
 
@@ -144,52 +161,128 @@ def _find_list(x, depth=0):
     return None
 
 
+def _budget_roll():
+    now = datetime.now(timezone.utc)
+    d, m = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m")
+    if BUDGET["day"] != d:
+        BUDGET["day"], BUDGET["used"] = d, 0
+        API_DOWN[0] = False
+    if BUDGET["month"] != m:
+        BUDGET["month"], BUDGET["month_used"] = m, 0
+
+
+def _parse_edges(items, now):
+    """Each MoneyLine EV bet carries the consensus (de-vigged) win probability of one team."""
+    best = {}
+    for it in items:
+        try:
+            ev = it.get("evBet") or {}
+            fair = ev.get("fairProb")
+            if fair is None or it.get("market") != "moneyline":
+                continue
+            team = it.get("team") or it.get("outcome")
+            words = _words(team)
+            if not words:
+                continue
+            if it.get("calculatedAt") and now - ts(it["calculatedAt"]) > EDGE_MAX_AGE:
+                continue
+            key = (it.get("eventId"), team)
+            cand = {"start": ts(it["startTime"]), "team": words, "fair": float(fair),
+                    "sport": it.get("sport"), "books": ev.get("consensusBooks") or 0}
+            if key not in best or cand["books"] > best[key]["books"]:
+                best[key] = cand
+        except Exception:
+            continue
+    return list(best.values())
+
+
 def odds_games(series):
-    """Probe: one call per run to the MoneyLine endpoint; logs its shape. Returns no games."""
-    if not ODDS_KEY or not ML_DEBUG[0]:
+    """One MoneyLine refresh covers every sport. Hard-capped by daily/monthly credits and real balance."""
+    if not ODDS_KEY:
         return []
-    ML_DEBUG[0] = False
+    _budget_roll()
+    c = ODDS_CACHE.get("ALL")
+    age = time.time() - c[0] if c else None
+    if c and age < ODDS_TTL:
+        return c[1]
+    rem = BUDGET.get("remaining")
+    over = (BUDGET["used"] + CALL_COST > DAILY_CREDITS or
+            BUDGET["month_used"] + CALL_COST > MONTHLY_CREDITS or
+            (rem is not None and rem <= MIN_REMAINING))
+    if over:
+        if c and c[1] and age < STALE_MAX:
+            return c[1]                      # recent fair values are still fine
+        if not API_DOWN[0]:
+            print("moneyline budget used up: running on Kalshi data only", flush=True)
+        API_DOWN[0] = True
+        return []
+    games, now = [], time.time()
     try:
-        r = DATA.get(ML_URL, headers={"x-api-key": ODDS_KEY}, timeout=(3.05, 15))
-        print("moneyline status", r.status_code, "| credits cost", r.headers.get("x-credits-cost"),
-              "| remaining", r.headers.get("x-credits-remaining"), flush=True)
-        body = r.json()
+        for page in range(1, ML_PAGES + 1):
+            BUDGET["used"] += CALL_COST
+            BUDGET["month_used"] += CALL_COST
+            r = DATA.get(ML_URL, params={"page": page} if page > 1 else None,
+                         headers={"x-api-key": ODDS_KEY}, timeout=(3.05, 15))
+            r.raise_for_status()
+            rh = r.headers.get("x-credits-remaining")
+            if rh is not None:
+                try:
+                    BUDGET["remaining"] = int(float(rh))
+                except ValueError:
+                    pass
+            body = r.json()
+            games.extend(_parse_edges(_find_list(body) or [], now))
+            pages = ((body.get("meta") or {}).get("pages") or 1) if isinstance(body, dict) else 1
+            if page >= pages:
+                break
     except Exception as e:
-        print("moneyline probe error", repr(e), flush=True)
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in (401, 402, 403, 429):
+            BUDGET["used"] = DAILY_CREDITS   # provider refused: stop for today
+        API_DOWN[0] = True
+        ODDS_CACHE["ALL"] = (time.time(), [])
+        LOADED[0] = 0
+        print("moneyline error", repr(e), "-> Kalshi-only until next refresh", flush=True)
         return []
-    print("moneyline top-level:", list(body)[:10] if isinstance(body, dict) else type(body).__name__,
-          flush=True)
-    items = _find_list(body)
-    print("moneyline items:", len(items) if items else 0, flush=True)
-    for it in (items or [])[:2]:
-        print("moneyline sample:", json.dumps(it)[:1500], flush=True)
-    return []
+    API_DOWN[0] = False
+    LOADED[0] = len(games)
+    print(f"moneyline ok: {len(games)} fair values | credits today {BUDGET['used']}/{DAILY_CREDITS} | "
+          f"account remaining {BUDGET.get('remaining')}", flush=True)
+    ODDS_CACHE["ALL"] = (time.time(), games)
+    return games
 
 
 def match_game(m, games, end):
+    """Return the sportsbook fair YES probability if exactly one MoneyLine bet matches this market."""
     sub = (m.get("yes_sub_title") or "").lower().strip()
-    subt, title = _words(sub), _words(m.get("title"))
-    best = None
+    subt = _words(sub)
+    if not subt or sub in ("tie", "draw"):
+        return None
+    found = None
     for g in games:
         if not (-3600 < end - g["start"] < 48 * 3600):
             continue
-        if sub in ("tie", "draw"):
-            if "draw" not in g["fair"] or not (g["home"] & title and g["away"] & title):
-                continue
-            cand = ("draw", g)
-        else:
-            sh, sa = len(subt & g["home"]), len(subt & g["away"])
-            if sh == sa:
-                continue
-            side = "home" if sh > sa else "away"
-            other = g["away"] if side == "home" else g["home"]
-            if not (other & title):
-                continue
-            cand = (side, g)
-        if best is not None:
-            return None
-        best = cand
-    return best
+        if not (subt <= g["team"] or g["team"] <= subt):
+            continue
+        if found is not None:
+            return None  # ambiguous
+        found = g["fair"]
+    return found
+
+
+def injury_probe():
+    """One-time probe (1 credit): logs the raw MoneyLine injuries response so alerts can be built."""
+    team = os.getenv("INJURY_PROBE_TEAM", "ncaab-notre-dame")
+    try:
+        r = DATA.get(f"{ML_BASE}/v1/teams/{team}/injuries",
+                     headers={"x-api-key": ODDS_KEY}, timeout=(3.05, 15))
+        print("injury probe status", r.status_code, "| credits cost", r.headers.get("x-credits-cost"),
+              "| remaining", r.headers.get("x-credits-remaining"), flush=True)
+        body = r.json()
+    except Exception as e:
+        print("injury probe error", repr(e), flush=True)
+        return
+    print("injury raw:", json.dumps(body)[:1200], flush=True)
 
 
 # ---------- pick scoring ----------
@@ -210,6 +303,19 @@ def evaluate(m, p_yes, margin):
                 "edge": p - price, "kelly": f, "growth": g}
         if best is None or g > best["growth"]:
             best = cand
+    return best
+
+
+def lean(m, p_yes):
+    """Best side to lean on, even if EV is negative (watchlist only)."""
+    ya, yb = dollars(m, "yes_ask"), dollars(m, "yes_bid")
+    best = None
+    for side, p, price in (("YES", p_yes, ya), ("NO", 1 - p_yes, None if yb is None else 1 - yb)):
+        if price is None or not (PMIN <= price <= PMAX):
+            continue
+        ev = p - (price + fee(price))
+        if best is None or ev > best["ev"]:
+            best = {"side": side, "price": price, "p": p, "ev": ev}
     return best
 
 
@@ -251,9 +357,10 @@ def in_window(m, now):
 
 
 def scan():
-    """Returns (picks, relaxed, marks, arbs).
+    """Returns (picks, relaxed, marks, arbs, leans).
     marks[ticker] = (fair_yes, margin, yes_ask, yes_bid) for live updates of open picks."""
     picks, relaxed, marks, arbs, now = [], [], {}, [], time.time()
+    leans = []
     st = {"markets": 0, "no_quote": 0, "wide": 0, "no_book": 0, "no_edge": 0, "thin": 0, "matched": 0}
     near = None
     for series in SERIES:
@@ -296,10 +403,8 @@ def scan():
                     continue
                 kfair = mid / tot if tot else mid
                 fair, src, margin = kfair, "Kalshi", UNCERT
-                hit = match_game(m, games, end)
-                if hit:
-                    side, g = hit
-                    book_p = g["fair"][side]
+                book_p = match_game(m, games, end)
+                if book_p is not None:
                     fair = BOOK_W * book_p + (1 - BOOK_W) * kfair
                     margin = UNCERT + 0.5 * abs(book_p - kfair)
                     src = SRC_LABEL + "+Kalshi"
@@ -308,6 +413,11 @@ def scan():
                     st["no_book"] += 1
                     continue
                 marks[m["ticker"]] = (fair, margin, a, b)
+                lz = lean(m, fair)
+                if lz:
+                    leans.append({**lz, "team": m.get("yes_sub_title") or m["ticker"],
+                                  "game": (m.get("title") or "").replace(" Winner?", "") or m["ticker"],
+                                  "ticker": m["ticker"], "event": ev_key, "src": src})
                 raw = max(fair - a, b - fair)
                 if near is None or raw > near[0]:
                     near = (raw, m["ticker"], src)
@@ -333,9 +443,9 @@ def scan():
         print(f"scan: {st['markets']} markets | book-matched {st['matched']} | no quote {st['no_quote']} | "
               f"wide {st['wide']} | no book {st['no_book']} | no edge {st['no_edge']} | "
               f"thin {st['thin']} | PICKS {len(picks)} | LOWCONF {len(relaxed)} | ARBS {len(arbs)} | "
-              f"best raw edge {nr}", flush=True)
+              f"api {'DOWN' if API_DOWN[0] else 'ok'} | best raw edge {nr}", flush=True)
     return (sorted(picks, key=lambda x: -x["growth"]),
-            sorted(relaxed, key=lambda x: -x["growth"]), marks, arbs)
+            sorted(relaxed, key=lambda x: -x["growth"]), marks, arbs, leans)
 
 
 # ---------- chart ----------
@@ -718,18 +828,41 @@ def post_arb(a, state):
 
 def post_status(state, best, posted):
     rec, pnl, avg, last, calib = stats(state["history"])
-    lean = (f"Best lean: {best['team']} {best['side']} at {best['price'] * 100:.0f}c "
-            f"(EV {best['ev']:+.3f})") if best else "No positive-EV market right now."
+    lean_txt = (f"Best lean: {best['team']} {best['side']} at {best['price'] * 100:.0f}c "
+                f"(EV {best['ev']:+.3f})") if best else "No positive-EV market right now."
     extra = f"\nPosted a low-confidence pick: {posted['team']} {posted['side']}" if posted else ""
+    if not ODDS_KEY or API_DOWN[0]:
+        odds_txt = "Pricing: Kalshi only (MoneyLine off or out of credits)"
+    else:
+        odds_txt = (f"Pricing: MoneyLine fair values for {LOADED[0]} teams | "
+                    f"credits left {BUDGET.get('remaining', '?')}")
     embed = {"title": "🕐 Status",
-             "description": f"Open picks: {len(state['open'])}\n"
-                            "Pricing: Kalshi only (sportsbook odds not connected yet)\n"
-                            f"Arbs found: {state['arb_count']}\n{lean}{extra}",
+             "description": f"Open picks: {len(state['open'])}\n{odds_txt}\n"
+                            f"Arbs found: {state['arb_count']}\n{lean_txt}{extra}",
              "color": GREY,
              "fields": [{"name": "Record (win %)", "value": rec, "inline": True},
                         {"name": "Last 20", "value": last, "inline": True},
                         {"name": "Calibration", "value": calib, "inline": True}],
              "footer": {"text": "Signals only, not financial advice"},
+             "timestamp": datetime.now(timezone.utc).isoformat()}
+    send(embed)
+
+
+def post_watch(top):
+    """Hourly top-N watchlist. Positive EV after fees is highlighted; the rest are labeled no edge."""
+    edges = sum(1 for l in top if l["ev"] > 0)
+    rows = []
+    for i, l in enumerate(top, 1):
+        tag = "🟢 **EDGE**" if l["ev"] > 0 else "⚪ no edge"
+        rows.append(f"**{i}.** {tag} | {l['game']}\n"
+                    f"Lean **{l['side']}** {l['team']} at {l['price'] * 100:.0f}c | "
+                    f"EV {l['ev']:+.3f} after fees | {l['src']}")
+    head = (f"{edges} of {len(top)} show a positive edge after fees." if edges
+            else "None show an edge after fees. These are only the closest markets.")
+    embed = {"title": f"📋 Hourly top {len(top)} (leans, not bets)",
+             "description": head + "\n\n" + "\n\n".join(rows),
+             "color": GREEN if edges else GREY,
+             "footer": {"text": "Leans are not tracked in the record | Signals only, not financial advice"},
              "timestamp": datetime.now(timezone.utc).isoformat()}
     send(embed)
 
@@ -785,7 +918,7 @@ def refresh_open(state, marks, now):
 
 def tick(state):
     settle(state)
-    picks, relaxed, marks, arbs = scan()
+    picks, relaxed, marks, arbs, leans = scan()
     now = time.time()
     refresh_open(state, marks, now)
 
@@ -844,19 +977,42 @@ def tick(state):
             state["last_pick"] = now
             posted = p
             break
+
+    # hourly watchlist: top WATCH_N games closest to an edge, best first
+    if now - state.get("last_watch", 0) >= WATCH_EVERY:
+        seen, top = set(), []
+        for l in sorted(leans, key=lambda x: -x["ev"]):
+            if l["event"] in seen or l["event"] in locked:
+                continue
+            seen.add(l["event"])
+            top.append(l)
+            if len(top) >= WATCH_N:
+                break
+        if top:
+            try:
+                post_watch(top)
+                state["last_watch"] = now
+            except Exception as e:
+                print("watchlist send error", repr(e), flush=True)
+
     if now - state.get("last_status", 0) >= STATUS_EVERY:
         try:
             post_status(state, relaxed[0] if relaxed else None, posted)
             state["last_status"] = now
         except Exception as e:
             print("status send error", repr(e), flush=True)
+    state["budget"] = dict(BUDGET)
     save_state(state)
 
 
 def main():
     state = load_state()
+    BUDGET.update(state.get("budget", {}))
     if not ODDS_KEY:
         print("No MONEYLINE_API_KEY set: Kalshi-only mode.", flush=True)
+    elif not state.get("injury_probed"):
+        injury_probe()
+        state["injury_probed"] = True
     print("sports bot started", flush=True)
     end, fails = time.time() + RUN_SECONDS, 0
     while time.time() < end:
