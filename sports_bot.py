@@ -61,6 +61,7 @@ MIN_REMAINING = int(os.getenv("MIN_REMAINING", "20"))     # stop calling when ac
 ML_PAGES = int(os.getenv("ML_PAGES", "1"))                # pages (25 bets each) fetched per refresh
 STALE_MAX = float(os.getenv("STALE_MAX", "7200"))         # reuse old odds this long when over budget
 EDGE_MAX_AGE = float(os.getenv("EDGE_MAX_AGE", "10800"))  # ignore MoneyLine bets calculated longer ago
+MAX_DISAGREE = float(os.getenv("MAX_DISAGREE", "0.20"))   # distrust fair values this far from Kalshi
 BUDGET = {"day": "", "used": 0, "month": "", "month_used": 0, "remaining": None}
 API_DOWN = [False]
 LOADED = [0]
@@ -253,13 +254,17 @@ def odds_games(series):
 
 
 def match_game(m, games, end):
-    """Return the sportsbook fair YES probability if exactly one MoneyLine bet matches this market."""
+    """Return the sportsbook fair YES probability if exactly one MoneyLine bet matches this market.
+    Games that already started are skipped: their pre-game odds are stale against live Kalshi prices."""
     sub = (m.get("yes_sub_title") or "").lower().strip()
     subt = _words(sub)
     if not subt or sub in ("tie", "draw"):
         return None
+    now = time.time()
     found = None
     for g in games:
+        if g["start"] <= now + 120:
+            continue
         if not (-3600 < end - g["start"] < 48 * 3600):
             continue
         if not (subt <= g["team"] or g["team"] <= subt):
@@ -271,18 +276,16 @@ def match_game(m, games, end):
 
 
 def injury_probe():
-    """One-time probe (1 credit): logs the raw MoneyLine injuries response so alerts can be built."""
-    team = os.getenv("INJURY_PROBE_TEAM", "ncaab-notre-dame")
-    try:
-        r = DATA.get(f"{ML_BASE}/v1/teams/{team}/injuries",
-                     headers={"x-api-key": ODDS_KEY}, timeout=(3.05, 15))
-        print("injury probe status", r.status_code, "| credits cost", r.headers.get("x-credits-cost"),
-              "| remaining", r.headers.get("x-credits-remaining"), flush=True)
-        body = r.json()
-    except Exception as e:
-        print("injury probe error", repr(e), flush=True)
-        return
-    print("injury raw:", json.dumps(body)[:1200], flush=True)
+    """One-time probe: NBA team list plus one NBA team's injuries. Logs raw responses."""
+    team = os.getenv("INJURY_PROBE_TEAM", "nba-boston-celtics")
+    for path in ("/v1/leagues/nba/teams", f"/v1/teams/{team}/injuries"):
+        try:
+            r = DATA.get(f"{ML_BASE}{path}", headers={"x-api-key": ODDS_KEY}, timeout=(3.05, 15))
+            print("probe", path, "status", r.status_code, "| cost", r.headers.get("x-credits-cost"),
+                  "| remaining", r.headers.get("x-credits-remaining"), flush=True)
+            print("probe raw:", json.dumps(r.json())[:1200], flush=True)
+        except Exception as e:
+            print("probe error", path, repr(e), flush=True)
 
 
 # ---------- pick scoring ----------
@@ -404,6 +407,8 @@ def scan():
                 kfair = mid / tot if tot else mid
                 fair, src, margin = kfair, "Kalshi", UNCERT
                 book_p = match_game(m, games, end)
+                if book_p is not None and abs(book_p - kfair) > MAX_DISAGREE:
+                    book_p = None   # too far apart: likely stale or mismatched, so don't trust it
                 if book_p is not None:
                     fair = BOOK_W * book_p + (1 - BOOK_W) * kfair
                     margin = UNCERT + 0.5 * abs(book_p - kfair)
@@ -1010,9 +1015,9 @@ def main():
     BUDGET.update(state.get("budget", {}))
     if not ODDS_KEY:
         print("No MONEYLINE_API_KEY set: Kalshi-only mode.", flush=True)
-    elif not state.get("injury_probed"):
+    elif not state.get("injury_probed_v2"):
         injury_probe()
-        state["injury_probed"] = True
+        state["injury_probed_v2"] = True
     print("sports bot started", flush=True)
     end, fails = time.time() + RUN_SECONDS, 0
     while time.time() < end:
