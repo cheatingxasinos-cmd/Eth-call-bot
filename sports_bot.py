@@ -112,6 +112,25 @@ COLLEGE = (
     "San Francisco=Dons;Pepperdine=Waves;Saint Louis=Billikens;Wichita State=Shockers;"
     "Northern Iowa=Panthers;Furman=Paladins;Chattanooga=Mocs;Delaware=Blue Hens;Towson=Tigers")
 
+COLLEGE_EXTRA = (
+    "North Dakota=Fighting Hawks;Central Arkansas=Bears;Florida A&M=Rattlers;UT Arlington=Mavericks;"
+    "Texas A&M-Corpus Christi=Islanders;Portland=Pilots;Tennessee-Martin=Skyhawks;"
+    "Southern University=Jaguars;Western Illinois=Leathernecks;Valparaiso=Beacons;"
+    "Bethune-Cookman=Wildcats;Lehigh=Mountain Hawks;Siena=Saints;Bryant=Bulldogs;Binghamton=Bearcats;"
+    "The Citadel=Bulldogs;West Georgia=Wolves;Kansas City=Roos;Campbell=Fighting Camels;"
+    "Southeast Missouri State=Redhawks;Morehead State=Eagles;Saint Peter's=Peacocks;"
+    "Southern Indiana=Screaming Eagles;Louisiana Tech=Bulldogs;Louisiana-Monroe=Warhawks;"
+    "Denver=Pioneers;Canisius=Golden Griffins;Tennessee Tech=Golden Eagles;Mercyhurst=Lakers;"
+    "Eastern Kentucky=Colonels;St. Thomas=Tommies;Presbyterian=Blue Hose;Howard=Bison;"
+    "Northeastern=Huskies;Boston University=Terriers;Little Rock=Trojans;Vermont=Catamounts;"
+    "Iona=Gaels;Elon=Phoenix;Marist=Red Foxes;UMass Lowell=River Hawks;Western Carolina=Catamounts;"
+    "Wright State=Raiders;USC Upstate=Spartans;New Hampshire=Wildcats;Charleston Southern=Buccaneers;"
+    "UNC Wilmington=Seahawks;NJIT=Highlanders;Florida Gulf Coast=Eagles;American=Eagles;"
+    "St. Bonaventure=Bonnies;UNC Asheville=Bulldogs;Mount St. Mary's=Mountaineers;Lafayette=Leopards;"
+    "New Haven=Chargers;Monmouth=Hawks;Loyola Maryland=Greyhounds;UAB=Blazers;McNeese=Cowboys;"
+    "UMBC=Retrievers;Northern Kentucky=Norse;Tennessee State=Tigers;Winthrop=Eagles;"
+    "Queens University=Royals;Merrimack=Warriors;Grambling State=Tigers;High Point=Panthers")
+
 ALIASES = {
     "NBA": {"Los Angeles L": "Los Angeles Lakers", "Los Angeles C": "Los Angeles Clippers",
             "LA Lakers": "Los Angeles Lakers", "LA Clippers": "Los Angeles Clippers"},
@@ -129,6 +148,8 @@ COLLEGE_ALIASES = {"Connecticut": "UConn", "Pitt": "Pittsburgh", "Mississippi": 
                    "Southern California": "USC", "Appalachian State": "App State", "UL Lafayette": "Louisiana",
                    "Florida International": "FIU", "Central Florida": "UCF", "Massachusetts": "UMass",
                    "Southern Methodist": "SMU", "Louisiana State": "LSU", "Brigham Young": "BYU"}
+COLLEGE_ALIASES.update({"Florida AM": "Florida A&M", "University of North Texas": "North Texas",
+                        "UNT": "North Texas"})
 
 
 def _prefix_map(names):
@@ -154,7 +175,7 @@ def _build_names():
             mp[_norm(a)] = full
         out[lg] = mp
     col = {}
-    schools = dict(x.split("=", 1) for x in COLLEGE.split(";"))
+    schools = dict(x.split("=", 1) for x in (COLLEGE + ";" + COLLEGE_EXTRA).split(";"))
     for school, mascot in schools.items():
         col[_norm(school)] = f"{school} {mascot}"
     for a, school in COLLEGE_ALIASES.items():
