@@ -6,7 +6,7 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -14,35 +14,38 @@ from urllib3.util.retry import Retry
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
+ODDS_KEY = os.environ.get("ODDS_API_KEY", "")
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
-ESPN = "https://site.api.espn.com/apis/site/v2/sports"
+ODDS_API = "https://api.the-odds-api.com/v4/sports"
 
-# Kalshi game-winner series. VERIFY these tickers on Kalshi. Override with SERIES env (comma list).
+# Kalshi game-winner series. Override with SERIES env (comma list).
 SERIES = [s.strip() for s in os.getenv(
-    "SERIES", "KXNBAGAME,KXNFLGAME,KXMLBGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXEPLGAME,KXMLSGAME"
+    "SERIES", "KXNBAGAME,KXNFLGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXEPLGAME,KXMLSGAME"
 ).split(",") if s.strip()]
 
-# Kalshi series -> ESPN scoreboard path
-ESPN_LEAGUES = {
-    "KXNBAGAME": "basketball/nba", "KXNFLGAME": "football/nfl", "KXMLBGAME": "baseball/mlb",
-    "KXNHLGAME": "hockey/nhl", "KXNCAAFGAME": "football/college-football",
-    "KXNCAAMBGAME": "basketball/mens-college-basketball", "KXEPLGAME": "soccer/eng.1",
-    "KXMLSGAME": "soccer/usa.1"}
+# Kalshi series -> The Odds API sport key
+ODDS_SPORTS = {
+    "KXNBAGAME": "basketball_nba", "KXNFLGAME": "americanfootball_nfl",
+    "KXMLBGAME": "baseball_mlb", "KXNHLGAME": "icehockey_nhl",
+    "KXNCAAFGAME": "americanfootball_ncaaf", "KXNCAAMBGAME": "basketball_ncaab",
+    "KXEPLGAME": "soccer_epl", "KXMLSGAME": "soccer_usa_mls"}
 
+BOOKS = os.getenv("ODDS_BOOKS", "draftkings").strip()   # "" = average all US books
+SRC_LABEL = "DraftKings" if BOOKS == "draftkings" else "Books"
 POLL = float(os.getenv("POLL_SECONDS", "30"))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))    # skip thin markets (bid/ask gap in dollars)
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))
 PMIN, PMAX = float(os.getenv("PMIN", "0.15")), float(os.getenv("PMAX", "0.92"))
-HOURS_AHEAD = float(os.getenv("HOURS_AHEAD", "48"))    # markets closing within this many hours
-ESPN_W = float(os.getenv("ESPN_W", "0.75"))            # weight of ESPN odds in the blend
-ESPN_TTL = float(os.getenv("ESPN_TTL", "300"))         # seconds to cache ESPN scoreboards
-TOP_N = int(os.getenv("TOP_N", "5"))                   # new picks posted per tick
+HOURS_AHEAD = float(os.getenv("HOURS_AHEAD", "48"))
+BOOK_W = float(os.getenv("BOOK_W", "0.75"))            # weight of sportsbook odds in the blend
+ODDS_TTL = float(os.getenv("ODDS_TTL", "1800"))        # seconds between odds refreshes (protects quota)
+TOP_N = int(os.getenv("TOP_N", "5"))
 MAX_OPEN = int(os.getenv("MAX_OPEN", "25"))
 KELLY_FRAC = float(os.getenv("KELLY_FRAC", "0.25"))
-MAX_STAKE = float(os.getenv("MAX_STAKE", "0.05"))      # hard cap, fraction of bankroll
-MIN_GROWTH = float(os.getenv("MIN_GROWTH", "0.0002"))  # min expected log growth per bet
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.015"))       # min conservative edge (prob - price)
-UNCERT = float(os.getenv("UNCERT", "0.01"))            # base haircut on fair probability
-REQUIRE_ESPN = os.getenv("REQUIRE_ESPN", "1") == "1"   # Kalshi-only fair value has no independent edge
+MAX_STAKE = float(os.getenv("MAX_STAKE", "0.05"))
+MIN_GROWTH = float(os.getenv("MIN_GROWTH", "0.0002"))
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.015"))
+UNCERT = float(os.getenv("UNCERT", "0.01"))
+REQUIRE_BOOK = os.getenv("REQUIRE_BOOK", "1") == "1"
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", str(345 * 60)))
 STATE_FILE = os.getenv("STATE_FILE", "sports_state.json")
 EDIT_SECONDS = float(os.getenv("EDIT_SECONDS", "120"))
@@ -116,8 +119,12 @@ def fee(p):
     return math.ceil(0.07 * p * (1 - p) * 100) / 100
 
 
-# ---------- espn odds (public, no key) ----------
-ESPN_CACHE = {}
+# ---------- sportsbook odds (The Odds API) ----------
+ODDS_CACHE = {}
+
+# generic words that appear in many team names and cause false ties when matching
+STOP = {"state", "university", "college", "the", "city", "united", "fc", "sc", "new", "los", "san",
+        "saint", "north", "south", "east", "west", "tech", "univ", "and", "vs"}
 
 
 def american_to_prob(v):
@@ -135,89 +142,68 @@ def american_to_prob(v):
     return 100 / (n + 100) if n > 0 else -n / (-n + 100)
 
 
-def _ml(o, side):
-    t = o.get(f"{side}TeamOdds") or {}
-    if t.get("moneyLine") is not None:
-        return t["moneyLine"]
-    m = (o.get("moneyline") or {}).get(side) or {}
-    for k in ("close", "open"):
-        v = (m.get(k) or {}).get("odds")
-        if v is not None:
-            return v
-    return None
-
-
-def _draw(o):
-    d = o.get("drawOdds") or {}
-    if d.get("moneyLine") is not None:
-        return d["moneyLine"]
-    m = (o.get("moneyline") or {}).get("draw") or {}
-    for k in ("close", "open"):
-        v = (m.get(k) or {}).get("odds")
-        if v is not None:
-            return v
-    return None
-
-
-# generic words that appear in many team names and cause false ties when matching
-STOP = {"state", "university", "college", "the", "city", "united", "fc", "sc", "new", "los", "san",
-        "saint", "north", "south", "east", "west", "tech", "univ", "and", "vs"}
-
-
 def _words(s):
     return {w for w in re.findall(r"[a-z]+", (s or "").lower()) if len(w) >= 3 and w not in STOP}
 
 
-def team_tokens(t):
-    return _words(" ".join(str(t.get(k, "")) for k in ("displayName", "location", "name", "shortDisplayName")))
-
-
-def espn_games(series):
-    """Today's and tomorrow's games with a de-vigged moneyline, cached for ESPN_TTL seconds."""
-    path = ESPN_LEAGUES.get(series)
-    if not path:
+def odds_games(series):
+    """De-vigged moneyline from the chosen sportsbook(s), cached for ODDS_TTL seconds."""
+    key = ODDS_SPORTS.get(series)
+    if not key or not ODDS_KEY:
         return []
-    c = ESPN_CACHE.get(series)
-    if c and time.time() - c[0] < ESPN_TTL:
+    c = ODDS_CACHE.get(series)
+    if c and time.time() - c[0] < ODDS_TTL:
         return c[1]
-    games, seen = [], set()
-    now = datetime.now(timezone.utc)
-    days = [None] + [(now + timedelta(days=i)).strftime("%Y%m%d") for i in (1, 2)]
-    for day in days:
-        try:
-            data = get_json(f"{ESPN}/{path}/scoreboard", {"dates": day} if day else None)
-        except Exception as e:
-            print("espn error", series, repr(e), flush=True)
+    params = {"apiKey": ODDS_KEY, "markets": "h2h", "oddsFormat": "american"}
+    if BOOKS:
+        params["bookmakers"] = BOOKS
+    else:
+        params["regions"] = "us"
+    try:
+        data = get_json(f"{ODDS_API}/{key}/odds", params)
+    except Exception as e:
+        print("odds error", series, repr(e), flush=True)
+        ODDS_CACHE[series] = (time.time(), [])  # back off so errors do not burn quota
+        return []
+    games = []
+    for ev in data:
+        acc = {"home": [], "away": [], "draw": []}
+        for bk in ev.get("bookmakers", []):
+            for mk in bk.get("markets", []):
+                if mk.get("key") != "h2h":
+                    continue
+                probs = {}
+                for o in mk.get("outcomes", []):
+                    pr = american_to_prob(o.get("price"))
+                    if pr is None:
+                        continue
+                    n = o.get("name")
+                    if n == ev.get("home_team"):
+                        probs["home"] = pr
+                    elif n == ev.get("away_team"):
+                        probs["away"] = pr
+                    elif n == "Draw":
+                        probs["draw"] = pr
+                if "home" in probs and "away" in probs:
+                    tot = sum(probs.values())
+                    for k_, v in probs.items():
+                        acc[k_].append(v / tot)
+        if not acc["home"] or not acc["away"]:
             continue
-        for ev in data.get("events", []):
-            if ev.get("id") in seen:
-                continue
-            seen.add(ev.get("id"))
-            try:
-                comp = ev["competitions"][0]
-                odds = comp.get("odds") or []
-                if not odds:
-                    continue
-                o = odds[0]
-                teams = {c_["homeAway"]: c_["team"] for c_ in comp["competitors"]}
-                ph, pa = american_to_prob(_ml(o, "home")), american_to_prob(_ml(o, "away"))
-                if ph is None or pa is None:
-                    continue
-                parts = {"home": ph, "away": pa}
-                pd_ = american_to_prob(_draw(o))
-                if pd_ is not None:
-                    parts["draw"] = pd_
-                tot = sum(parts.values())
-                games.append({"start": ts(ev["date"]), "fair": {k: v / tot for k, v in parts.items()},
-                              "home": team_tokens(teams["home"]), "away": team_tokens(teams["away"])})
-            except Exception:
-                continue
-    ESPN_CACHE[series] = (time.time(), games)
+        fair = {k_: sum(v) / len(v) for k_, v in acc.items() if v}
+        s = sum(fair.values())
+        try:
+            start = ts(ev["commence_time"])
+        except Exception:
+            continue
+        games.append({"start": start, "fair": {k_: v / s for k_, v in fair.items()},
+                      "home": _words(ev.get("home_team")), "away": _words(ev.get("away_team"))})
+    ODDS_CACHE[series] = (time.time(), games)
     return games
 
 
-def match_espn(m, games, end):
-    """Return (side, game) if this Kalshi market clearly pays on one ESPN team (or the draw)."""
+def match_game(m, games, end):
+    """Return (side, game) if this Kalshi market clearly pays on one team (or the draw)."""
     sub = (m.get("yes_sub_title") or "").lower().strip()
     subt, title = _words(sub), _words(m.get("title"))
     best = None
@@ -269,19 +255,27 @@ def evaluate(m, p_yes, margin):
 LAST_LOG = [0.0]
 
 
+def in_window(m, now):
+    try:
+        end = ts(m.get("expected_expiration_time") or m["close_time"])
+    except Exception:
+        return False
+    return 0 < end - now < HOURS_AHEAD * 3600
+
+
 def scan():
-    """Fair value = ESPN moneyline (de-vigged) blended with Kalshi's sibling-market midpoint.
-    Picks are ranked by expected log bankroll growth."""
+    """Fair value = sportsbook moneyline (de-vigged) blended with Kalshi's sibling-market midpoint."""
     picks, now = [], time.time()
-    st = {"markets": 0, "no_quote": 0, "wide": 0, "no_espn": 0, "no_edge": 0, "thin": 0, "espn": 0}
-    near = None  # best raw edge seen, for diagnostics
+    st = {"markets": 0, "no_quote": 0, "wide": 0, "no_book": 0, "no_edge": 0, "thin": 0, "matched": 0}
+    near = None
     for series in SERIES:
         try:
             mkts = kalshi_markets(series)
         except Exception as e:
             print("scan error", series, repr(e), flush=True)
             continue
-        games = espn_games(series)
+        # only spend odds quota on sports that have markets closing soon
+        games = odds_games(series) if any(in_window(m, now) for m in mkts) else []
         events = {}
         for m in mkts:
             events.setdefault(m.get("event_ticker") or m["ticker"], []).append(m)
@@ -296,12 +290,9 @@ def scan():
                 mids[m["ticker"]] = (a + b) / 2
             tot = sum(v for v in mids.values() if v) if all_ok and len(ms) >= 2 else None
             for m in ms:
-                try:
-                    end = ts(m.get("expected_expiration_time") or m["close_time"])
-                except Exception:
+                if not in_window(m, now):
                     continue
-                if not (0 < end - now < HOURS_AHEAD * 3600):
-                    continue
+                end = ts(m.get("expected_expiration_time") or m["close_time"])
                 st["markets"] += 1
                 mid = mids.get(m["ticker"])
                 if mid is None:
@@ -313,16 +304,16 @@ def scan():
                     continue
                 kfair = mid / tot if tot else mid
                 fair, src, margin = kfair, "Kalshi", UNCERT
-                hit = match_espn(m, games, end)
+                hit = match_game(m, games, end)
                 if hit:
                     side, g = hit
-                    espn_p = g["fair"][side]
-                    fair = ESPN_W * espn_p + (1 - ESPN_W) * kfair
-                    margin = UNCERT + 0.5 * abs(espn_p - kfair)
-                    src = "ESPN+Kalshi"
-                    st["espn"] += 1
-                elif REQUIRE_ESPN:
-                    st["no_espn"] += 1
+                    book_p = g["fair"][side]
+                    fair = BOOK_W * book_p + (1 - BOOK_W) * kfair
+                    margin = UNCERT + 0.5 * abs(book_p - kfair)
+                    src = SRC_LABEL + "+Kalshi"
+                    st["matched"] += 1
+                elif REQUIRE_BOOK:
+                    st["no_book"] += 1
                     continue
                 raw = max(fair - a, b - fair)
                 if near is None or raw > near[0]:
@@ -342,8 +333,8 @@ def scan():
     if now - LAST_LOG[0] >= 120:
         LAST_LOG[0] = now
         nr = f"{near[0] * 100:+.1f}c on {near[1]} ({near[2]})" if near else "n/a"
-        print(f"scan: {st['markets']} markets | espn-matched {st['espn']} | no quote {st['no_quote']} | "
-              f"wide {st['wide']} | no espn {st['no_espn']} | no edge {st['no_edge']} | "
+        print(f"scan: {st['markets']} markets | book-matched {st['matched']} | no quote {st['no_quote']} | "
+              f"wide {st['wide']} | no book {st['no_book']} | no edge {st['no_edge']} | "
               f"thin {st['thin']} | PICKS {len(picks)} | best raw edge {nr}", flush=True)
     return sorted(picks, key=lambda x: -x["growth"])
 
@@ -768,6 +759,9 @@ def tick(state):
 
 def main():
     state = load_state()
+    if not ODDS_KEY:
+        print("WARNING: ODDS_API_KEY is not set, so no sportsbook odds will load and no picks will post",
+              flush=True)
     print("sports bot started", flush=True)
     end, fails = time.time() + RUN_SECONDS, 0
     while time.time() < end:
