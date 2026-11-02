@@ -24,6 +24,10 @@ SERIES = [s.strip() for s in os.getenv(
     "SERIES", "KXNBAGAME,KXNFLGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXEPLGAME,KXMLSGAME"
 ).split(",") if s.strip()]
 
+# League label shown next to team names so "Atlanta" or "Ohio" is never ambiguous.
+SPORT = {"KXNBAGAME": "NBA", "KXNFLGAME": "NFL", "KXNHLGAME": "NHL", "KXNCAAFGAME": "NCAAF",
+         "KXNCAAMBGAME": "NCAAM", "KXEPLGAME": "EPL", "KXMLSGAME": "MLS"}
+
 SRC_LABEL = "MoneyLine"
 POLL = float(os.getenv("POLL_SECONDS", "15"))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))
@@ -59,12 +63,14 @@ MONTHLY_CREDITS = int(os.getenv("MONTHLY_CREDITS", "1000"))
 CALL_COST = int(os.getenv("CALL_COST", "1"))              # credits per page fetched
 MIN_REMAINING = int(os.getenv("MIN_REMAINING", "20"))     # stop calling when account is this low
 ML_PAGES = int(os.getenv("ML_PAGES", "1"))                # pages (25 bets each) fetched per refresh
-STALE_MAX = float(os.getenv("STALE_MAX", "7200"))         # reuse old odds this long when over budget
+STALE_MAX = float(os.getenv("STALE_MAX", "7200"))         # reuse old odds this long when over budget or erroring
+RETRY_AFTER = float(os.getenv("RETRY_AFTER", "300"))      # seconds before retrying a failed MoneyLine call
 EDGE_MAX_AGE = float(os.getenv("EDGE_MAX_AGE", "10800"))  # ignore MoneyLine bets calculated longer ago
 MAX_DISAGREE = float(os.getenv("MAX_DISAGREE", "0.20"))   # distrust fair values this far from Kalshi
 BUDGET = {"day": "", "used": 0, "month": "", "month_used": 0, "remaining": None}
 API_DOWN = [False]
 LOADED = [0]
+RETRY_AT = [0.0]
 
 
 # ---------- http ----------
@@ -132,7 +138,7 @@ def kalshi_market(ticker):
 
 def fee(p):
     """Kalshi taker fee for one contract, rounded up to the cent."""
-    return math.ceil(0.07 * p * (1 - p) * 100) / 100
+    return math.ceil(round(0.07 * p * (1 - p) * 100, 6)) / 100
 
 
 # ---------- sportsbook fair values (MoneyLine EV bets, credit-capped) ----------
@@ -188,8 +194,9 @@ def _parse_edges(items, now):
             if it.get("calculatedAt") and now - ts(it["calculatedAt"]) > EDGE_MAX_AGE:
                 continue
             key = (it.get("eventId"), team)
-            cand = {"start": ts(it["startTime"]), "team": words, "fair": float(fair),
-                    "sport": it.get("sport"), "books": ev.get("consensusBooks") or 0}
+            cand = {"start": ts(it["startTime"]), "team": words, "name": str(team).strip(),
+                    "fair": float(fair), "sport": it.get("sport"),
+                    "books": ev.get("consensusBooks") or 0}
             if key not in best or cand["books"] > best[key]["books"]:
                 best[key] = cand
         except Exception:
@@ -206,6 +213,9 @@ def odds_games(series):
     age = time.time() - c[0] if c else None
     if c and age < ODDS_TTL:
         return c[1]
+    if time.time() < RETRY_AT[0]:
+        # recent failure: keep using older fair values until they go stale
+        return c[1] if c and age < STALE_MAX else []
     rem = BUDGET.get("remaining")
     over = (BUDGET["used"] + CALL_COST > DAILY_CREDITS or
             BUDGET["month_used"] + CALL_COST > MONTHLY_CREDITS or
@@ -241,11 +251,11 @@ def odds_games(series):
         if status in (401, 402, 403, 429):
             BUDGET["used"] = DAILY_CREDITS   # provider refused: stop for today
         API_DOWN[0] = True
-        ODDS_CACHE["ALL"] = (time.time(), [])
-        LOADED[0] = 0
-        print("moneyline error", repr(e), "-> Kalshi-only until next refresh", flush=True)
-        return []
+        RETRY_AT[0] = time.time() + RETRY_AFTER   # keep the old cache, just retry soon
+        print("moneyline error", repr(e), "-> retry in", int(RETRY_AFTER), "s", flush=True)
+        return c[1] if c and age < STALE_MAX else []
     API_DOWN[0] = False
+    RETRY_AT[0] = 0.0
     LOADED[0] = len(games)
     print(f"moneyline ok: {len(games)} fair values | credits today {BUDGET['used']}/{DAILY_CREDITS} | "
           f"account remaining {BUDGET.get('remaining')}", flush=True)
@@ -254,12 +264,12 @@ def odds_games(series):
 
 
 def match_game(m, games, end):
-    """Return the sportsbook fair YES probability if exactly one MoneyLine bet matches this market.
+    """Return (fair YES probability, full team name) if exactly one MoneyLine bet matches this market.
     Games that already started are skipped: their pre-game odds are stale against live Kalshi prices."""
     sub = (m.get("yes_sub_title") or "").lower().strip()
     subt = _words(sub)
     if not subt or sub in ("tie", "draw"):
-        return None
+        return None, None
     now = time.time()
     found = None
     for g in games:
@@ -270,9 +280,9 @@ def match_game(m, games, end):
         if not (subt <= g["team"] or g["team"] <= subt):
             continue
         if found is not None:
-            return None  # ambiguous
-        found = g["fair"]
-    return found
+            return None, None  # ambiguous
+        found = (g["fair"], g["name"])
+    return found if found else (None, None)
 
 
 def injury_probe():
@@ -373,6 +383,7 @@ def scan():
             print("scan error", series, repr(e), flush=True)
             continue
         games = odds_games(series) if any(in_window(m, now) for m in mkts) else []
+        league = SPORT.get(series, series)
         events = {}
         for m in mkts:
             events.setdefault(m.get("event_ticker") or m["ticker"], []).append(m)
@@ -406,9 +417,9 @@ def scan():
                     continue
                 kfair = mid / tot if tot else mid
                 fair, src, margin = kfair, "Kalshi", UNCERT
-                book_p = match_game(m, games, end)
+                book_p, book_name = match_game(m, games, end)
                 if book_p is not None and abs(book_p - kfair) > MAX_DISAGREE:
-                    book_p = None   # too far apart: likely stale or mismatched, so don't trust it
+                    book_p, book_name = None, None   # too far apart: likely stale or mismatched
                 if book_p is not None:
                     fair = BOOK_W * book_p + (1 - BOOK_W) * kfair
                     margin = UNCERT + 0.5 * abs(book_p - kfair)
@@ -418,19 +429,20 @@ def scan():
                     st["no_book"] += 1
                     continue
                 marks[m["ticker"]] = (fair, margin, a, b)
+                label = book_name or m.get("yes_sub_title") or m["ticker"]
+                title = (m.get("title") or "").replace(" Winner?", "")
+                game = f"{league} | {title}" if title else f"{league} | {m['ticker']}"
                 lz = lean(m, fair)
                 if lz:
-                    leans.append({**lz, "team": m.get("yes_sub_title") or m["ticker"],
-                                  "game": (m.get("title") or "").replace(" Winner?", "") or m["ticker"],
+                    leans.append({**lz, "team": label, "game": game,
                                   "ticker": m["ticker"], "event": ev_key, "src": src})
                 raw = max(fair - a, b - fair)
                 if near is None or raw > near[0]:
                     near = (raw, m["ticker"], src)
                 r = evaluate(m, fair, margin)
-                title = (m.get("title") or "").replace(" Winner?", "")
                 base_pick = {"ticker": m["ticker"], "series": series, "event": ev_key,
-                             "team": m.get("yes_sub_title") or m["ticker"], "title": title,
-                             "game": title or m["ticker"], "commence": end,
+                             "team": label, "title": title,
+                             "game": game, "commence": end,
                              "p_yes": fair, "books": len(ms), "src": src}
                 if r and r["growth"] >= MIN_GROWTH and r["edge"] >= MIN_EDGE:
                     picks.append({**r, **base_pick})
@@ -454,24 +466,40 @@ def scan():
 
 
 # ---------- chart ----------
-CW, CH = 720, 880
+CW, CH = 800, 480
 WHITE, MUTED = (255, 255, 255, 255), (160, 168, 178, 255)
 C_UP, C_DN = (0, 217, 142), (255, 87, 87)
-ORG, CYAN, AMBER = (255, 140, 58), (0, 229, 255), (255, 190, 40)
+AMBER = (255, 190, 40)
+NEON_C, NEON_M, NEON_P, NEON_G = (34, 229, 240), (232, 58, 216), (255, 61, 139), (34, 229, 138)
 
 
 @functools.lru_cache(maxsize=64)
-def _font(size, bold=True):
+def _mono(size, bold=True):
     names = ([os.getenv("CHART_FONT", "")] +
-             (["DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "arialbd.ttf"] if bold
-              else ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "arial.ttf"]))
-    for n in names:
-        if n:
+             (["DejaVuSansMono-Bold.ttf", "LiberationMono-Bold.ttf", "courbd.ttf"] if bold
+              else ["DejaVuSansMono.ttf", "LiberationMono-Regular.ttf", "cour.ttf"]))
+    for nm in names:
+        if nm:
             try:
-                return ImageFont.truetype(n, size)
+                return ImageFont.truetype(nm, size)
             except OSError:
                 pass
     return ImageFont.load_default()
+
+
+def _sp(d, xy, s, font, fill, sp=0.0, anchor="l"):
+    """Letter-spaced text. anchor: l, m or r (vertically centred)."""
+    w = sum(d.textlength(c, font=font) + sp for c in s) - sp
+    x, y = xy
+    x = x - w if anchor == "r" else x - w / 2 if anchor == "m" else x
+    for c in s:
+        d.text((x, y), c, font=font, fill=fill, anchor="lm")
+        x += d.textlength(c, font=font) + sp
+
+
+def _vgrad(w, h, top, bot):
+    g = Image.linear_gradient("L").resize((max(1, int(w)), max(1, int(h))))
+    return ImageOps.colorize(g, top, bot).convert("RGBA")
 
 
 def _dots(d, x0, y0, x1, y1, fill, w=1, on=3.0, off=5.0):
@@ -504,198 +532,177 @@ def _hhmm(s):
 
 def render_frames(p, outcome, S, n):
     k = lambda v: v * S
-    F = lambda sz, b=True: _font(max(6, int(k(sz))), b)
     lw = lambda v: max(1, int(k(v)))
+    M = lambda sz, b=True: _mono(max(6, int(k(sz))), b)
     W, H = int(CW * S), int(CH * S)
     accent = {"win": C_UP, "loss": C_DN}.get(outcome)
-    price, fair = p["price"], p["p"]
+    price, fair = p["price"], max(p["p"], 0.01)
     src = p.get("src", "Kalshi")
     edge = (fair - price) * 100
-    side_col = C_UP if p["side"] == "YES" else C_DN
+    ev_c = NEON_G if edge >= 0 else (255, 87, 87)
+    side_col = NEON_G if p["side"] == "YES" else NEON_P
     pts = p.get("pts") or [[time.time(), price, fair]]
     t0 = pts[0][0]
     t1 = max(pts[-1][0], t0 + 120)
+    ang = lambda q: (-90 + 360 * q) % 360
 
-    g = Image.linear_gradient("L").resize((W, H))
-    base = ImageOps.colorize(g, (13, 31, 31), (10, 10, 10)).convert("RGBA")
+    # background, grid, margin dots
+    base = _vgrad(W, H, (42, 10, 58), (100, 12, 36))
     d = ImageDraw.Draw(base, "RGBA")
-    rng = random.Random(7)
-    for _ in range(50):
-        sx, sy = rng.randint(0, W), rng.randint(0, int(H * 0.22))
-        r = k(rng.choice((0.6, 0.9, 1.2)))
-        d.ellipse([sx - r, sy - r, sx + r, sy + r], fill=(255, 255, 255, rng.randint(40, 110)))
+    for x in range(0, CW + 1, 25):
+        d.line([(k(x), 0), (k(x), H)], fill=(255, 255, 255, 13), width=1)
+    for y in range(0, CH + 1, 25):
+        d.line([(0, k(y)), (W, k(y))], fill=(255, 255, 255, 13), width=1)
+    rng = random.Random(sum(map(ord, p["team"])))
+    for _ in range(10):
+        x = rng.randint(4, CW - 4)
+        y = rng.choice((rng.randint(4, 18), rng.randint(CH - 18, CH - 4)))
+        d.ellipse([k(x - 1.5), k(y - 1.5), k(x + 1.5), k(y + 1.5)], fill=NEON_C + (150,))
 
-    team = p["team"][:22]
-    init = "".join(w[0] for w in p["team"].split()[:2]).upper() or "?"
-    d.ellipse([k(24), k(24), k(88), k(88)], fill=side_col + (255,), outline=(255, 255, 255, 120), width=lw(2))
-    d.text((k(56), k(56)), init, font=F(24), fill=WHITE, anchor="mm")
-    d.text((k(104), k(46)), team, font=F(26), fill=WHITE, anchor="lm")
-    d.text((k(104), k(74)), p["game"][:44], font=F(13, False), fill=MUTED, anchor="lm")
+    # card with gradient outline
+    CX0, CY0, CX1, CY1 = 24, 24, 776, 456
+    d.rounded_rectangle([k(CX0), k(CY0), k(CX1), k(CY1)], radius=k(16), fill=(26, 5, 34, 238))
+    gw, gh = int(k(CX1 - CX0)), int(k(CY1 - CY0))
+    grad = ImageOps.colorize(Image.linear_gradient("L").rotate(90, expand=True).resize((gw, gh)),
+                             NEON_C, NEON_M).convert("RGBA")
+    ring = Image.new("L", (gw, gh), 0)
+    ImageDraw.Draw(ring).rounded_rectangle([0, 0, gw - 1, gh - 1], radius=int(k(16)), outline=255,
+                                           width=lw(2.5))
+    base.paste(grad, (int(k(CX0)), int(k(CY0))), ring)
+    d = ImageDraw.Draw(base, "RGBA")
+
+    # header
+    cx, cy = k(50), k(52)
+    d.polygon([(cx, cy - k(7)), (cx + k(7), cy), (cx, cy + k(7)), (cx - k(7), cy)], fill=NEON_C + (255,))
+    _sp(d, (k(66), k(52)), f"{p['team'].upper()[:26]}  {p['side']}", M(16), NEON_C + (255,), k(1))
+    _sp(d, (k(44), k(76)), p["game"][:62], M(9, False), MUTED, k(0.5))
     left = p["commence"] - time.time()
-    ring = outcome is None
-    btxt, bcol = (("Closes " + _hhmm(left)), (255, 255, 255)) if ring else (outcome.upper(), accent)
-    fb = F(18)
-    bw = d.textlength(btxt, font=fb) / S + (62 if ring else 36)
-    bx0 = 696 - bw
-    d.rounded_rectangle([k(bx0), k(30), k(696), k(78)], radius=k(16), fill=(255, 255, 255, 26),
-                        outline=bcol + (190,), width=lw(2))
-    if ring:
-        cx, cy, r = k(bx0 + 28), k(54), k(11)
-        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(255, 255, 255, 40), width=lw(3))
-        frac = max(0.0, min(1.0, left / (HOURS_AHEAD * 3600)))
-        if frac > 0.003:
-            d.arc([cx - r, cy - r, cx + r, cy + r], -90, -90 + 360 * frac, fill=bcol + (255,), width=lw(3))
-        d.text((k(bx0 + 46), k(54)), btxt, font=fb, fill=bcol + (255,), anchor="lm")
+    if outcome is None:
+        _sp(d, (k(734), k(52)), "LIVE", M(10), NEON_M + (255,), k(1.5), "r")
+        _sp(d, (k(756), k(76)), "CLOSES " + _hhmm(left), M(9, False), MUTED, k(0.5), "r")
     else:
-        d.text((k(bx0 + bw / 2), k(54)), btxt, font=fb, fill=bcol + (255,), anchor="mm")
+        _sp(d, (k(756), k(52)), outcome.upper(), M(14), accent + (255,), k(1.5), "r")
+    _sp(d, (k(44), k(104)), "EDGE HISTORY", M(10, False), (214, 58, 208, 255), k(1.5))
+    _sp(d, (k(444), k(104)), "LIVE ODDS", M(10, False), (214, 58, 208, 255), k(1.5))
 
-    ev_c = C_UP if edge >= 0 else C_DN
-    cards = [("KALSHI PRICE", f"{price * 100:.0f}c", ORG, p["side"] + " ask", None),
-             ("IMPLIED FAIR", f"{fair * 100:.1f}%", CYAN, src[:22] + " blend", None),
-             ("EDGE", f"{edge:+.1f} pts", ev_c, f"EV {p['ev'] * 100:+.1f}c after fees", edge >= 0)]
-    cwid = (672 - 20) / 3
-    for i, (lab, val, col, sub, arrow) in enumerate(cards):
-        x0 = 24 + i * (cwid + 10)
-        d.rounded_rectangle([k(x0), k(100), k(x0 + cwid), k(182)], radius=k(14), fill=(255, 255, 255, 16),
-                            outline=(255, 255, 255, 30), width=lw(1))
-        d.rounded_rectangle([k(x0 + 14), k(100), k(x0 + 14 + 40), k(103)], radius=k(2), fill=col + (255,))
-        d.text((k(x0 + 14), k(122)), lab, font=F(11, False), fill=MUTED, anchor="lm")
-        d.text((k(x0 + 14), k(150)), val, font=F(26), fill=col + (255,), anchor="lm")
-        d.text((k(x0 + 14), k(171)), sub, font=F(10, False), fill=MUTED, anchor="lm")
-        if arrow is not None:
-            _arrow(d, k(x0 + cwid - 22), k(140), arrow, k(9), col + (255,))
+    # 7 edge bars
+    vals = [(b - a) * 100 for _, a, b in pts][-7:]
+    slots = [None] * (7 - len(vals)) + vals
+    emax = max([abs(v) for v in vals] + [0.5])
+    BY, bw_, pitch = 206, 38, 52
+    for i, v in enumerate(slots):
+        x = 44 + i * pitch
+        if v is None:
+            d.rounded_rectangle([k(x), k(BY - 3), k(x + bw_), k(BY)], radius=k(1), fill=(255, 255, 255, 22))
+        else:
+            h_ = max(6, abs(v) / emax * 78)
+            top, bot = (NEON_C, (255, 45, 168)) if v >= 0 else ((255, 87, 87), (140, 20, 60))
+            gi = _vgrad(k(bw_), k(h_), top, bot)
+            mk = Image.new("L", gi.size, 0)
+            ImageDraw.Draw(mk).rounded_rectangle([0, 0, gi.size[0] - 1, gi.size[1] - 1], radius=int(k(3)), fill=255)
+            base.paste(gi, (int(k(x)), int(k(BY - h_))), mk)
+            d = ImageDraw.Draw(base, "RGBA")
+            d.text((k(x + bw_ / 2), k(BY - h_ - 7)), f"{v:+.1f}", font=M(8, False), fill=WHITE, anchor="mm")
+        d.text((k(x + bw_ / 2), k(BY + 12)), f"{i + 1:02d}", font=M(8, False), fill=(138, 127, 168, 255), anchor="mm")
+    d.line([(k(44), k(BY)), (k(394), k(BY))], fill=(110, 106, 142, 255), width=lw(1))
 
-    d.rounded_rectangle([k(12), k(196), k(708), k(562)], radius=k(18), fill=(255, 255, 255, 14),
-                        outline=(255, 255, 255, 28), width=lw(1))
-    d.text((k(26), k(214)), "PRICE vs FAIR VALUE", font=F(11), fill=MUTED, anchor="lm")
-    d.text((k(190), k(214)), "● Kalshi", font=F(11), fill=ORG + (255,), anchor="lm")
-    d.text((k(255), k(214)), "● Fair", font=F(11), fill=CYAN + (255,), anchor="lm")
-    PX0, PX1, PY0, PY1 = k(70), k(640), k(236), k(462)
-    pv = [a * 100 for _, a, _ in pts]
-    fv = [b * 100 for _, _, b in pts]
+    # price vs fair panel
+    d.rounded_rectangle([k(44), k(232), k(404), k(352)], radius=k(4), fill=(20, 3, 28, 255),
+                        outline=(42, 168, 184, 180), width=lw(1))
+    _sp(d, (k(54), k(244)), "PRICE vs FAIR", M(8, False), MUTED, k(1))
+    _sp(d, (k(160), k(244)), "● KALSHI", M(8), NEON_M + (255,), k(0.5))
+    _sp(d, (k(232), k(244)), "● FAIR", M(8), NEON_C + (255,), k(0.5))
+    pv, fv = [a * 100 for _, a, _ in pts], [b * 100 for _, _, b in pts]
     entry = (p.get("entry_price") or price) * 100
-    vals = pv + fv + [entry]
-    lo, hi = min(vals), max(vals)
+    allv = pv + fv + [entry]
+    lo, hi = min(allv), max(allv)
     if hi - lo < 4:
-        m = (hi + lo) / 2
-        lo, hi = m - 2, m + 2
+        mid = (hi + lo) / 2
+        lo, hi = mid - 2, mid + 2
     pad = (hi - lo) * 0.15
     lo, hi = lo - pad, hi + pad
+    PX0, PX1, PY0, PY1 = k(60), k(366), k(262), k(340)
     X = lambda t: PX0 + (t - t0) / (t1 - t0) * (PX1 - PX0)
     Y = lambda v: PY1 - (v - lo) / (hi - lo) * (PY1 - PY0)
-    xs = [X(t) for t, _, _ in pts]
-
-    d.text(((PX0 + PX1) / 2, (PY0 + PY1) / 2), p["side"], font=F(120), fill=side_col + (14,), anchor="mm")
-    for i in range(5):
-        v = lo + (hi - lo) * i / 4
+    xs = [X(t) for t, _, _ in pts] if len(pts) > 1 else [(PX0 + PX1) / 2]
+    for i in range(3):
+        v = lo + (hi - lo) * i / 2
         _dots(d, PX0, Y(v), PX1, Y(v), (150, 165, 200, 40), lw(1), k(2), k(5))
-        d.text((PX1 + k(8), Y(v)), f"{v:.1f}c", font=F(10, False), fill=MUTED, anchor="lm")
-    for i in range(4):
-        fr = i / 3
-        x = PX0 + (PX1 - PX0) * fr
-        if 0 < fr < 1:
-            _dots(d, x, PY0, x, k(520), (150, 165, 200, 28), lw(1), k(2), k(6))
-        lbl = datetime.fromtimestamp(t0 + (t1 - t0) * fr, timezone.utc).strftime("%H:%M")
-        d.text((x, k(546)), lbl + (" UTC" if i == 3 else ""), font=F(10, False), fill=MUTED, anchor="mm")
-
-    if len(pts) > 1:
-        d.polygon([(x, Y(v)) for x, v in zip(xs, pv)] + [(xs[-1], PY1), (xs[0], PY1)], fill=ORG + (26,))
-        for i in range(len(pts) - 1):
-            c = C_UP if (fv[i] + fv[i + 1]) >= (pv[i] + pv[i + 1]) else C_DN
-            d.polygon([(xs[i], Y(fv[i])), (xs[i + 1], Y(fv[i + 1])),
-                       (xs[i + 1], Y(pv[i + 1])), (xs[i], Y(pv[i]))], fill=c + (60,))
-
-        def line_fn(vals_):
-            def fn(gd):
-                gd.line([(x, Y(v)) for x, v in zip(xs, vals_)], fill=255, width=lw(3), joint="curve")
-            return fn
-        _glow(base, line_fn(pv), ORG, k(4), 0.7)
-        _glow(base, line_fn(fv), CYAN, k(4), 0.7)
-        d = ImageDraw.Draw(base, "RGBA")
-        d.line([(x, Y(v)) for x, v in zip(xs, pv)], fill=ORG + (255,), width=lw(2.2), joint="curve")
-        d.line([(x, Y(v)) for x, v in zip(xs, fv)], fill=CYAN + (255,), width=lw(2.2), joint="curve")
-        hi_i = max(range(len(pv)), key=pv.__getitem__)
-        lo_i = min(range(len(pv)), key=pv.__getitem__)
-        d.text((xs[hi_i], max(PY0 + k(8), Y(pv[hi_i]) - k(9))), f"H {pv[hi_i]:.1f}", font=F(9),
-               fill=C_UP + (230,), anchor="mm")
-        d.text((xs[lo_i], min(PY1 - k(6), Y(pv[lo_i]) + k(9))), f"L {pv[lo_i]:.1f}", font=F(9),
-               fill=C_DN + (230,), anchor="mm")
-
+        d.text((PX1 + k(5), Y(v)), f"{v:.0f}c", font=M(8, False), fill=MUTED, anchor="lm")
     ey = Y(entry)
-    _dots(d, PX0, ey, PX1, ey, AMBER + (210,), lw(1.2), k(5), k(4))
-    _arrow(d, PX0 + k(10), ey - k(12), p["side"] == "YES", k(6), AMBER + (255,))
-    d.text((PX0 + k(22), ey - k(12)), f"ENTRY {entry:.0f}c", font=F(10), fill=AMBER + (255,), anchor="lm")
-
-    lx = xs[-1]
-    py_, fy_ = Y(pv[-1]), Y(fv[-1])
-    fy2 = fy_
-    if abs(py_ - fy_) < k(18):
-        fy2 = py_ + k(18) if fy_ >= py_ else py_ - k(18)
-    for yy, txt, col in ((py_, f"{pv[-1]:.1f}", ORG), (fy2, f"{fv[-1]:.1f}", CYAN)):
-        d.rounded_rectangle([PX1 + k(2), yy - k(9), k(706), yy + k(9)], radius=k(4), fill=col + (255,))
-        d.text((PX1 + k(6), yy), txt, font=F(11), fill=(8, 10, 20, 255), anchor="lm")
-    for cy_, c in ((py_, ORG), (fy_, CYAN)):
-        d.ellipse([lx - k(4), cy_ - k(4), lx + k(4), cy_ + k(4)], fill=c + (255,))
-
-    ES0, ES1 = k(484), k(520)
-    em = (ES0 + ES1) / 2
-    d.rounded_rectangle([PX0, ES0, PX1, ES1], radius=k(6), fill=(255, 255, 255, 10))
-    _dots(d, PX0, em, PX1, em, (150, 165, 200, 50), lw(1), k(2), k(4))
-    d.text((PX0 + k(6), ES0 + k(7)), "EDGE (fair - price)", font=F(8, False), fill=MUTED, anchor="lm")
-    edges = [b - a for a, b in zip(pv, fv)]
-    emax = max(max(abs(e) for e in edges), 0.5)
-    bwid = max(k(1.2), min(k(8), (PX1 - PX0) / max(len(pts), 1) * 0.7))
-    for x, e in zip(xs, edges):
-        h_ = abs(e) / emax * (ES1 - ES0) / 2
-        c = C_UP if e >= 0 else C_DN
-        d.rectangle([x - bwid / 2, em - h_ if e >= 0 else em, x + bwid / 2, em if e >= 0 else em + h_],
-                    fill=c + (200,))
-
+    _dots(d, PX0, ey, PX1, ey, AMBER + (200,), lw(1), k(5), k(4))
+    _sp(d, (PX0 + k(4), ey - k(8)), f"ENTRY {entry:.0f}c", M(8), AMBER + (255,))
+    if len(pts) > 1:
+        d.polygon([(x, Y(v)) for x, v in zip(xs, fv)] + [(x, Y(v)) for x, v in zip(xs[::-1], pv[::-1])],
+                  fill=ev_c + (45,))
+        _glow(base, lambda gd: gd.line([(x, Y(v)) for x, v in zip(xs, pv)], fill=255, width=lw(3), joint="curve"),
+              NEON_M, k(4), 0.8)
+        d = ImageDraw.Draw(base, "RGBA")
+        d.line([(x, Y(v)) for x, v in zip(xs, pv)], fill=NEON_M + (255,), width=lw(2), joint="curve")
+        for i in range(len(xs) - 1):
+            _dots(d, xs[i], Y(fv[i]), xs[i + 1], Y(fv[i + 1]), NEON_C + (230,), lw(1.4), k(4), k(3))
+    step = max(1, len(xs) // 14)
+    for i in list(range(0, len(xs), step)) + [len(xs) - 1]:
+        d.ellipse([xs[i] - k(3), Y(pv[i]) - k(3), xs[i] + k(3), Y(pv[i]) + k(3)], fill=NEON_C + (255,))
+    lx, py_, fy_ = xs[-1], Y(pv[-1]), Y(fv[-1])
+    d.ellipse([lx - k(3), fy_ - k(3), lx + k(3), fy_ + k(3)], fill=NEON_C + (255,))
     if outcome:
-        d.text(((PX0 + PX1) / 2, (PY0 + PY1) / 2), outcome.upper(), font=F(96), fill=accent + (80,), anchor="mm")
+        d.text(((PX0 + PX1) / 2, (PY0 + PY1) / 2), outcome.upper(), font=M(56), fill=accent + (80,), anchor="mm")
 
-    mx0, mx1 = k(24), k(696)
-    zx = mx0 + (mx1 - mx0) * 0.4
-    roi = p["roi"]
-    mxp = mx0 + (mx1 - mx0) * ((max(-0.10, min(0.15, roi)) + 0.10) / 0.25)
-    d.text((mx0, k(584)), "EV METER", font=F(11), fill=MUTED, anchor="lm")
-    d.text((mx1, k(584)), f"{roi * 100:+.1f}% ROI after fees", font=F(11), fill=ev_c + (255,), anchor="rm")
-    d.rectangle([mx0, k(596), zx, k(614)], fill=C_DN + (60,))
-    d.rectangle([zx, k(596), mx1, k(614)], fill=C_UP + (60,))
-    d.rectangle([min(zx, mxp), k(599), max(zx, mxp), k(611)], fill=ev_c + (230,))
-    d.rounded_rectangle([mxp - k(2), k(592), mxp + k(2), k(618)], radius=k(2), fill=WHITE)
-    d.text((mx0, k(630)), "-10%", font=F(9, False), fill=MUTED, anchor="lm")
-    d.text((zx, k(630)), "0", font=F(9, False), fill=MUTED, anchor="mm")
-    d.text((mx1, k(630)), "+15%", font=F(9, False), fill=MUTED, anchor="rm")
+    # badges
+    bwid = (360 - 20) / 3
+    for bi, (lab, val, col) in enumerate((("EV", f"{p['ev'] * 100:+.1f}c", ev_c),
+                                          ("ROI", f"{p['roi'] * 100:+.1f}%", ev_c),
+                                          ("STAKE", f"{p['kelly'] * 100:.1f}%", NEON_C))):
+        x0 = 44 + bi * (bwid + 10)
+        d.rounded_rectangle([k(x0), k(364), k(x0 + bwid), k(394)], radius=k(8), fill=(255, 255, 255, 14),
+                            outline=col + (170,), width=lw(1.5))
+        _sp(d, (k(x0 + 10), k(373)), lab, M(8, False), MUTED, k(1))
+        d.text((k(x0 + bwid - 10), k(384)), val, font=M(13), fill=col + (255,), anchor="rm")
 
-    d.text((mx0, k(652)), "PAYOFF PER CONTRACT", font=F(11), fill=MUTED, anchor="lm")
-    rw = (mx1 - mx0) * price
-    d.rectangle([mx0, k(662), mx0 + rw, k(688)], fill=C_DN + (200,))
-    d.rectangle([mx0 + rw, k(662), mx1, k(688)], fill=C_UP + (200,))
-    d.text((mx0 + k(10), k(675)), f"RISK {price * 100:.0f}c", font=F(12), fill=WHITE, anchor="lm")
-    d.text((mx1 - k(10), k(675)), f"WIN {(1 - price) * 100:.0f}c", font=F(12), fill=WHITE, anchor="rm")
+    # odds cards
+    cards = [(114, 164, (232, 48, 122), (74, 10, 58, 220), f"KALSHI {p['side']} ASK",
+              f"{price * 100:.0f}c to enter", f"{1 / price:.2f}", NEON_G, (217, 184, 208, 255)),
+             (172, 222, (34, 200, 224), (16, 42, 74, 220), f"{src.upper()[:20]} FAIR",
+              f"{fair * 100:.1f}% win prob", f"{1 / fair:.2f}", NEON_C, (184, 208, 224, 255))]
+    for y0, y1, oc, fc, lab, sub, val, vc, lc in cards:
+        d.rounded_rectangle([k(444), k(y0), k(756), k(y1)], radius=k(8), fill=fc, outline=oc + (255,), width=lw(1.8))
+        _sp(d, (k(456), k(y0 + 20)), lab, M(10, False), lc, k(1))
+        d.text((k(456), k(y0 + 38)), sub, font=M(8, False), fill=MUTED, anchor="lm")
+        d.text((k(744), k(y0 + 27)), val, font=M(26), fill=vc + (255,), anchor="rm")
 
-    blue = (60, 90, 140)
-    badges = [("EV", f"{p['ev']:+.3f}", C_UP if p["ev"] > 0 else C_DN),
-              ("ROI", f"{p['roi'] * 100:+.1f}%", C_UP if p["roi"] > 0 else C_DN),
-              ("FAIR", f"{fair * 100:.0f}%", blue), ("PRICE", f"{price * 100:.0f}c", blue),
-              ("STAKE", f"{p['kelly'] * 100:.1f}%", blue)]
-    gap, nb = 5, len(badges)
-    bwn = (720 - 48 - (nb - 1) * gap) / nb
-    for i, (nm, lab, bc) in enumerate(badges):
-        x0 = k(24 + i * (bwn + gap))
-        d.rounded_rectangle([x0, k(704), x0 + k(bwn), k(758)], radius=k(11), fill=bc + (255,),
-                            outline=(255, 255, 255, 70), width=lw(1.5))
-        d.text((x0 + k(bwn / 2), k(722)), nm, font=F(10, False), fill=(255, 255, 255, 215), anchor="mm")
-        d.text((x0 + k(bwn / 2), k(742)), lab, font=F(13), fill=WHITE, anchor="mm")
+    # edge block + gauge
+    _sp(d, (k(452), k(282)), "EDGE", M(9, False), MUTED, k(1.5))
+    d.text((k(452), k(312)), f"{edge:+.1f}", font=M(30), fill=ev_c + (255,), anchor="lm")
+    _arrow(d, k(574), k(312), edge >= 0, k(11), ev_c + (255,))
+    d.text((k(452), k(340)), f"EV {p['ev'] * 100:+.1f}c after fees", font=M(8, False), fill=MUTED, anchor="lm")
+    gx, gy, gr = k(672), k(312), k(50)
+    box = [gx - gr, gy - gr, gx + gr, gy + gr]
+    d.ellipse(box, outline=(106, 90, 122, 150), width=lw(1.2))
+    lo_q, hi_q = sorted((price, fair))
+    _glow(base, lambda gd: gd.arc(box, ang(0), ang(fair), fill=255, width=lw(6)), NEON_G, k(4), 0.7)
+    d = ImageDraw.Draw(base, "RGBA")
+    d.arc(box, ang(0), ang(fair), fill=NEON_G + (255,), width=lw(5))
+    if hi_q - lo_q > 0.003:
+        d.arc(box, ang(lo_q), ang(hi_q), fill=ev_c + (255,), width=lw(9))
+    pa = math.radians(-90 + 360 * price)
+    ex, ey2 = gx + math.cos(pa) * gr, gy + math.sin(pa) * gr
+    d.line([(gx, gy), (ex, ey2)], fill=NEON_P + (255,), width=lw(1.8))
+    d.ellipse([ex - k(4), ey2 - k(4), ex + k(4), ey2 + k(4)], fill=NEON_P + (255,))
+    d.ellipse([gx - k(4), gy - k(4), gx + k(4), gy + k(4)], fill=WHITE)
+    d.text((gx + math.cos(pa) * (gr + k(16)), gy + math.sin(pa) * (gr + k(12))), f"{price * 100:.0f}c",
+           font=M(9), fill=NEON_P + (255,), anchor="mm")
+    d.text((gx, k(380)), f"{fair * 100:.1f}%", font=M(13), fill=NEON_G + (255,), anchor="mm")
+    _sp(d, (gx, k(393)), "WIN PROB", M(8, False), (207, 207, 224, 255), k(1), "m")
 
-    d.rounded_rectangle([k(24), k(774), k(696), k(852)], radius=k(28), fill=side_col + (255,),
+    # buy bar
+    tc = (10, 10, 20, 255) if p["side"] == "YES" else WHITE
+    d.rounded_rectangle([k(44), k(404), k(756), k(446)], radius=k(14), fill=side_col + (238,),
                         outline=(accent + (255,)) if accent else None, width=lw(3))
-    _arrow(d, k(64), k(813), p["side"] == "YES", k(15), (255, 255, 255, 255))
-    d.text((k(380), k(800)), f"BUY {p['side']} at {price * 100:.0f}c · {1 / price:.2f}x payout",
-           font=F(21), fill=WHITE, anchor="mm")
-    d.text((k(380), k(828)), f"{src[:24]} · {p['ticker'][-14:]}", font=F(12, False),
-           fill=(255, 255, 255, 215), anchor="mm")
+    _arrow(d, k(72), k(425), p["side"] == "YES", k(11), tc)
+    d.text((k(410), k(418)), f"BUY {p['side']} at {price * 100:.0f}c  |  {1 / price:.2f}x payout",
+           font=M(15), fill=tc, anchor="mm")
+    d.text((k(410), k(435)), p["ticker"][-26:], font=M(8, False), fill=tc, anchor="mm")
 
     frames = []
     for f in range(n):
@@ -703,11 +710,11 @@ def render_frames(p, outcome, S, n):
         sn = math.sin(2 * math.pi * t)
         im = base.copy()
         fd = ImageDraw.Draw(im, "RGBA")
-        r = k(8 + 1.8 * sn)
-        for cy_, c in ((py_, ORG), (fy_, CYAN)):
-            fd.ellipse([lx - r, cy_ - r, lx + r, cy_ + r], outline=c + (255,), width=lw(2))
-        fd.rectangle([mxp - k(3), k(591), mxp + k(3), k(619)], outline=(255, 255, 255, int(120 + 100 * sn)),
-                     width=lw(1))
+        r = k(5 + 1.8 * sn)
+        if outcome is None:
+            fd.ellipse([k(746) - r, k(52) - r, k(746) + r, k(52) + r], fill=NEON_P + (int(150 + 90 * sn),))
+        fd.ellipse([lx - r * 1.6, py_ - r * 1.6, lx + r * 1.6, py_ + r * 1.6], outline=NEON_C + (200,), width=lw(1.5))
+        fd.ellipse([ex - r * 1.3, ey2 - r * 1.3, ex + r * 1.3, ey2 + r * 1.3], outline=NEON_P + (200,), width=lw(1.5))
         if accent:
             fd.rounded_rectangle([k(3), k(3), W - k(4), H - k(4)], radius=k(24),
                                  outline=accent + (int(110 + 90 * sn),), width=lw(4))
@@ -931,11 +938,13 @@ def tick(state):
     for a in sorted(arbs, key=lambda x: -x["profit"]):
         if sent >= 3 or now - state["arbs"].get(a["event"], 0) < ARB_REPEAT:
             continue
+        first_time = a["event"] not in state["arbs"]   # count profit once per game per 24h
         try:
             post_arb(a, state)
             state["arbs"][a["event"]] = now
-            state["arb_count"] += 1
-            state["arb_locked"] += a["profit"]
+            if first_time:
+                state["arb_count"] += 1
+                state["arb_locked"] += a["profit"]
             sent += 1
         except Exception as e:
             print("arb send error", repr(e), flush=True)
@@ -955,7 +964,11 @@ def tick(state):
         p["pts"] = [[round(now), round(p["price"], 4), round(p["p"], 4)]]
         p["entry_price"], p["last_edit"] = p["price"], now
         p["p0"], p["ev0"] = p["p"], p["ev"]
-        post(p, state)
+        try:
+            post(p, state)
+        except Exception as e:
+            print("pick send error", repr(e), flush=True)
+            continue
         state["open"][t] = p
         locked.add(p["event"])
         fresh += 1
