@@ -15,14 +15,33 @@ jobs:
     timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
+
       - run: pip install -r requirements.txt
-      - run: python sports_bot.py
+
+      - name: Restore bot state
+        uses: actions/cache/restore@v4
+        with:
+          path: sports_state.json
+          key: sports-state-${{ github.run_id }}
+          restore-keys: sports-state-
+
+      - name: Run bot
+        run: python sports_bot.py
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          MIN_EDGE: "0"
-          UNCERT: "0"
-          MIN_GROWTH: "0"
-          MAX_SPREAD: "0.2"
+          MONEYLINE_API_KEY: ${{ secrets.MONEYLINE_API_KEY }}
+          DAILY_CREDITS: "330"
+          MONTHLY_CREDITS: "9900"
+          ODDS_TTL: "300"
+          CALL_COST: "1"
+
+      - name: Save bot state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: sports_state.json
+          key: sports-state-${{ github.run_id }}
