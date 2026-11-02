@@ -22,4 +22,7 @@ jobs:
       - run: python sports_bot.py
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          MIN_ROI: "0"
+          MIN_EDGE: "0"
+          UNCERT: "0"
+          MIN_GROWTH: "0"
+          MAX_SPREAD: "0.2"
