@@ -33,12 +33,11 @@ jobs:
         run: python sports_bot.py
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          MONEYLINE_API_KEY: ${{ secrets.MONEYLINE_API_KEY }}
-          DAILY_CREDITS: "330"
-          MONTHLY_CREDITS: "9900"
-          CALL_COST: "1"
+          DAILY_CREDITS: "32"
+          MONTHLY_CREDITS: "1000"
+          CALL_COST: "8"
+          ODDS_TTL: "21600"
           REQUIRE_BOOK: "0"
-          ODDS_TTL: "3600"
 
       - name: Save bot state
         if: always()
