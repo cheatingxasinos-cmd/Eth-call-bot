@@ -36,9 +36,9 @@ jobs:
           MONEYLINE_API_KEY: ${{ secrets.MONEYLINE_API_KEY }}
           DAILY_CREDITS: "330"
           MONTHLY_CREDITS: "9900"
-          ODDS_TTL: "300"
           CALL_COST: "1"
-
+          REQUIRE_BOOK: "0"O
+          ODDS_TTL: "3600"
       - name: Save bot state
         if: always()
         uses: actions/cache/save@v4
