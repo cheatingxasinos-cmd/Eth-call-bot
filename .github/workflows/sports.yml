@@ -35,7 +35,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           MONEYLINE_API_KEY: ${{ secrets.MONEYLINE_API_KEY }}
           MONEYLINE_URL: "https://mlapi.bet/v1/edge/ev"
-          DAILY_CREDITS: "32"
+          DAILY_CREDITS: "302"
           MONTHLY_CREDITS: "1000"
           CALL_COST: "1"
           ODDS_TTL: "3600"
