@@ -21,12 +21,185 @@ KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 
 # Kalshi series scanned every tick (free, no key).
 SERIES = [s.strip() for s in os.getenv(
-    "SERIES", "KXNBAGAME,KXNFLGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXEPLGAME,KXMLSGAME"
+    "SERIES",
+    "KXNBAGAME,KXNFLGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXEPLGAME,KXMLSGAME,KXATPMATCH,KXWTAMATCH"
 ).split(",") if s.strip()]
 
 # League label shown next to team names so "Atlanta" or "Ohio" is never ambiguous.
 SPORT = {"KXNBAGAME": "NBA", "KXNFLGAME": "NFL", "KXNHLGAME": "NHL", "KXNCAAFGAME": "NCAAF",
-         "KXNCAAMBGAME": "NCAAM", "KXEPLGAME": "EPL", "KXMLSGAME": "MLS"}
+         "KXNCAAMBGAME": "NCAAM", "KXEPLGAME": "EPL", "KXMLSGAME": "MLS",
+         "KXATPMATCH": "ATP", "KXWTAMATCH": "WTA"}
+
+# ---------- full team names (city + nickname, school + mascot) ----------
+TEAMS_FILE = os.getenv("TEAMS_FILE", "team_names.json")   # optional: {"NCAAM": {"Ohio": "Ohio Bobcats"}}
+
+
+def _norm(s):
+    s = (s or "").lower().replace("&", " and ")
+    s = re.sub(r"['’.]", "", s)
+    s = re.sub(r"[()\-,]", " ", s)
+    s = re.sub(r"\bstate\b", "st", s)
+    s = re.sub(r"\bsaint\b", "st", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+NBA = ("Atlanta Hawks;Boston Celtics;Brooklyn Nets;Charlotte Hornets;Chicago Bulls;Cleveland Cavaliers;"
+       "Dallas Mavericks;Denver Nuggets;Detroit Pistons;Golden State Warriors;Houston Rockets;Indiana Pacers;"
+       "Los Angeles Lakers;Los Angeles Clippers;Memphis Grizzlies;Miami Heat;Milwaukee Bucks;"
+       "Minnesota Timberwolves;New Orleans Pelicans;New York Knicks;Oklahoma City Thunder;Orlando Magic;"
+       "Philadelphia 76ers;Phoenix Suns;Portland Trail Blazers;Sacramento Kings;San Antonio Spurs;"
+       "Toronto Raptors;Utah Jazz;Washington Wizards")
+NFL = ("Arizona Cardinals;Atlanta Falcons;Baltimore Ravens;Buffalo Bills;Carolina Panthers;Chicago Bears;"
+       "Cincinnati Bengals;Cleveland Browns;Dallas Cowboys;Denver Broncos;Detroit Lions;Green Bay Packers;"
+       "Houston Texans;Indianapolis Colts;Jacksonville Jaguars;Kansas City Chiefs;Las Vegas Raiders;"
+       "Los Angeles Chargers;Los Angeles Rams;Miami Dolphins;Minnesota Vikings;New England Patriots;"
+       "New Orleans Saints;New York Giants;New York Jets;Philadelphia Eagles;Pittsburgh Steelers;"
+       "San Francisco 49ers;Seattle Seahawks;Tampa Bay Buccaneers;Tennessee Titans;Washington Commanders")
+NHL = ("Anaheim Ducks;Boston Bruins;Buffalo Sabres;Calgary Flames;Carolina Hurricanes;Chicago Blackhawks;"
+       "Colorado Avalanche;Columbus Blue Jackets;Dallas Stars;Detroit Red Wings;Edmonton Oilers;"
+       "Florida Panthers;Los Angeles Kings;Minnesota Wild;Montreal Canadiens;Nashville Predators;"
+       "New Jersey Devils;New York Islanders;New York Rangers;Ottawa Senators;Philadelphia Flyers;"
+       "Pittsburgh Penguins;San Jose Sharks;Seattle Kraken;St. Louis Blues;Tampa Bay Lightning;"
+       "Toronto Maple Leafs;Utah Mammoth;Vancouver Canucks;Vegas Golden Knights;Washington Capitals;"
+       "Winnipeg Jets")
+EPL = ("Arsenal;Aston Villa;AFC Bournemouth;Brentford;Brighton and Hove Albion;Burnley;Chelsea;Crystal Palace;"
+       "Everton;Fulham;Leeds United;Liverpool;Manchester City;Manchester United;Newcastle United;"
+       "Nottingham Forest;Sunderland;Tottenham Hotspur;West Ham United;Wolverhampton Wanderers")
+MLS = ("Atlanta United FC;Austin FC;Charlotte FC;Chicago Fire FC;FC Cincinnati;Colorado Rapids;Columbus Crew;"
+       "D.C. United;FC Dallas;Houston Dynamo FC;Inter Miami CF;LA Galaxy;Los Angeles FC;Minnesota United FC;"
+       "CF Montreal;Nashville SC;New England Revolution;New York City FC;New York Red Bulls;Orlando City SC;"
+       "Philadelphia Union;Portland Timbers;Real Salt Lake;San Diego FC;San Jose Earthquakes;"
+       "Seattle Sounders FC;Sporting Kansas City;St. Louis City SC;Toronto FC;Vancouver Whitecaps FC")
+
+# school=mascot (full name is built as "school mascot")
+COLLEGE = (
+    "Boston College=Eagles;California=Golden Bears;Clemson=Tigers;Duke=Blue Devils;Florida State=Seminoles;"
+    "Georgia Tech=Yellow Jackets;Louisville=Cardinals;Miami (FL)=Hurricanes;NC State=Wolfpack;"
+    "North Carolina=Tar Heels;Notre Dame=Fighting Irish;Pittsburgh=Panthers;SMU=Mustangs;Stanford=Cardinal;"
+    "Syracuse=Orange;Virginia=Cavaliers;Virginia Tech=Hokies;Wake Forest=Demon Deacons;"
+    "Illinois=Fighting Illini;Indiana=Hoosiers;Iowa=Hawkeyes;Maryland=Terrapins;Michigan=Wolverines;"
+    "Michigan State=Spartans;Minnesota=Golden Gophers;Nebraska=Cornhuskers;Northwestern=Wildcats;"
+    "Ohio State=Buckeyes;Oregon=Ducks;Penn State=Nittany Lions;Purdue=Boilermakers;Rutgers=Scarlet Knights;"
+    "UCLA=Bruins;USC=Trojans;Washington=Huskies;Wisconsin=Badgers;"
+    "Arizona=Wildcats;Arizona State=Sun Devils;Baylor=Bears;BYU=Cougars;Cincinnati=Bearcats;Colorado=Buffaloes;"
+    "Houston=Cougars;Iowa State=Cyclones;Kansas=Jayhawks;Kansas State=Wildcats;Oklahoma State=Cowboys;"
+    "TCU=Horned Frogs;Texas Tech=Red Raiders;UCF=Knights;Utah=Utes;West Virginia=Mountaineers;"
+    "Alabama=Crimson Tide;Arkansas=Razorbacks;Auburn=Tigers;Florida=Gators;Georgia=Bulldogs;Kentucky=Wildcats;"
+    "LSU=Tigers;Mississippi State=Bulldogs;Missouri=Tigers;Oklahoma=Sooners;Ole Miss=Rebels;"
+    "South Carolina=Gamecocks;Tennessee=Volunteers;Texas=Longhorns;Texas A&M=Aggies;Vanderbilt=Commodores;"
+    "Butler=Bulldogs;Creighton=Bluejays;DePaul=Blue Demons;Georgetown=Hoyas;Marquette=Golden Eagles;"
+    "Providence=Friars;Seton Hall=Pirates;St. John's=Red Storm;UConn=Huskies;Villanova=Wildcats;"
+    "Xavier=Musketeers;Gonzaga=Bulldogs;Memphis=Tigers;San Diego State=Aztecs;Saint Mary's=Gaels;"
+    "Dayton=Flyers;VCU=Rams;Nevada=Wolf Pack;Boise State=Broncos;Colorado State=Rams;Utah State=Aggies;"
+    "New Mexico=Lobos;UNLV=Rebels;Wyoming=Cowboys;Fresno State=Bulldogs;Air Force=Falcons;Army=Black Knights;"
+    "Navy=Midshipmen;Tulane=Green Wave;Tulsa=Golden Hurricane;Temple=Owls;South Florida=Bulls;"
+    "East Carolina=Pirates;Charlotte=49ers;North Texas=Mean Green;Rice=Owls;UTSA=Roadrunners;"
+    "Florida Atlantic=Owls;Ohio=Bobcats;Toledo=Rockets;Miami (OH)=RedHawks;Bowling Green=Falcons;"
+    "Kent State=Golden Flashes;Akron=Zips;Buffalo=Bulls;Ball State=Cardinals;Central Michigan=Chippewas;"
+    "Eastern Michigan=Eagles;Northern Illinois=Huskies;Western Michigan=Broncos;UMass=Minutemen;"
+    "App State=Mountaineers;Coastal Carolina=Chanticleers;Georgia Southern=Eagles;Georgia State=Panthers;"
+    "James Madison=Dukes;Marshall=Thundering Herd;Old Dominion=Monarchs;South Alabama=Jaguars;"
+    "Southern Miss=Golden Eagles;Texas State=Bobcats;Troy=Trojans;Arkansas State=Red Wolves;"
+    "Louisiana=Ragin' Cajuns;Liberty=Flames;Jacksonville State=Gamecocks;Kennesaw State=Owls;"
+    "Middle Tennessee=Blue Raiders;New Mexico State=Aggies;Sam Houston=Bearcats;UTEP=Miners;"
+    "Western Kentucky=Hilltoppers;FIU=Panthers;Oregon State=Beavers;Washington State=Cougars;"
+    "Hawaii=Rainbow Warriors;San Jose State=Spartans;Saint Joseph's=Hawks;La Salle=Explorers;"
+    "Davidson=Wildcats;Richmond=Spiders;George Mason=Patriots;George Washington=Revolutionaries;"
+    "Fordham=Rams;Loyola Chicago=Ramblers;Drake=Bulldogs;Bradley=Braves;Illinois State=Redbirds;"
+    "Indiana State=Sycamores;Murray State=Racers;Belmont=Bruins;Duquesne=Dukes;Rhode Island=Rams;"
+    "Penn=Quakers;Princeton=Tigers;Harvard=Crimson;Yale=Bulldogs;Cornell=Big Red;Columbia=Lions;"
+    "Brown=Bears;Dartmouth=Big Green;Oral Roberts=Golden Eagles;Grand Canyon=Lopes;Santa Clara=Broncos;"
+    "San Francisco=Dons;Pepperdine=Waves;Saint Louis=Billikens;Wichita State=Shockers;"
+    "Northern Iowa=Panthers;Furman=Paladins;Chattanooga=Mocs;Delaware=Blue Hens;Towson=Tigers")
+
+ALIASES = {
+    "NBA": {"Los Angeles L": "Los Angeles Lakers", "Los Angeles C": "Los Angeles Clippers",
+            "LA Lakers": "Los Angeles Lakers", "LA Clippers": "Los Angeles Clippers"},
+    "NFL": {"Los Angeles C": "Los Angeles Chargers", "Los Angeles R": "Los Angeles Rams",
+            "New York G": "New York Giants", "New York J": "New York Jets"},
+    "NHL": {"New York I": "New York Islanders", "New York R": "New York Rangers"},
+    "EPL": {"Man City": "Manchester City", "Man United": "Manchester United", "Man Utd": "Manchester United",
+            "Spurs": "Tottenham Hotspur", "Wolves": "Wolverhampton Wanderers", "Bournemouth": "AFC Bournemouth",
+            "Nottm Forest": "Nottingham Forest", "Forest": "Nottingham Forest"},
+    "MLS": {"LAFC": "Los Angeles FC", "NYCFC": "New York City FC", "Kansas City": "Sporting Kansas City",
+            "Montreal": "CF Montreal", "Miami": "Inter Miami CF", "Inter Miami": "Inter Miami CF",
+            "Columbus": "Columbus Crew", "Salt Lake": "Real Salt Lake"},
+}
+COLLEGE_ALIASES = {"Connecticut": "UConn", "Pitt": "Pittsburgh", "Mississippi": "Ole Miss", "Cal": "California",
+                   "Southern California": "USC", "Appalachian State": "App State", "UL Lafayette": "Louisiana",
+                   "Florida International": "FIU", "Central Florida": "UCF", "Massachusetts": "UMass",
+                   "Southern Methodist": "SMU", "Louisiana State": "LSU", "Brigham Young": "BYU"}
+
+
+def _prefix_map(names):
+    """city / nickname-less prefixes -> full name; prefixes shared by two teams are dropped."""
+    m, bad = {}, set()
+    for full in names:
+        w = _norm(full).split()
+        for i in range(1, len(w) + 1):
+            key = " ".join(w[:i])
+            if key in m and m[key] != full:
+                bad.add(key)
+            m.setdefault(key, full)
+    for b in bad:
+        m.pop(b, None)
+    return m
+
+
+def _build_names():
+    out = {}
+    for lg, raw in (("NBA", NBA), ("NFL", NFL), ("NHL", NHL), ("EPL", EPL), ("MLS", MLS)):
+        mp = _prefix_map(raw.split(";"))
+        for a, full in ALIASES.get(lg, {}).items():
+            mp[_norm(a)] = full
+        out[lg] = mp
+    col = {}
+    schools = dict(x.split("=", 1) for x in COLLEGE.split(";"))
+    for school, mascot in schools.items():
+        col[_norm(school)] = f"{school} {mascot}"
+    for a, school in COLLEGE_ALIASES.items():
+        if school in schools:
+            col[_norm(a)] = f"{school} {schools[school]}"
+    out["NCAAF"], out["NCAAM"] = col, dict(col)
+    try:
+        with open(TEAMS_FILE) as f:
+            for lg, mp in json.load(f).items():
+                out.setdefault(lg, {}).update({_norm(k): v for k, v in mp.items()})
+    except Exception:
+        pass
+    return out
+
+
+NAME_MAP = _build_names()
+MISSING = set()
+
+
+def full_name(short, league, book=None):
+    """Full team name: city+nickname for pro teams, school+mascot for colleges. Tennis keeps player names."""
+    short = (short or "").strip()
+    if not short or _norm(short) in ("tie", "draw"):
+        return short
+    if league not in NAME_MAP:   # tennis: players, no mascots
+        return book if book and len(book.split()) > len(short.split()) else short
+    hit = NAME_MAP.get(league, {}).get(_norm(short))
+    if hit:
+        return hit
+    if book and len(book.split()) > len(short.split()):
+        return book
+    if (league, short) not in MISSING:
+        MISSING.add((league, short))
+        print(f"no full name for {league} '{short}': add it to {TEAMS_FILE}", flush=True)
+    return short
+
+
+def full_game(title, league):
+    """'Atlanta at Boston' -> 'Atlanta Hawks at Boston Celtics'."""
+    parts = re.split(r"\s+(?:at|vs\.?|v)\s+", title, maxsplit=1, flags=re.I)
+    if len(parts) != 2:
+        return title
+    sep = " at " if re.search(r"\sat\s", title, re.I) else " vs "
+    return f"{full_name(parts[0], league)}{sep}{full_name(parts[1], league)}"
+
 
 SRC_LABEL = "MoneyLine"
 POLL = float(os.getenv("POLL_SECONDS", "15"))
@@ -71,6 +244,7 @@ BUDGET = {"day": "", "used": 0, "month": "", "month_used": 0, "remaining": None}
 API_DOWN = [False]
 LOADED = [0]
 RETRY_AT = [0.0]
+EMPTY_SERIES = set()
 
 
 # ---------- http ----------
@@ -382,6 +556,9 @@ def scan():
         except Exception as e:
             print("scan error", series, repr(e), flush=True)
             continue
+        if not mkts and series not in EMPTY_SERIES:
+            EMPTY_SERIES.add(series)
+            print(f"no open markets for series {series}: check the ticker or it may be off-season", flush=True)
         games = odds_games(series) if any(in_window(m, now) for m in mkts) else []
         league = SPORT.get(series, series)
         events = {}
@@ -391,7 +568,7 @@ def scan():
             arb = find_arb(ms, now)
             if arb:
                 arb["event"] = ev_key
-                arb["title"] = (ms[0].get("title") or ev_key).replace(" Winner?", "")
+                arb["title"] = full_game((ms[0].get("title") or ev_key).replace(" Winner?", ""), league)
                 arbs.append(arb)
             mids, all_ok = {}, True
             for m in ms:
@@ -429,8 +606,8 @@ def scan():
                     st["no_book"] += 1
                     continue
                 marks[m["ticker"]] = (fair, margin, a, b)
-                label = book_name or m.get("yes_sub_title") or m["ticker"]
-                title = (m.get("title") or "").replace(" Winner?", "")
+                label = full_name(m.get("yes_sub_title"), league, book_name) if m.get("yes_sub_title") else m["ticker"]
+                title = full_game((m.get("title") or "").replace(" Winner?", ""), league)
                 game = f"{league} | {title}" if title else f"{league} | {m['ticker']}"
                 lz = lean(m, fair)
                 if lz:
@@ -574,8 +751,8 @@ def render_frames(p, outcome, S, n):
     # header
     cx, cy = k(50), k(52)
     d.polygon([(cx, cy - k(7)), (cx + k(7), cy), (cx, cy + k(7)), (cx - k(7), cy)], fill=NEON_C + (255,))
-    _sp(d, (k(66), k(52)), f"{p['team'].upper()[:26]}  {p['side']}", M(16), NEON_C + (255,), k(1))
-    _sp(d, (k(44), k(76)), p["game"][:62], M(9, False), MUTED, k(0.5))
+    _sp(d, (k(66), k(52)), f"{p['team'].upper()[:40]}  {p['side']}", M(16), NEON_C + (255,), k(1))
+    _sp(d, (k(44), k(76)), p["game"][:72], M(9, False), MUTED, k(0.5))
     left = p["commence"] - time.time()
     if outcome is None:
         _sp(d, (k(734), k(52)), "LIVE", M(10), NEON_M + (255,), k(1.5), "r")
