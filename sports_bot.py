@@ -14,32 +14,28 @@ from urllib3.util.retry import Retry
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
-ODDS_KEY = os.environ.get("ODDS_API_KEY", "")
+ODDS_KEY = os.environ.get("MONEYLINE_API_KEY", "")
+ML_URL = os.getenv("MONEYLINE_URL", "https://mlapi.bet/v1/events/today")
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
-ODDS_API = "https://api.the-odds-api.com/v4/sports"
 
 # Kalshi series scanned every tick (free, no key).
 SERIES = [s.strip() for s in os.getenv(
     "SERIES", "KXNBAGAME,KXNFLGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXEPLGAME,KXMLSGAME"
 ).split(",") if s.strip()]
-# Only these series spend Odds API credits (keeps the free 500/month plan alive).
-ODDS_SERIES = {s.strip() for s in os.getenv(
-    "ODDS_SERIES", "KXNBAGAME,KXNFLGAME,KXNHLGAME").split(",") if s.strip()}
 
-ODDS_SPORTS = {
-    "KXNBAGAME": "basketball_nba", "KXNFLGAME": "americanfootball_nfl",
-    "KXMLBGAME": "baseball_mlb", "KXNHLGAME": "icehockey_nhl",
-    "KXNCAAFGAME": "americanfootball_ncaaf", "KXNCAAMBGAME": "basketball_ncaab",
-    "KXEPLGAME": "soccer_epl", "KXMLSGAME": "soccer_usa_mls"}
-
-BOOKS = os.getenv("ODDS_BOOKS", "draftkings").strip()
-SRC_LABEL = "DraftKings" if BOOKS == "draftkings" else "Books"
+SRC_LABEL = "MoneyLine"
 POLL = float(os.getenv("POLL_SECONDS", "15"))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))
 PMIN, PMAX = float(os.getenv("PMIN", "0.15")), float(os.getenv("PMAX", "0.92"))
 HOURS_AHEAD = float(os.getenv("HOURS_AHEAD", "48"))
 BOOK_W = float(os.getenv("BOOK_W", "0.75"))
-ODDS_TTL = float(os.getenv("ODDS_TTL", "21600"))
+ODDS_TTL = float(os.getenv("ODDS_TTL", "300"))           # seconds between MoneyLine refreshes
+DAILY_CREDITS = int(os.getenv("DAILY_CREDITS", "330"))   # hard cap per UTC day
+MONTHLY_CREDITS = int(os.getenv("MONTHLY_CREDITS", "9900"))
+CALL_COST = int(os.getenv("CALL_COST", "1"))             # credits one MoneyLine call uses
+STALE_MAX = float(os.getenv("STALE_MAX", "7200"))        # reuse old odds this long when over budget
+BUDGET = {"day": "", "used": 0, "month": "", "month_used": 0}
+API_DOWN = [False]
 TOP_N = int(os.getenv("TOP_N", "5"))
 MAX_OPEN = int(os.getenv("MAX_OPEN", "25"))
 KELLY_FRAC = float(os.getenv("KELLY_FRAC", "0.25"))
@@ -79,8 +75,18 @@ def get_json(url, params=None, timeout=(3.05, 10)):
     return r.json()
 
 
+def get_json_h(url, headers, params=None):
+    r = DATA.get(url, params=params, headers=headers, timeout=(3.05, 10))
+    r.raise_for_status()
+    return r.json()
+
+
 def ts(iso):
     return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def _t(v):
+    return float(v) if isinstance(v, (int, float)) else ts(str(v))
 
 
 # ---------- state ----------
@@ -95,6 +101,7 @@ def load_state():
     s.setdefault("arbs", {})
     s.setdefault("arb_count", 0)
     s.setdefault("arb_locked", 0.0)
+    s.setdefault("budget", {})
     return s
 
 
@@ -126,8 +133,9 @@ def fee(p):
     return math.ceil(0.07 * p * (1 - p) * 100) / 100
 
 
-# ---------- sportsbook odds (The Odds API, optional) ----------
+# ---------- sportsbook odds (MoneyLine, optional, credit-capped) ----------
 ODDS_CACHE = {}
+ML_DEBUG = [True]
 
 STOP = {"state", "university", "college", "the", "city", "united", "fc", "sc", "new", "los", "san",
         "saint", "north", "south", "east", "west", "tech", "univ", "and", "vs"}
@@ -152,58 +160,70 @@ def _words(s):
     return {w for w in re.findall(r"[a-z]+", (s or "").lower()) if len(w) >= 3 and w not in STOP}
 
 
+def _budget_roll():
+    now = datetime.now(timezone.utc)
+    d, m = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m")
+    if BUDGET["day"] != d:
+        BUDGET["day"], BUDGET["used"] = d, 0
+        API_DOWN[0] = False
+    if BUDGET["month"] != m:
+        BUDGET["month"], BUDGET["month_used"] = m, 0
+
+
 def odds_games(series):
-    key = ODDS_SPORTS.get(series)
-    if not key or not ODDS_KEY or series not in ODDS_SERIES:
+    """One MoneyLine call covers every sport. Hard-capped by daily and monthly credits."""
+    if not ODDS_KEY:
         return []
-    c = ODDS_CACHE.get(series)
-    if c and time.time() - c[0] < ODDS_TTL:
+    _budget_roll()
+    c = ODDS_CACHE.get("ALL")
+    age = time.time() - c[0] if c else None
+    if c and age < ODDS_TTL:
         return c[1]
-    params = {"apiKey": ODDS_KEY, "markets": "h2h", "oddsFormat": "american"}
-    if BOOKS:
-        params["bookmakers"] = BOOKS
-    else:
-        params["regions"] = "us"
-    try:
-        data = get_json(f"{ODDS_API}/{key}/odds", params)
-    except Exception as e:
-        print("odds error", series, repr(e), flush=True)
-        ODDS_CACHE[series] = (time.time(), [])
+    over = (BUDGET["used"] + CALL_COST > DAILY_CREDITS or
+            BUDGET["month_used"] + CALL_COST > MONTHLY_CREDITS)
+    if over:
+        if c and c[1] and age < STALE_MAX:
+            return c[1]                      # recent odds are still fine
+        if not API_DOWN[0]:
+            print("moneyline budget used up: running on Kalshi data only", flush=True)
+        API_DOWN[0] = True
         return []
+    BUDGET["used"] += CALL_COST
+    BUDGET["month_used"] += CALL_COST
+    try:
+        data = get_json_h(ML_URL, {"x-api-key": ODDS_KEY})
+    except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in (401, 402, 403, 429):
+            BUDGET["used"] = DAILY_CREDITS   # provider refused: stop for today
+        API_DOWN[0] = True
+        ODDS_CACHE["ALL"] = (time.time(), [])
+        print("moneyline error", repr(e), "-> Kalshi-only until next refresh", flush=True)
+        return []
+    API_DOWN[0] = False
+    print(f"moneyline call ok: {BUDGET['used']}/{DAILY_CREDITS} credits today, "
+          f"{BUDGET['month_used']}/{MONTHLY_CREDITS} this month", flush=True)
+    events = data if isinstance(data, list) else (data.get("events") or data.get("data") or [])
+    if ML_DEBUG[0] and events:
+        ML_DEBUG[0] = False
+        print("moneyline sample:", json.dumps(events[0])[:1500], flush=True)
     games = []
-    for ev in data:
-        acc = {"home": [], "away": [], "draw": []}
-        for bk in ev.get("bookmakers", []):
-            for mk in bk.get("markets", []):
-                if mk.get("key") != "h2h":
-                    continue
-                probs = {}
-                for o in mk.get("outcomes", []):
-                    pr = american_to_prob(o.get("price"))
-                    if pr is None:
-                        continue
-                    n = o.get("name")
-                    if n == ev.get("home_team"):
-                        probs["home"] = pr
-                    elif n == ev.get("away_team"):
-                        probs["away"] = pr
-                    elif n == "Draw":
-                        probs["draw"] = pr
-                if "home" in probs and "away" in probs:
-                    tot = sum(probs.values())
-                    for k_, v in probs.items():
-                        acc[k_].append(v / tot)
-        if not acc["home"] or not acc["away"]:
-            continue
-        fair = {k_: sum(v) / len(v) for k_, v in acc.items() if v}
-        s = sum(fair.values())
+    for ev in events:  # field names are guesses: fix them from the sample line
         try:
-            start = ts(ev["commence_time"])
+            probs = {"home": american_to_prob(ev["home_moneyline"]),
+                     "away": american_to_prob(ev["away_moneyline"])}
+            d_ = american_to_prob(ev.get("draw_moneyline"))
+            if d_:
+                probs["draw"] = d_
+            if probs["home"] is None or probs["away"] is None:
+                continue
+            tot = sum(probs.values())
+            games.append({"start": _t(ev["start_time"]),
+                          "fair": {k_: v / tot for k_, v in probs.items()},
+                          "home": _words(ev["home_team"]), "away": _words(ev["away_team"])})
         except Exception:
             continue
-        games.append({"start": start, "fair": {k_: v / s for k_, v in fair.items()},
-                      "home": _words(ev.get("home_team")), "away": _words(ev.get("away_team"))})
-    ODDS_CACHE[series] = (time.time(), games)
+    ODDS_CACHE["ALL"] = (time.time(), games)
     return games
 
 
@@ -262,7 +282,7 @@ def find_arb(ms, now):
         return None
     subs = [(m.get("yes_sub_title") or "").lower().strip() for m in ms]
     if n == 3 and not any(s in ("tie", "draw") for s in subs):
-        return None  # three outcomes but no draw leg: not guaranteed exhaustive
+        return None
     asks = [dollars(m, "yes_ask") for m in ms]
     bids = [dollars(m, "yes_bid") for m in ms]
     best = None
@@ -344,7 +364,7 @@ def scan():
                     margin = UNCERT + 0.5 * abs(book_p - kfair)
                     src = SRC_LABEL + "+Kalshi"
                     st["matched"] += 1
-                elif REQUIRE_BOOK:
+                elif REQUIRE_BOOK and not API_DOWN[0]:
                     st["no_book"] += 1
                     continue
                 marks[m["ticker"]] = (fair, margin, a, b)
@@ -368,7 +388,8 @@ def scan():
         nr = f"{near[0] * 100:+.1f}c on {near[1]} ({near[2]})" if near else "n/a"
         print(f"scan: {st['markets']} markets | book-matched {st['matched']} | no quote {st['no_quote']} | "
               f"wide {st['wide']} | no book {st['no_book']} | no edge {st['no_edge']} | "
-              f"thin {st['thin']} | PICKS {len(picks)} | ARBS {len(arbs)} | best raw edge {nr}", flush=True)
+              f"thin {st['thin']} | PICKS {len(picks)} | ARBS {len(arbs)} | "
+              f"api {'DOWN' if API_DOWN[0] else 'ok'} | best raw edge {nr}", flush=True)
     return sorted(picks, key=lambda x: -x["growth"]), marks, arbs
 
 
@@ -802,7 +823,6 @@ def tick(state):
     now = time.time()
     refresh_open(state, marks, now)
 
-    # arbitrage alerts (once per game per ARB_REPEAT seconds)
     sent = 0
     for a in sorted(arbs, key=lambda x: -x["profit"]):
         if sent >= 3 or now - state["arbs"].get(a["event"], 0) < ARB_REPEAT:
@@ -835,13 +855,15 @@ def tick(state):
         state["open"][t] = p
         locked.add(p["event"])
         fresh += 1
+    state["budget"] = dict(BUDGET)
     save_state(state)
 
 
 def main():
     state = load_state()
+    BUDGET.update(state.get("budget", {}))
     if not ODDS_KEY:
-        print("No ODDS_API_KEY set: Kalshi-only mode (arb alerts work, few edge picks). "
+        print("No MONEYLINE_API_KEY set: Kalshi-only mode (arb alerts work, few edge picks). "
               "Add a key for sportsbook-matched picks.", flush=True)
     print("sports bot started", flush=True)
     end, fails = time.time() + RUN_SECONDS, 0
