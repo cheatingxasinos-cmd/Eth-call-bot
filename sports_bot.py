@@ -131,6 +131,22 @@ COLLEGE_EXTRA = (
     "UMBC=Retrievers;Northern Kentucky=Norse;Tennessee State=Tigers;Winthrop=Eagles;"
     "Queens University=Royals;Merrimack=Warriors;Grambling State=Tigers;High Point=Panthers")
 
+COLLEGE_EXTRA += ";" + (
+    "Sacramento State=Hornets;Central Connecticut State=Blue Devils;Pacific=Tigers;"
+    "Bethesda=Flames;Cal State Fullerton=Titans;Northern Arizona=Lumberjacks;"
+    "North Florida=Ospreys;California Baptist=Lancers;Arkansas-Pine Bluff=Golden Lions;"
+    "Lipscomb=Bisons;Alabama State=Hornets;Cleveland State=Vikings;New Orleans=Privateers;"
+    "Wofford=Terriers;South Dakota State=Jackrabbits;Drexel=Dragons;"
+    "Purdue Fort Wayne=Mastodons;Stetson=Hatters;Holy Cross=Crusaders;Hampton=Pirates;"
+    "Coppin State=Eagles;Wagner=Seahawks;Manhattan=Jaspers;Seattle=Redhawks;"
+    "Milwaukee=Panthers;Southern Utah=Thunderbirds;Radford=Highlanders;"
+    "UC Riverside=Highlanders;North Alabama=Lions;UC Davis=Aggies;"
+    "Eastern Washington=Eagles;East Tennessee State=Buccaneers;Colgate=Raiders;"
+    "Weber State=Wildcats;Northern Colorado=Bears;Colorado College=Tigers;"
+    "Idaho State=Bengals;Northwestern State=Demons;Fresno Pacific=Sunbirds;"
+    "Utah Tech=Trailblazers;Long Beach State=Beach;Abilene Christian=Wildcats;"
+    "University of North Texas at Dallas=Trailblazers")
+
 ALIASES = {
     "NBA": {"Los Angeles L": "Los Angeles Lakers", "Los Angeles C": "Los Angeles Clippers",
             "LA Lakers": "Los Angeles Lakers", "LA Clippers": "Los Angeles Clippers"},
