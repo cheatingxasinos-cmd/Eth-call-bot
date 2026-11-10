@@ -606,11 +606,11 @@ def attach_injuries(p):
 
 
 def inj_text(p):
-    """Short injury summary for the Discord embed."""
+    """Short injury summary for the Discord embed, labeled with full team names."""
     lg = p.get("league") or (p.get("game") or "").split(" | ")[0]
     opp = _title_opp(p)
     parts = []
-    for label, key in ((abbr(p["team"], lg), "inj"), (abbr(opp, lg), "inj_opp")):
+    for label, key in ((p["team"], "inj"), (opp, "inj_opp")):
         items = p.get(key)
         if items is None:
             parts.append(f"**{label}:** not available")
@@ -625,16 +625,20 @@ def inj_text(p):
     return "\n".join(parts)[:1000]
 
 
-# ---------- sportsbook moneyline (optional, The Odds API, needs ODDS_API_KEY) ----------
-ODDS_KEY = os.getenv("ODDS_API_KEY", "")
-ODDS_TTL = float(os.getenv("ODDS_TTL", "1800"))           # seconds between fetches per league (1 credit each)
+# ---------- sportsbook moneyline (AllSportsAPI soccer odds) ----------
+# Paste your AllSportsAPI key between the quotes below (keep the quotes). A GitHub secret named
+# ALLSPORTS_API_KEY, if you ever add one, takes priority over this. Keep the repo private if the key is in the file.
+ASA_KEY = os.getenv("ALLSPORTS_API_KEY") or "PASTE_YOUR_KEY_HERE"
+if ASA_KEY == "PASTE_YOUR_KEY_HERE":
+    ASA_KEY = ""
+ASA_URL = "https://apiv2.allsportsapi.com/football/"
+ODDS_TTL = float(os.getenv("ODDS_TTL", "1800"))           # seconds between refreshes (2 API calls each)
 ODDS_FAIL_TTL = float(os.getenv("ODDS_FAIL_TTL", "1800"))
-ODDS_REGIONS = os.getenv("ODDS_REGIONS", "us")
-ODDS_SPORT = {"NFL": "americanfootball_nfl", "NCAAF": "americanfootball_ncaaf", "NBA": "basketball_nba",
-              "NCAAM": "basketball_ncaab", "NHL": "icehockey_nhl", "MLB": "baseball_mlb",
-              "EPL": "soccer_epl", "MLS": "soccer_usa_mls"}
-ODDS_CACHE = {}
+ML_LEAGUES = ("EPL", "MLS")                               # the football endpoint is soccer only
+ASA_CACHE = {}
 ODDS_WARNED = set()
+_ML_ALIAS = {"spurs": "tottenham hotspur", "wolves": "wolverhampton wanderers", "forest": "nottingham forest",
+             "nottm forest": "nottingham forest"}
 
 
 def _american(dec):
@@ -643,62 +647,99 @@ def _american(dec):
     return f"+{(dec - 1) * 100:.0f}" if dec >= 2 else f"-{100 / (dec - 1):.0f}"
 
 
+def _asn(s):
+    n = _norm(s)
+    n = _ML_ALIAS.get(n, n)
+    toks = [t for t in n.split() if t not in ("fc", "cf", "sc", "afc")]
+    return {"united" if t == "utd" else "manchester" if t == "man" else t for t in toks}
+
+
 def _same(a, b):
-    na, nb = _norm(a), _norm(b)
-    if not na or not nb:
-        return False
-    if na == nb or na in nb or nb in na:
-        return True
-    return na.split()[-1] == nb.split()[-1]
+    ta, tb = _asn(a), _asn(b)
+    return bool(ta) and bool(tb) and (ta <= tb or tb <= ta)
 
 
-def _odds_league(league):
-    sport = ODDS_SPORT.get(league)
-    if not ODDS_KEY or not sport:
+def _asa_league(country, league_name):
+    """Map an AllSportsAPI fixture to one of our leagues, or None (keeps same-named clubs elsewhere out)."""
+    c, l_ = (country or "").lower(), (league_name or "").lower()
+    if "england" in c and re.match(r"^premier league( - .*)?$", l_):
+        return "EPL"
+    if l_.startswith("major league soccer") or l_ == "mls":
+        return "MLS"
+    return None
+
+
+def _asa_events():
+    """One Fixtures call + one Odds call covers every soccer game from yesterday to tomorrow (UTC)."""
+    if not ASA_KEY:
         return None
     now = time.time()
-    hit = ODDS_CACHE.get(league)
+    hit = ASA_CACHE.get("all")
     if hit and now - hit[0] < (ODDS_TTL if hit[1] is not None else ODDS_FAIL_TTL):
         return hit[1]
     events = None
     try:
-        r = DATA.get(f"https://api.the-odds-api.com/v4/sports/{sport}/odds/",
-                     params={"apiKey": ODDS_KEY, "regions": ODDS_REGIONS, "markets": "h2h",
-                             "oddsFormat": "decimal"}, timeout=(3.05, 10))
-        r.raise_for_status()
+        d0 = time.strftime("%Y-%m-%d", time.gmtime(now - 86400))
+        d1 = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
+        fx = DATA.get(ASA_URL, params={"met": "Fixtures", "APIkey": ASA_KEY, "from": d0, "to": d1,
+                                       "timezone": "UTC"}, timeout=(3.05, 25))
+        fx.raise_for_status()
+        fxj = fx.json()
+        od = DATA.get(ASA_URL, params={"met": "Odds", "APIkey": ASA_KEY, "from": d0, "to": d1},
+                      timeout=(3.05, 25))
+        od.raise_for_status()
+        odds = od.json().get("result")
+        odds = odds if isinstance(odds, dict) else {}
+        fixtures = fxj.get("result")
+        if not isinstance(fixtures, list):
+            if "fixtures" not in ODDS_WARNED:
+                ODDS_WARNED.add("fixtures")
+                print("AllSportsAPI fixtures reply:", str(fxj)[:200], flush=True)
+            fixtures = []
         events = []
-        for ev in r.json():
-            probs, best, books = {}, {}, 0
-            for bk in ev.get("bookmakers", []):
-                mk = next((m for m in bk.get("markets", []) if m.get("key") == "h2h"), None)
-                outs = [(o["name"], float(o["price"])) for o in (mk or {}).get("outcomes", []) if o.get("price")]
-                tot = sum(1 / pr for _, pr in outs)
-                if len(outs) < 2 or tot <= 0:
+        for f in fixtures:
+            lg = _asa_league(f.get("country_name"), f.get("league_name"))
+            rows = odds.get(str(f.get("event_key")))
+            if not lg or not rows:
+                continue
+            probs, best, books = {"home": [], "draw": [], "away": []}, {}, 0
+            for r in rows:
+                try:
+                    o = {"home": float(r["odd_1"]), "draw": float(r["odd_x"]), "away": float(r["odd_2"])}
+                except (TypeError, ValueError, KeyError):
                     continue
+                if min(o.values()) <= 1:
+                    continue
+                tot = sum(1 / v for v in o.values())
                 books += 1
-                for nm, pr in outs:                          # remove the book's margin, then average
-                    probs.setdefault(nm, []).append((1 / pr) / tot)
-                    best[nm] = max(best.get(nm, 0), pr)
+                for side, v in o.items():                    # remove the book's margin, then average
+                    probs[side].append((1 / v) / tot)
+                    best[side] = max(best.get(side, 0), v)
             if books:
-                events.append({"home": ev.get("home_team", ""), "away": ev.get("away_team", ""),
+                events.append({"lg": lg, "home": f.get("event_home_team", ""), "away": f.get("event_away_team", ""),
                                "n": books, "best": best,
-                               "p": {nm: sum(v) / len(v) for nm, v in probs.items()}})
+                               "p": {s_: sum(v) / len(v) for s_, v in probs.items() if v}})
     except Exception as e:
-        if league not in ODDS_WARNED:
-            ODDS_WARNED.add(league)
-            print("moneyline fetch error", league, repr(e), flush=True)
+        if "fetch" not in ODDS_WARNED:
+            ODDS_WARNED.add("fetch")
+            print("moneyline fetch error", repr(e), flush=True)
         events = None
-    ODDS_CACHE[league] = (now, events)
+    ASA_CACHE["all"] = (now, events)
     return events
 
 
 def moneyline_for(team, opp, league):
-    for ev in _odds_league(league) or []:
-        h, a = ev["home"], ev["away"]
-        if (_same(team, h) and _same(opp, a)) or (_same(team, a) and _same(opp, h)):
-            for nm, pr in ev["p"].items():
-                if _same(team, nm):
-                    return {"prob": pr, "books": ev["n"], "best_odds": _american(ev["best"].get(nm))}
+    if league not in ML_LEAGUES:
+        return None
+    for ev in _asa_events() or []:
+        if ev["lg"] != league:
+            continue
+        for side, other in (("home", "away"), ("away", "home")):
+            if _same(team, ev[side]) and _same(opp, ev[other]):
+                pr = ev["p"].get(side)
+                if pr:
+                    return {"prob": pr, "draw": ev["p"].get("draw"), "books": ev["n"],
+                            "best_odds": _american(ev["best"].get(side))}
     return None
 
 
@@ -715,15 +756,16 @@ def attach_moneyline(p):
 def ml_text(p):
     lg = p.get("league") or (p.get("game") or "").split(" | ")[0]
     ml = p.get("ml")
-    if lg not in ODDS_SPORT:
-        return "Not covered for this league"
-    if not ODDS_KEY:
-        return "Add ODDS_API_KEY to turn this on"
+    if lg not in ML_LEAGUES:
+        return "Soccer only (EPL and MLS)"
+    if not ASA_KEY:
+        return "Paste your AllSportsAPI key into the script to turn this on"
     if not ml:
         return "No matching sportsbook line yet"
     gap = (ml["prob"] - p["p"]) * 100
+    draw = f" | Draw: {ml['draw'] * 100:.0f}%" if ml.get("draw") else ""
     return (f"Books: **{ml['prob'] * 100:.0f}%** ({ml['books']} books) | Kalshi: **{p['p'] * 100:.0f}%** | "
-            f"Gap: **{gap:+.1f} pts**\nBest line: {ml['best_odds']}")
+            f"Gap: **{gap:+.1f} pts**{draw}\nBest line: {ml['best_odds']}")
 
 
 LAST_LOG = [0.0]
@@ -753,6 +795,9 @@ def scan():
                 arb["event"] = ev_key
                 arb["title"] = full_game((ms[0].get("title") or ev_key).replace(" Winner?", ""), league)
                 arbs.append(arb)
+            # the two sides of the game (draw excluded): the opponent is the other side's name
+            sides = [(m["ticker"], full_name(m.get("yes_sub_title"), league)) for m in ms
+                     if m.get("yes_sub_title") and _norm(m["yes_sub_title"]) not in ("tie", "draw")]
             mids, all_ok = {}, True
             for m in ms:
                 b, a = dollars(m, "yes_bid"), dollars(m, "yes_ask")
@@ -780,6 +825,9 @@ def scan():
                 label = full_name(m.get("yes_sub_title"), league) if m.get("yes_sub_title") else m["ticker"]
                 title = full_game((m.get("title") or "").replace(" Winner?", ""), league)
                 game = f"{league} | {title}" if title else f"{league} | {m['ticker']}"
+                opp = None
+                if len(sides) == 2:
+                    opp = next((n_ for t_, n_ in sides if t_ != m["ticker"]), None)
                 price = a
                 if win >= MIN_WIN and PMIN <= price <= PMAX:
                     leans.append({"side": "YES", "price": price, "p": win, "team": label, "game": game,
@@ -787,7 +835,7 @@ def scan():
                 r = evaluate(m, win)
                 if r:
                     picks.append({**r, "ticker": m["ticker"], "series": series, "event": ev_key,
-                                  "league": league, "team": label, "title": title, "game": game,
+                                  "league": league, "team": label, "opp": opp, "title": title, "game": game,
                                   "commence": end, "p_yes": win, "books": len(ms), "src": "Kalshi"})
                 else:
                     st["no_call"] += 1
@@ -935,7 +983,9 @@ def abbr(name, league):
 
 
 def _title_opp(p):
-    """The other team in 'A at B' / 'A vs B', parsed from the game title."""
+    """The team we are playing against: the other side of the Kalshi game, else parsed from the title."""
+    if p.get("opp"):
+        return p["opp"]
     parts = re.split(r"\s+(?:at|vs\.?|v)\s+", p.get("title") or "", maxsplit=1, flags=re.I)
     if len(parts) == 2:
         a, b = parts
@@ -945,7 +995,7 @@ def _title_opp(p):
 
 
 def _opp_name(p, league):
-    return p.get("opp") or _title_opp(p)
+    return _title_opp(p)
 
 
 # ---------- sport art (bottom-left panel) ----------
@@ -1316,11 +1366,26 @@ def render_frames(p, outcome, S, n):
     base = Image.new("RGBA", (W, H), BG)
     d = ImageDraw.Draw(base, "RGBA")
 
+    def fit(text, maxw, size, bold=True, lo=9):
+        """Font + text that fit in maxw (scaled px): shrink the font first, then trim with a dot."""
+        sz = size
+        while sz > lo and d.textlength(text, font=F(sz, bold)) > maxw:
+            sz -= 1
+        f = F(sz, bold)
+        t = text
+        while len(t) > 3 and d.textlength(t, font=f) > maxw:
+            t = t[:-1]
+        if t != text:
+            t = t.rstrip() + "."
+        return f, t
+
     # ===== scoreboard header =====
     draw_team_emblem(base, k(112), k(84), k(100), team, kind, pc, a1, +1)
     draw_team_emblem(base, k(848), k(84), k(100), opp, kind, oc, a2, -1)
-    d.text((k(112), k(166)), a1, font=F(26), fill=WHITE, anchor="mm")
-    d.text((k(848), k(166)), a2, font=F(26), fill=WHITE, anchor="mm")
+    f_, t_ = fit(team, k(176), 21)
+    d.text((k(112), k(166)), t_, font=f_, fill=WHITE, anchor="mm")
+    f_, t_ = fit(opp, k(176), 21)
+    d.text((k(848), k(166)), t_, font=f_, fill=WHITE, anchor="mm")
     d.text((k(255), k(86)), f"{price * 100:.0f}", font=F(62), fill=GOLD, anchor="mm")
     d.text((k(705), k(86)), f"{(1 - price) * 100:.0f}", font=F(62), fill=GOLD, anchor="mm")
     d.text((k(255), k(128)), f"{team.upper()[:16]} (c)", font=F(11, False), fill=AXIS, anchor="mm")
@@ -1400,7 +1465,7 @@ def render_frames(p, outcome, S, n):
             d.text((hx, hy + (-k(14) if up else k(14))), f"{lab} {pv[idx]:.0f}%", font=F(11),
                    fill=SUB, anchor="mm")
 
-    # end dots, pills and big readouts
+    # end dots, name pills and big readouts
     ex = k(PXE)
     ys = {"p": Y(win), "o": Y(100 - win)}
     anchor_y = dict(ys)
@@ -1409,13 +1474,15 @@ def render_frames(p, outcome, S, n):
     if anchor_y[dn] - anchor_y[up] < gap:
         mid = (anchor_y[up] + anchor_y[dn]) / 2
         anchor_y[up], anchor_y[dn] = mid - gap / 2, mid + gap / 2
-    PXL = k(724)
-    for key, ab, val, c, sub in (("p", a1, win, pc, f"{delta:+.1f} pts"), ("o", a2, 100 - win, oc, f"{-delta:+.1f} pts")):
+    PXL, PW = k(724), k(176)
+    for key, nm, val, c, sub in (("p", team, win, pc, f"{delta:+.1f} pts"),
+                                 ("o", opp, 100 - win, oc, f"{-delta:+.1f} pts")):
         ay = anchor_y[key]
         pill_cy = ay - k(18)
         d.line([(ex + k(10), ys[key]), (PXL, pill_cy)], fill=c + (110,), width=lw(1.5))
-        d.rounded_rectangle([PXL, pill_cy - k(17), PXL + k(96), pill_cy + k(17)], radius=k(6), fill=c + (255,))
-        d.text((PXL + k(48), pill_cy), ab, font=F(17), fill=WHITE, anchor="mm")
+        d.rounded_rectangle([PXL, pill_cy - k(17), PXL + PW, pill_cy + k(17)], radius=k(6), fill=c + (255,))
+        f_, t_ = fit(nm, PW - k(14), 16)
+        d.text((PXL + PW / 2, pill_cy), t_, font=f_, fill=WHITE, anchor="mm")
         d.text((PXL, ay + k(26)), f"{val:.0f}%", font=F(42), fill=c + (255,), anchor="lm")
         d.text((PXL + k(2), ay + k(58)), sub, font=F(12, False), fill=AXIS, anchor="lm")
         d.ellipse([ex - k(8.5), ys[key] - k(8.5), ex + k(8.5), ys[key] + k(8.5)], fill=c + (255,), outline=BG, width=lw(2))
@@ -1453,7 +1520,6 @@ def render_frames(p, outcome, S, n):
 
     # ===== injury report =====
     IY0, IY1 = 856, 1046
-    a2r = abbr(_title_opp(p), league)
     sev_col = {3: (255, 87, 87, 255), 2: (255, 140, 60, 255), 1: (255, 190, 40, 255), 0: (0, 217, 142, 255)}
     d.rounded_rectangle([k(24), k(IY0), k(936), k(IY1)], radius=k(14), fill=(255, 255, 255, 8),
                         outline=(255, 255, 255, 28), width=lw(1))
@@ -1461,9 +1527,11 @@ def render_frames(p, outcome, S, n):
     d.text((k(920), k(IY0 + 20)), f"{INJ_SRC.get(league, 'Injury feed')} | statuses can change before game time",
            font=F(10, False), fill=AXIS, anchor="rm")
 
-    def inj_col(x0, ab_, col_, items):
-        d.rounded_rectangle([k(x0), k(IY0 + 38), k(x0 + 56), k(IY0 + 60)], radius=k(6), fill=col_ + (255,))
-        d.text((k(x0 + 28), k(IY0 + 49)), ab_[:4], font=F(13), fill=WHITE, anchor="mm")
+    def inj_col(x0, name_, col_, items):
+        BW = 190                                                    # badge shows the full team name
+        d.rounded_rectangle([k(x0), k(IY0 + 38), k(x0 + BW), k(IY0 + 60)], radius=k(6), fill=col_ + (255,))
+        f_, t_ = fit(name_, k(BW - 14), 13)
+        d.text((k(x0 + BW / 2), k(IY0 + 49)), t_, font=f_, fill=WHITE, anchor="mm")
         if items is None:
             d.text((k(x0), k(IY0 + 92)), "Injury data not available for this matchup",
                    font=F(13, False), fill=AXIS, anchor="lm")
@@ -1473,7 +1541,8 @@ def render_frames(p, outcome, S, n):
             return
         cnt = [sum(1 for i in items if _sev(i["status"]) == s_) for s_ in (3, 2, 1)]
         summ = "   ".join(f"{c} {lab}" for c, lab in zip(cnt, ("OUT", "DOUBTFUL", "QUESTIONABLE")) if c)
-        d.text((k(x0 + 68), k(IY0 + 49)), summ or "All probable", font=F(11, False), fill=SUB, anchor="lm")
+        f2, t2 = fit(summ or "All probable", k(220), 11, False, 8)
+        d.text((k(x0 + BW + 12), k(IY0 + 49)), t2, font=f2, fill=SUB, anchor="lm")
         show = items if len(items) <= 4 else items[:3]
         for r_, it in enumerate(show):
             ry = IY0 + 78 + r_ * 27 + 13
@@ -1488,8 +1557,8 @@ def render_frames(p, outcome, S, n):
             d.text((k(x0 + 64), k(IY0 + 78 + 3 * 27 + 13)), f"+{len(items) - 3} more",
                    font=F(12, False), fill=AXIS, anchor="lm")
 
-    inj_col(40, a1, pc, p.get("inj"))
-    inj_col(492, a2r, oc, p.get("inj_opp"))
+    inj_col(40, team, pc, p.get("inj"))
+    inj_col(492, opp, oc, p.get("inj_opp"))
     d.text((k(CW / 2), k(1058)), "Signals only, not financial advice", font=F(10, False),
            fill=(90, 90, 95, 255), anchor="mm")
 
@@ -1543,8 +1612,10 @@ def stats(h):
 
 def build_embed(p, state, outcome=None):
     rec, pnl, last = stats(state["history"])
+    lg = p.get("league") or (p.get("game") or "").split(" | ")[0]
     lines = [f"**Game:** {p['game']}",
              f"**Pick:** {p['team']} to win",
+             f"**Opponent:** {_opp_name(p, lg)}",
              f"**Price:** {p['price'] * 100:.0f}c | **Payout:** {1 / p['price']:.2f}x",
              f"**Win prob:** {p['p'] * 100:.0f}%",
              f"**Closes:** <t:{int(p['commence'])}:R>"]
