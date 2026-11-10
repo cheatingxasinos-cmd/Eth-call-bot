@@ -26,11 +26,11 @@ SERIES = [s.strip() for s in os.getenv(
 
 # League label shown next to team names so "Atlanta" or "Ohio" is never ambiguous.
 SPORT = {"KXNBAGAME": "NBA", "KXNFLGAME": "NFL", "KXNHLGAME": "NHL", "KXNCAAFGAME": "NCAAF",
-         "KXNCAAMBGAME": "NCAAM", "KXEPLGAME": "EPL", "KXMLSGAME": "MLS",
-         "KXATPMATCH": "ATP", "KXWTAMATCH": "WTA", "KXMLBGAME": "MLB"}
+         "KXNCAAMBGAME": "NCAAM", "KXEPLGAME": "EPL", "KXMLSGAME": "MLS", "KXATPMATCH": "ATP",
+         "KXWTAMATCH": "WTA", "KXMLBGAME": "MLB"}
 
 # ---------- full team names (city + nickname, school + mascot) ----------
-TEAMS_FILE = os.getenv("TEAMS_FILE", "team_names.json")   # optional: {"NCAAM": {"Ohio": "Ohio Bobcats"}}
+TEAMS_FILE = os.getenv("TEAMS_FILE", "team_names.json")  # optional: {"NCAAM": {"Ohio": "Ohio Bobcats"}}
 
 
 def _norm(s):
@@ -110,7 +110,6 @@ COLLEGE = (
     "Brown=Bears;Dartmouth=Big Green;Oral Roberts=Golden Eagles;Grand Canyon=Lopes;Santa Clara=Broncos;"
     "San Francisco=Dons;Pepperdine=Waves;Saint Louis=Billikens;Wichita State=Shockers;"
     "Northern Iowa=Panthers;Furman=Paladins;Chattanooga=Mocs;Delaware=Blue Hens;Towson=Tigers")
-
 COLLEGE_EXTRA = (
     "Alabama A&M=Bulldogs;"
     "North Dakota=Fighting Hawks;Central Arkansas=Bears;Florida A&M=Rattlers;UT Arlington=Mavericks;"
@@ -130,7 +129,6 @@ COLLEGE_EXTRA = (
     "New Haven=Chargers;Monmouth=Hawks;Loyola Maryland=Greyhounds;UAB=Blazers;McNeese=Cowboys;"
     "UMBC=Retrievers;Northern Kentucky=Norse;Tennessee State=Tigers;Winthrop=Eagles;"
     "Queens University=Royals;Merrimack=Warriors;Grambling State=Tigers;High Point=Panthers")
-
 COLLEGE_EXTRA += ";" + (
     "Sacramento State=Hornets;Central Connecticut State=Blue Devils;Pacific=Tigers;"
     "Bethesda=Flames;Cal State Fullerton=Titans;Northern Arizona=Lumberjacks;"
@@ -146,6 +144,23 @@ COLLEGE_EXTRA += ";" + (
     "Idaho State=Bengals;Northwestern State=Demons;Fresno Pacific=Sunbirds;"
     "Utah Tech=Trailblazers;Long Beach State=Beach;Abilene Christian=Wildcats;"
     "University of North Texas at Dallas=Trailblazers")
+# schools from the "no full name" log warnings
+COLLEGE_EXTRA += ";" + (
+    "San Diego=Toreros;Lamar=Cardinals;Idaho=Vandals;UT Rio Grande Valley=Vaqueros;"
+    "Houston Christian=Huskies;Austin Peay=Governors;Tarleton State=Texans;Incarnate Word=Cardinals;"
+    "East Texas A&M=Lions;Texas Southern=Tigers;Portland State=Vikings;Cal Poly=Mustangs;"
+    "North Dakota State=Bison;Samford=Bulldogs;Mercer=Bears;Jackson State=Tigers;Alcorn State=Braves;"
+    "Prairie View A&M=Panthers;Lindenwood=Lions;Mississippi Valley State=Delta Devils;"
+    "West Florida=Argonauts;North Carolina Central=Eagles;Morgan State=Bears;Southern Illinois=Salukis;"
+    "Chicago State=Cougars;Montana State=Bobcats;Montana=Grizzlies;Gardner-Webb=Runnin' Bulldogs;"
+    "South Carolina State=Bulldogs;Delaware State=Hornets;Bucknell=Bison;Maine=Black Bears;"
+    "Eastern Illinois=Panthers;South Dakota=Coyotes;Missouri State=Bears;William & Mary=Tribe;"
+    "Stonehill=Skyhawks;Robert Morris=Colonials;LIU=Sharks;Sacred Heart=Pioneers;Stony Brook=Seawolves;"
+    "North Carolina A&T=Aggies;University at Albany=Great Danes;VMI=Keydets;Norfolk State=Spartans;"
+    "Southeastern Louisiana=Lions;Nicholls State=Colonels;Stephen F. Austin=Lumberjacks;"
+    "Youngstown State=Penguins;Omaha=Mavericks;SIU Edwardsville=Cougars;FDU=Knights;Hofstra=Pride;"
+    "Loyola Marymount=Lions;Quinnipiac=Bobcats;Niagara=Purple Eagles;Cal State Bakersfield=Roadrunners;"
+    "Maryland-Eastern Shore=Hawks;Oakland=Golden Grizzlies;UC Santa Barbara=Gauchos")
 
 ALIASES = {
     "NBA": {"Los Angeles L": "Los Angeles Lakers", "Los Angeles C": "Los Angeles Clippers",
@@ -165,7 +180,7 @@ COLLEGE_ALIASES = {"Connecticut": "UConn", "Pitt": "Pittsburgh", "Mississippi": 
                    "Florida International": "FIU", "Central Florida": "UCF", "Massachusetts": "UMass",
                    "Southern Methodist": "SMU", "Louisiana State": "LSU", "Brigham Young": "BYU"}
 COLLEGE_ALIASES.update({"Florida AM": "Florida A&M", "University of North Texas": "North Texas",
-                        "UNT": "North Texas"})
+                        "UNT": "North Texas", "Albany": "University at Albany"})
 
 
 def _prefix_map(names):
@@ -238,18 +253,18 @@ def full_game(title, league):
 POLL = float(os.getenv("POLL_SECONDS", "15"))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))
 PMIN, PMAX = float(os.getenv("PMIN", "0.15")), float(os.getenv("PMAX", "0.92"))
-MIN_WIN = float(os.getenv("MIN_WIN", "0.40"))             # minimum win probability for any call
-HOURS_AHEAD = float(os.getenv("HOURS_AHEAD", "6"))        # max hours until a game starts (live games always count)
+MIN_WIN = float(os.getenv("MIN_WIN", "0.40"))  # minimum win probability for any call
+HOURS_AHEAD = float(os.getenv("HOURS_AHEAD", "6"))  # max hours until a game starts (live games always count)
 # typical game length in hours, used to estimate start = expected end - length
-GAME_HOURS = {"NBA": 2.5, "NFL": 3.5, "NHL": 2.75, "NCAAF": 3.5, "NCAAM": 2.25,
-              "EPL": 2.0, "MLS": 2.0, "ATP": 3.0, "WTA": 2.5, "MLB": 3.0}
-TOP_N = int(os.getenv("TOP_N", "3"))                      # max new picks per scan
-MAX_OPEN = int(os.getenv("MAX_OPEN", "25"))               # max open picks overall
-STATUS_EVERY = float(os.getenv("STATUS_SECONDS", "3600"))   # status update interval
-WATCH_EVERY = float(os.getenv("WATCH_SECONDS", "3600"))     # hourly watchlist interval
-WATCH_N = int(os.getenv("WATCH_N", "3"))                    # games on the watchlist
-ARB_MIN = float(os.getenv("ARB_MIN", "0.01"))          # min locked profit per set, in dollars
-ARB_REPEAT = float(os.getenv("ARB_REPEAT", "1800"))    # seconds before re-alerting the same game
+GAME_HOURS = {"NBA": 2.5, "NFL": 3.5, "NHL": 2.75, "NCAAF": 3.5, "NCAAM": 2.25, "EPL": 2.0, "MLS": 2.0,
+              "ATP": 3.0, "WTA": 2.5, "MLB": 3.0}
+TOP_N = int(os.getenv("TOP_N", "3"))  # max new picks per scan
+MAX_OPEN = int(os.getenv("MAX_OPEN", "25"))  # max open picks overall
+STATUS_EVERY = float(os.getenv("STATUS_SECONDS", "3600"))  # status update interval
+WATCH_EVERY = float(os.getenv("WATCH_SECONDS", "3600"))  # hourly watchlist interval
+WATCH_N = int(os.getenv("WATCH_N", "3"))  # games on the watchlist
+ARB_MIN = float(os.getenv("ARB_MIN", "0.01"))  # min locked profit per set, in dollars
+ARB_REPEAT = float(os.getenv("ARB_REPEAT", "1800"))  # seconds before re-alerting the same game
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", str(345 * 60)))
 STATE_FILE = os.getenv("STATE_FILE", "sports_state.json")
 EDIT_SECONDS = float(os.getenv("EDIT_SECONDS", "120"))
@@ -314,8 +329,7 @@ def dollars(m, key):
 
 
 def kalshi_markets(series):
-    return get_json(f"{KALSHI}/markets", {"series_ticker": series, "status": "open",
-                                          "limit": 1000}).get("markets", [])
+    return get_json(f"{KALSHI}/markets", {"series_ticker": series, "status": "open", "limit": 1000}).get("markets", [])
 
 
 def kalshi_market(ticker):
@@ -379,25 +393,24 @@ def find_arb(ms, now, league=None):
 
 
 # ---------- injury report (Yahoo Sports page first, ESPN feed as backup; no keys) ----------
-INJ_SOURCE = os.getenv("INJURY_SOURCE", "yahoo").lower()      # "yahoo" or "espn" (which one goes first)
+INJ_SOURCE = os.getenv("INJURY_SOURCE", "yahoo").lower()  # "yahoo" or "espn" (which one goes first)
 YAHOO_SLUG = {"NFL": "nfl", "NBA": "nba", "NHL": "nhl", "MLB": "mlb",
               "NCAAF": "college-football", "NCAAM": "college-basketball"}
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Safari/537.36")
 YAHOO_HEADERS = {"User-Agent": BROWSER_UA, "Accept": "text/html,application/xhtml+xml",
                  "Accept-Language": "en-US,en;q=0.9"}
-ESPN_HOSTS = ("https://site.api.espn.com/apis/site/v2/sports",
-              "https://site.web.api.espn.com/apis/site/v2/sports")
+ESPN_HOSTS = ("https://site.api.espn.com/apis/site/v2/sports", "https://site.web.api.espn.com/apis/site/v2/sports")
 ESPN_HEADERS = {"User-Agent": BROWSER_UA, "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "en-US,en;q=0.9", "Origin": "https://www.espn.com",
                 "Referer": "https://www.espn.com/"}
 INJ_PATH = {"NFL": "football/nfl", "NBA": "basketball/nba", "NHL": "hockey/nhl", "MLB": "baseball/mlb",
             "NCAAF": "football/college-football", "NCAAM": "basketball/mens-college-basketball",
             "EPL": "soccer/eng.1", "MLS": "soccer/usa.1"}
-INJ_TTL = float(os.getenv("INJURY_TTL", "600"))              # seconds between refreshes per league
-INJ_FAIL_TTL = float(os.getenv("INJURY_FAIL_TTL", "1800"))   # wait after a failure before retrying
-INJ_CACHE = {}                                               # league -> (fetched_at, {team_key: [players]} or None)
-INJ_SRC = {}                                                 # league -> "Yahoo Sports" / "ESPN"
+INJ_TTL = float(os.getenv("INJURY_TTL", "600"))  # seconds between refreshes per league
+INJ_FAIL_TTL = float(os.getenv("INJURY_FAIL_TTL", "1800"))  # wait after a failure before retrying
+INJ_CACHE = {}  # league -> (fetched_at, {team_key: [players]} or None)
+INJ_SRC = {}  # league -> "Yahoo Sports" / "ESPN"
 INJ_WARNED = set()
 
 
@@ -510,7 +523,7 @@ def _inj_yahoo(league):
     ps = _InjParse(fulls)
     ps.feed(r.text)
     out = ps.out
-    if out and len(out) >= max(3, len(fulls) // 3):       # healthy parse: teams not listed have no injuries
+    if out and len(out) >= max(3, len(fulls) // 3):  # healthy parse: teams not listed have no injuries
         for nf in fulls:
             out.setdefault(nf, [])
     return out or None
@@ -562,7 +575,7 @@ def _inj_league(league):
         try:
             data = fn(league)
         except Exception as e:
-            if (label, league) not in INJ_WARNED:           # log once, not every tick
+            if (label, league) not in INJ_WARNED:  # log once, not every tick
                 INJ_WARNED.add((label, league))
                 print(f"injury source {label} failed for {league}: {repr(e)}", flush=True)
             data = None
@@ -625,155 +638,11 @@ def inj_text(p):
     return "\n".join(parts)[:1000]
 
 
-# ---------- sportsbook moneyline (AllSportsAPI soccer odds) ----------
-# Paste your AllSportsAPI key between the quotes below (keep the quotes). A GitHub secret named
-# ALLSPORTS_API_KEY, if you ever add one, takes priority over this. Keep the repo private if the key is in the file.
-ASA_KEY = os.getenv("ALLSPORTS_API_KEY") or "PASTE_YOUR_KEY_HERE"
-if ASA_KEY == "PASTE_YOUR_KEY_HERE":
-    ASA_KEY = ""
-ASA_URL = "https://apiv2.allsportsapi.com/football/"
-ODDS_TTL = float(os.getenv("ODDS_TTL", "1800"))           # seconds between refreshes (2 API calls each)
-ODDS_FAIL_TTL = float(os.getenv("ODDS_FAIL_TTL", "1800"))
-ML_LEAGUES = ("EPL", "MLS")                               # the football endpoint is soccer only
-ASA_CACHE = {}
-ODDS_WARNED = set()
-_ML_ALIAS = {"spurs": "tottenham hotspur", "wolves": "wolverhampton wanderers", "forest": "nottingham forest",
-             "nottm forest": "nottingham forest"}
-
-
-def _american(dec):
-    if not dec or dec <= 1:
-        return "n/a"
-    return f"+{(dec - 1) * 100:.0f}" if dec >= 2 else f"-{100 / (dec - 1):.0f}"
-
-
-def _asn(s):
-    n = _norm(s)
-    n = _ML_ALIAS.get(n, n)
-    toks = [t for t in n.split() if t not in ("fc", "cf", "sc", "afc")]
-    return {"united" if t == "utd" else "manchester" if t == "man" else t for t in toks}
-
-
-def _same(a, b):
-    ta, tb = _asn(a), _asn(b)
-    return bool(ta) and bool(tb) and (ta <= tb or tb <= ta)
-
-
-def _asa_league(country, league_name):
-    """Map an AllSportsAPI fixture to one of our leagues, or None (keeps same-named clubs elsewhere out)."""
-    c, l_ = (country or "").lower(), (league_name or "").lower()
-    if "england" in c and re.match(r"^premier league( - .*)?$", l_):
-        return "EPL"
-    if l_.startswith("major league soccer") or l_ == "mls":
-        return "MLS"
-    return None
-
-
-def _asa_events():
-    """One Fixtures call + one Odds call covers every soccer game from yesterday to tomorrow (UTC)."""
-    if not ASA_KEY:
-        return None
-    now = time.time()
-    hit = ASA_CACHE.get("all")
-    if hit and now - hit[0] < (ODDS_TTL if hit[1] is not None else ODDS_FAIL_TTL):
-        return hit[1]
-    events = None
-    try:
-        d0 = time.strftime("%Y-%m-%d", time.gmtime(now - 86400))
-        d1 = time.strftime("%Y-%m-%d", time.gmtime(now + 86400))
-        fx = DATA.get(ASA_URL, params={"met": "Fixtures", "APIkey": ASA_KEY, "from": d0, "to": d1,
-                                       "timezone": "UTC"}, timeout=(3.05, 25))
-        fx.raise_for_status()
-        fxj = fx.json()
-        od = DATA.get(ASA_URL, params={"met": "Odds", "APIkey": ASA_KEY, "from": d0, "to": d1},
-                      timeout=(3.05, 25))
-        od.raise_for_status()
-        odds = od.json().get("result")
-        odds = odds if isinstance(odds, dict) else {}
-        fixtures = fxj.get("result")
-        if not isinstance(fixtures, list):
-            if "fixtures" not in ODDS_WARNED:
-                ODDS_WARNED.add("fixtures")
-                print("AllSportsAPI fixtures reply:", str(fxj)[:200], flush=True)
-            fixtures = []
-        events = []
-        for f in fixtures:
-            lg = _asa_league(f.get("country_name"), f.get("league_name"))
-            rows = odds.get(str(f.get("event_key")))
-            if not lg or not rows:
-                continue
-            probs, best, books = {"home": [], "draw": [], "away": []}, {}, 0
-            for r in rows:
-                try:
-                    o = {"home": float(r["odd_1"]), "draw": float(r["odd_x"]), "away": float(r["odd_2"])}
-                except (TypeError, ValueError, KeyError):
-                    continue
-                if min(o.values()) <= 1:
-                    continue
-                tot = sum(1 / v for v in o.values())
-                books += 1
-                for side, v in o.items():                    # remove the book's margin, then average
-                    probs[side].append((1 / v) / tot)
-                    best[side] = max(best.get(side, 0), v)
-            if books:
-                events.append({"lg": lg, "home": f.get("event_home_team", ""), "away": f.get("event_away_team", ""),
-                               "n": books, "best": best,
-                               "p": {s_: sum(v) / len(v) for s_, v in probs.items() if v}})
-    except Exception as e:
-        if "fetch" not in ODDS_WARNED:
-            ODDS_WARNED.add("fetch")
-            print("moneyline fetch error", repr(e), flush=True)
-        events = None
-    ASA_CACHE["all"] = (now, events)
-    return events
-
-
-def moneyline_for(team, opp, league):
-    if league not in ML_LEAGUES:
-        return None
-    for ev in _asa_events() or []:
-        if ev["lg"] != league:
-            continue
-        for side, other in (("home", "away"), ("away", "home")):
-            if _same(team, ev[side]) and _same(opp, ev[other]):
-                pr = ev["p"].get(side)
-                if pr:
-                    return {"prob": pr, "draw": ev["p"].get("draw"), "books": ev["n"],
-                            "best_odds": _american(ev["best"].get(side))}
-    return None
-
-
-def attach_moneyline(p):
-    lg = p.get("league") or (p.get("game") or "").split(" | ")[0]
-    try:
-        p["ml"] = moneyline_for(p["team"], _title_opp(p), lg)
-    except Exception as e:
-        print("moneyline attach error", repr(e), flush=True)
-        p["ml"] = None
-    p["ml_at"] = time.time()
-
-
-def ml_text(p):
-    lg = p.get("league") or (p.get("game") or "").split(" | ")[0]
-    ml = p.get("ml")
-    if lg not in ML_LEAGUES:
-        return "Soccer only (EPL and MLS)"
-    if not ASA_KEY:
-        return "Paste your AllSportsAPI key into the script to turn this on"
-    if not ml:
-        return "No matching sportsbook line yet"
-    gap = (ml["prob"] - p["p"]) * 100
-    draw = f" | Draw: {ml['draw'] * 100:.0f}%" if ml.get("draw") else ""
-    return (f"Books: **{ml['prob'] * 100:.0f}%** ({ml['books']} books) | Kalshi: **{p['p'] * 100:.0f}%** | "
-            f"Gap: **{gap:+.1f} pts**{draw}\nBest line: {ml['best_odds']}")
-
-
 LAST_LOG = [0.0]
 
 
 def scan():
-    """Returns (picks, marks, arbs, leans).
-    marks[ticker] = (win_prob, yes_ask) for live updates of open picks."""
+    """Returns (picks, marks, arbs, leans). marks[ticker] = (win_prob, yes_ask) for live updates of open picks."""
     picks, marks, arbs, leans, now = [], {}, [], [], time.time()
     st = {"markets": 0, "no_quote": 0, "wide": 0, "no_call": 0}
     for series in SERIES:
@@ -820,7 +689,7 @@ def scan():
                 if a - b > MAX_SPREAD:
                     st["wide"] += 1
                     continue
-                win = mid / tot if tot else mid          # win probability from Kalshi prices
+                win = mid / tot if tot else mid  # win probability from Kalshi prices
                 marks[m["ticker"]] = (win, a)
                 label = full_name(m.get("yes_sub_title"), league) if m.get("yes_sub_title") else m["ticker"]
                 title = full_game((m.get("title") or "").replace(" Winner?", ""), league)
@@ -834,9 +703,9 @@ def scan():
                                   "event": ev_key, "src": "Kalshi"})
                 r = evaluate(m, win)
                 if r:
-                    picks.append({**r, "ticker": m["ticker"], "series": series, "event": ev_key,
-                                  "league": league, "team": label, "opp": opp, "title": title, "game": game,
-                                  "commence": end, "p_yes": win, "books": len(ms), "src": "Kalshi"})
+                    picks.append({**r, "ticker": m["ticker"], "series": series, "event": ev_key, "league": league,
+                                  "team": label, "opp": opp, "title": title, "game": game, "commence": end,
+                                  "p_yes": win, "books": len(ms), "src": "Kalshi"})
                 else:
                     st["no_call"] += 1
     if now - LAST_LOG[0] >= 120:
@@ -854,16 +723,13 @@ BG = (15, 14, 16, 255)
 WHITE, MUTED = (255, 255, 255, 255), (160, 168, 178, 255)
 C_UP, C_DN = (0, 217, 142), (255, 87, 87)
 AMBER = (255, 190, 40)
-NEON_C, NEON_P, NEON_G = (34, 229, 240), (255, 61, 139), (34, 229, 138)
 BLUE, PURPLE = (79, 114, 184), (142, 107, 191)
 GOLD = (245, 180, 0, 255)
 GRID, AXIS, SUB = (46, 46, 48, 255), (124, 124, 124, 255), (168, 168, 168, 255)
 RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
-
-LOGO_DIR = os.getenv("LOGO_DIR", "logos")      # logos/<normalized_team_name>.png, e.g. logos/buffalo_bills.png
-KIND = {"NFL": "football", "NCAAF": "football", "NBA": "basketball", "NCAAM": "basketball",
-        "NHL": "hockey", "EPL": "soccer", "MLS": "soccer", "ATP": "tennis", "WTA": "tennis",
-        "MLB": "baseball"}
+LOGO_DIR = os.getenv("LOGO_DIR", "logos")  # logos/<normalized_team_name>.png, e.g. logos/buffalo_bills.png
+KIND = {"NFL": "football", "NCAAF": "football", "NBA": "basketball", "NCAAM": "basketball", "NHL": "hockey",
+        "EPL": "soccer", "MLS": "soccer", "ATP": "tennis", "WTA": "tennis", "MLB": "baseball"}
 
 
 @functools.lru_cache(maxsize=64)
@@ -956,7 +822,7 @@ _AB = (
     "Other outcomes=OTH")
 ABBR = {_norm(a): b for a, b in (x.split("=") for x in _AB.split(";"))}
 try:
-    with open(os.getenv("ABBR_FILE", "team_abbr.json")) as _f:      # optional {"Ohio Bobcats": "OHIO"}
+    with open(os.getenv("ABBR_FILE", "team_abbr.json")) as _f:  # optional {"Ohio Bobcats": "OHIO"}
         ABBR.update({_norm(a): b for a, b in json.load(_f).items()})
 except Exception:
     pass
@@ -1021,11 +887,11 @@ def art_football(d, box, k, accent, win):
         d.line([(x, fy0), (x, fy0 + k(3))], fill=(255, 255, 255, 170), width=L)
         d.line([(x, fy1 - k(3)), (x, fy1)], fill=(255, 255, 255, 170), width=L)
     d.rectangle([x0, fy0, x1, fy1], outline=(255, 255, 255, 255), width=max(1, int(k(2))))
-    for gx, sgn in ((x0 + ez * 0.35, 1), (x1 - ez * 0.35, -1)):      # goalposts
+    for gx, sgn in ((x0 + ez * 0.35, 1), (x1 - ez * 0.35, -1)):  # goalposts
         d.line([(gx, cy - h * 0.13), (gx, cy + h * 0.13)], fill=(255, 215, 0, 255), width=max(1, int(k(2))))
         d.line([(gx, cy - h * 0.13), (gx + sgn * k(5), cy - h * 0.13)], fill=(255, 215, 0, 255), width=L)
         d.line([(gx, cy + h * 0.13), (gx + sgn * k(5), cy + h * 0.13)], fill=(255, 215, 0, 255), width=L)
-    bx = x0 + ez + max(0.0, min(1.0, win)) * 10 * pw          # ball at win probability
+    bx = x0 + ez + max(0.0, min(1.0, win)) * 10 * pw  # ball at win probability
     d.line([(bx, fy0), (bx, fy1)], fill=AMBER + (230,), width=max(1, int(k(2))))
     rx, ry = k(9), k(5.5)
     d.ellipse([bx - rx, cy - ry, bx + rx, cy + ry], fill=(139, 69, 19, 255), outline=(255, 255, 255, 255))
@@ -1086,8 +952,7 @@ def art_tennis(d, box, k, accent, win):
     throat_end = b + s * 0.14
     handle_end = throat_end + s * 0.30
     hw = s * 0.045
-    d.polygon([T(-hw, throat_end), T(hw, throat_end), T(hw, handle_end), T(-hw, handle_end)],
-              fill=(40, 40, 48, 255))
+    d.polygon([T(-hw, throat_end), T(hw, throat_end), T(hw, handle_end), T(-hw, handle_end)], fill=(40, 40, 48, 255))
     for i in range(1, 6):
         yy = throat_end + (handle_end - throat_end) * i / 6
         d.line([T(-hw, yy), T(hw, yy)], fill=(90, 90, 100, 255), width=L)
@@ -1103,8 +968,10 @@ def art_tennis(d, box, k, accent, win):
     d.line(pts + [pts[0]], fill=accent + (255,), width=max(2, int(k(5))), joint="curve")
     bx, by, br = x0 + (x1 - x0) * 0.76, y0 + s * 0.80, s * 0.09
     d.ellipse([bx - br, by - br, bx + br, by + br], fill=(205, 235, 60, 255))
-    d.arc([bx - br * 2.1, by - br, bx - br * 0.1, by + br], -40, 40, fill=(255, 255, 255, 255), width=max(1, int(k(2))))
-    d.arc([bx + br * 0.1, by - br, bx + br * 2.1, by + br], 140, 220, fill=(255, 255, 255, 255), width=max(1, int(k(2))))
+    d.arc([bx - br * 2.1, by - br, bx - br * 0.1, by + br], -40, 40, fill=(255, 255, 255, 255),
+          width=max(1, int(k(2))))
+    d.arc([bx + br * 0.1, by - br, bx + br * 2.1, by + br], 140, 220, fill=(255, 255, 255, 255),
+          width=max(1, int(k(2))))
 
 
 def art_court(d, box, k, accent, win):
@@ -1140,7 +1007,8 @@ def art_rink(d, box, k, accent, win):
     cy = (y0 + y1) / 2
     fy0, fy1 = cy - h / 2, cy + h / 2
     RED_, BLUE_ = (220, 50, 50, 255), (40, 90, 200, 255)
-    d.rounded_rectangle([x0, fy0, x1, fy1], radius=h * 0.3, fill=(225, 238, 250, 255), outline=(60, 70, 90, 255), width=L)
+    d.rounded_rectangle([x0, fy0, x1, fy1], radius=h * 0.3, fill=(225, 238, 250, 255), outline=(60, 70, 90, 255),
+                        width=L)
     mx = (x0 + x1) / 2
     d.line([(mx, fy0), (mx, fy1)], fill=RED_, width=L * 2)
     d.ellipse([mx - h * 0.16, cy - h * 0.16, mx + h * 0.16, cy + h * 0.16], outline=BLUE_, width=L)
@@ -1150,7 +1018,8 @@ def art_rink(d, box, k, accent, win):
         d.line([(gx, fy0 + h * 0.05), (gx, fy1 - h * 0.05)], fill=RED_, width=L)
     cr = h * 0.12
     d.pieslice([x0 + w * 0.08 - cr, cy - cr, x0 + w * 0.08 + cr, cy + cr], -90, 90, fill=accent + (130,), outline=RED_)
-    d.pieslice([x0 + w * 0.92 - cr, cy - cr, x0 + w * 0.92 + cr, cy + cr], 90, 270, fill=accent + (130,), outline=RED_)
+    d.pieslice([x0 + w * 0.92 - cr, cy - cr, x0 + w * 0.92 + cr, cy + cr], 90, 270, fill=accent + (130,),
+               outline=RED_)
     for fx in (x0 + w * 0.2, x0 + w * 0.8):
         for fy in (cy - h * 0.25, cy + h * 0.25):
             d.ellipse([fx - h * 0.1, fy - h * 0.1, fx + h * 0.1, fy + h * 0.1], outline=RED_, width=L)
@@ -1182,15 +1051,15 @@ def art_pitch(d, box, k, accent, win):
     d.rectangle([x1 - gb[0], cy - gb[1] / 2, x1, cy + gb[1] / 2], outline=W, width=L)
 
 
-ART = {"football": art_football, "baseball": art_baseball, "tennis": art_tennis,
-       "basketball": art_court, "hockey": art_rink, "soccer": art_pitch}
+ART = {"football": art_football, "baseball": art_baseball, "tennis": art_tennis, "basketball": art_court,
+       "hockey": art_rink, "soccer": art_pitch}
 
 
 # ---------- emblems: helmet / racket / basketball / puck, with the team logo built in ----------
 def _badge(base, d, cx, cy, r, color, ab, logo):
     """White disc with the team logo, or the team's initials if there's no logo file."""
-    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255, 255),
-              outline=tuple(color) + (255,), width=max(1, int(r * 0.14)))
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255, 255), outline=tuple(color) + (255,),
+              width=max(1, int(r * 0.14)))
     if logo:
         lg = logo.copy()
         lg.thumbnail((max(1, int(r * 1.5)), max(1, int(r * 1.5))))
@@ -1203,6 +1072,7 @@ def _badge(base, d, cx, cy, r, color, ab, logo):
 
 def draw_helmet(base, d, cx, cy, s, color, ab, face, logo=None):
     """face=+1 looks right, -1 looks left. s = overall size in px. Logo sits on the shell side."""
+
     def P(x, y):
         return (cx + face * x * s, cy + y * s)
 
@@ -1228,36 +1098,34 @@ def draw_helmet(base, d, cx, cy, s, color, ab, face, logo=None):
         x = -0.52 + 0.94 * i / 18
         stripe.append((x, -0.04 - 0.40 * math.sqrt(max(0.0, 1 - ((x + 0.05) / 0.56) ** 2))))
     ln(stripe, 0.055, (255, 255, 255, 235))
-    ell(-0.08, 0.10, 0.06, 0.24, fill=dark)                      # ear hole
+    ell(-0.08, 0.10, 0.06, 0.24, fill=dark)  # ear hole
     ell(-0.055, 0.125, 0.035, 0.215, fill=(0, 0, 0, 120))
-    ell(0.14, -0.22, 0.52, 0.08, fill=(10, 10, 16, 150), outline=(255, 255, 255, 70))   # visor
+    ell(0.14, -0.22, 0.52, 0.08, fill=(10, 10, 16, 150), outline=(255, 255, 255, 70))  # visor
     ln([(0.47, -0.02), (0.66, 0.02), (0.68, 0.20), (0.54, 0.32), (0.34, 0.36)], 0.035, gray)  # facemask
     ln([(0.66, 0.08), (0.44, 0.10)], 0.03, gray)
     ln([(0.67, 0.15), (0.44, 0.19)], 0.03, gray)
-    ln([(0.34, 0.36), (0.12, 0.33)], 0.03, (40, 40, 48, 255))   # chin strap
-    ell(-0.46, -0.42, -0.12, -0.24, fill=(255, 255, 255, 50))   # gloss
+    ln([(0.34, 0.36), (0.12, 0.33)], 0.03, (40, 40, 48, 255))  # chin strap
+    ell(-0.46, -0.42, -0.12, -0.24, fill=(255, 255, 255, 50))  # gloss
     bx, by = P(-0.16, -0.10)
-    _badge(base, d, bx, by, 0.2 * s, color, ab, logo)           # team logo on the shell
+    _badge(base, d, bx, by, 0.2 * s, color, ab, logo)  # team logo on the shell
 
 
 def draw_racket(base, d, cx, cy, s, color, ab, face, logo=None):
     """Tennis racket tilted 30 degrees; face=+1 head leans right, -1 leans left. Logo in the strings."""
     th = math.radians(30)
-    a, b = 0.27, 0.36                       # head half-width / half-height (in units of s)
-    hx = cx + face * 0.1475 * s             # head center, so the whole racket is centered on (cx, cy)
+    a, b = 0.27, 0.36  # head half-width / half-height (in units of s)
+    hx = cx + face * 0.1475 * s  # head center, so the whole racket is centered on (cx, cy)
     hy = cy - 0.2555 * s
 
     def T(x, y):
-        return (hx + face * (x * math.cos(th) - y * math.sin(th)) * s,
-                hy + (x * math.sin(th) + y * math.cos(th)) * s)
+        return (hx + face * (x * math.cos(th) - y * math.sin(th)) * s, hy + (x * math.sin(th) + y * math.cos(th)) * s)
 
     col = tuple(color) + (255,)
     dark = tuple(int(c * 0.55) for c in color) + (255,)
     throat_end, handle_end, hw = b + 0.17, b + 0.17 + 0.42, 0.055
     d.ellipse([cx - 0.5 * s, cy + 0.50 * s, cx + 0.5 * s, cy + 0.60 * s], fill=(0, 0, 0, 70))  # shadow
     # handle + leather grip
-    d.polygon([T(-hw, throat_end), T(hw, throat_end), T(hw, handle_end), T(-hw, handle_end)],
-              fill=(38, 38, 46, 255))
+    d.polygon([T(-hw, throat_end), T(hw, throat_end), T(hw, handle_end), T(-hw, handle_end)], fill=(38, 38, 46, 255))
     for i in range(1, 8):
         yy = throat_end + (handle_end - throat_end) * i / 8
         d.line([T(-hw, yy), T(hw, yy + 0.02)], fill=(110, 110, 124, 255), width=max(1, int(0.012 * s)))
@@ -1281,9 +1149,9 @@ def draw_racket(base, d, cx, cy, s, color, ab, face, logo=None):
     d.line(pts + [pts[0]], fill=dark, width=max(2, int(0.075 * s)), joint="curve")
     d.line(pts + [pts[0]], fill=col, width=max(2, int(0.05 * s)), joint="curve")
     gl = [T(a * math.cos(math.radians(t)), b * math.sin(math.radians(t))) for t in range(200, 262, 6)]
-    d.line(gl, fill=(255, 255, 255, 110), width=max(1, int(0.015 * s)))                    # frame gloss
+    d.line(gl, fill=(255, 255, 255, 110), width=max(1, int(0.015 * s)))  # frame gloss
     hxp, hyp = T(0, 0)
-    _badge(base, d, hxp, hyp, 0.17 * s, color, ab, logo)                                    # logo in strings
+    _badge(base, d, hxp, hyp, 0.17 * s, color, ab, logo)  # logo in strings
 
 
 def draw_ball(base, d, cx, cy, r, kind, color, ab, logo=None):
@@ -1299,8 +1167,8 @@ def draw_ball(base, d, cx, cy, r, kind, color, ab, logo=None):
         return
     ring = r * 0.12
     d.ellipse([cx - r - ring, cy - r - ring, cx + r + ring, cy + r + ring], fill=tuple(color) + (255,))
-    body = {"basketball": (214, 106, 44), "soccer": (245, 245, 245),
-            "baseball": (240, 240, 235)}.get(kind, (245, 245, 245))
+    body = {"basketball": (214, 106, 44), "soccer": (245, 245, 245), "baseball": (240, 240, 235)}.get(kind,
+                                                                                                    (245, 245, 245))
     d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=body + (255,))
     arcs = lambda c, ww: (d.arc([cx - 2.3 * r, cy - r, cx - 0.3 * r, cy + r], -45, 45, fill=c, width=ww),
                           d.arc([cx + 0.3 * r, cy - r, cx + 2.3 * r, cy + r], 135, 225, fill=c, width=ww))
@@ -1340,7 +1208,7 @@ def draw_team_emblem(base, cx, cy, s, name, kind, color, ab, face):
 
 # ---------- the chart ----------
 def render_frames(p, outcome, S, n):
-    SS = S * (2 if S <= 1.25 else 1)                 # supersample for smooth edges
+    SS = S * (2 if S <= 1.25 else 1)  # supersample for smooth edges
     k = lambda v: v * SS
     lw = lambda v: max(1, int(round(k(v))))
     F = lambda sz, b=True: _sans(max(6, int(round(k(sz)))), b)
@@ -1353,15 +1221,12 @@ def render_frames(p, outcome, S, n):
     entry = p.get("entry_price") or price
     left = p["commence"] - time.time()
     started = left < GAME_HOURS.get(league, 3.0) * 3600
-
     hist = [list(x) for x in (p.get("pts") or [[time.time(), price, p["p"]]])]
     if len(hist) == 1:
         hist.append([hist[0][0] + 60, hist[0][1], hist[0][2]])
     win = hist[-1][2] * 100
     p0 = (p.get("p0") or hist[0][2]) * 100
     delta = win - p0
-    ml = p.get("ml")
-    mlp = ml["prob"] * 100 if ml else None
 
     base = Image.new("RGBA", (W, H), BG)
     d = ImageDraw.Draw(base, "RGBA")
@@ -1396,16 +1261,15 @@ def render_frames(p, outcome, S, n):
         d.ellipse([k(432), k(38), k(442), k(48)], fill=tag_c)
         d.text((k(450), k(43)), "LIVE" if started else "UPCOMING", font=F(13), fill=tag_c, anchor="lm")
         d.text((k(480), k(86)), _hhmm(left), font=F(38), fill=WHITE, anchor="mm")
-        d.text((k(480), k(124)), f"{league}  |  {team} to win"[:44], font=F(16, False), fill=SUB, anchor="mm")
-        d.text((k(480), k(150)), f"Entry {entry * 100:.0f}c  |  {1 / entry:.2f}x payout",
-               font=F(13, False), fill=AXIS, anchor="mm")
+        d.text((k(480), k(124)), f"{league} | {team} to win"[:44], font=F(16, False), fill=SUB, anchor="mm")
+        d.text((k(480), k(150)), f"Entry {entry * 100:.0f}c | {1 / entry:.2f}x payout", font=F(13, False),
+               fill=AXIS, anchor="mm")
     else:
         oc_col = (C_UP if outcome == "win" else C_DN) + (255,)
         d.text((k(480), k(44)), "FINAL", font=F(13), fill=AXIS, anchor="mm")
         d.text((k(480), k(88)), outcome.upper(), font=F(42), fill=oc_col, anchor="mm")
         d.text((k(480), k(128)), f"{p.get('pnl', 0):+.2f}u", font=F(22), fill=WHITE, anchor="mm")
-        d.text((k(480), k(152)), f"{league}  |  {team}"[:44], font=F(13, False), fill=SUB, anchor="mm")
-
+        d.text((k(480), k(152)), f"{league} | {team}"[:44], font=F(13, False), fill=SUB, anchor="mm")
     # page indicator
     d.rounded_rectangle([k(455), k(218), k(505), k(231)], radius=k(6.5), fill=WHITE)
     d.ellipse([k(520), k(218), k(533), k(231)], fill=(85, 85, 90, 255))
@@ -1415,27 +1279,18 @@ def render_frames(p, outcome, S, n):
     PX0_, PXE, GX1, LBL = 24, 700, 842, 936
     allv = [h[2] * 100 for h in hist]
     allv += [100 - v for v in allv]
-    if mlp is not None:
-        allv += [mlp, 100 - mlp]
     lo = min(30, math.floor((min(allv) - 2) / 10) * 10)
     hi = max(70, math.ceil((max(allv) + 2) / 10) * 10)
     Y = lambda v: k(CB) - (v - lo) / (hi - lo) * (k(CB) - k(CT))
     t0, t1 = hist[0][0], max(hist[-1][0], hist[0][0] + 1)
     X = lambda t: k(PX0_) + (t - t0) / (t1 - t0) * (k(PXE) - k(PX0_))
-
     for v in range(int(lo), int(hi) + 1, 10):
         mid_ = v == 50
         _dots(d, k(PX0_), Y(v), k(GX1), Y(v), (78, 78, 82, 255) if mid_ else GRID, lw(1), k(4), k(4))
         d.text((k(LBL), Y(v)), f"{v}%", font=F(15), fill=SUB if mid_ else AXIS, anchor="rm")
-
     ey = Y(p0)
     _dots(d, k(PX0_), ey, k(PXE), ey, AMBER + (210,), lw(1.4), k(2), k(5))
     d.text((k(PX0_ + 4), ey - k(9)), f"ENTRY {p0:.0f}%", font=F(11), fill=AMBER + (255,), anchor="lm")
-    if mlp is not None:                                     # sportsbook consensus line
-        my_ = Y(mlp)
-        _dots(d, k(PX0_), my_, k(PXE), my_, NEON_C + (200,), lw(1.4), k(6), k(4))
-        d.text((k(PXE - 6), my_ - k(9)), f"BOOKS {mlp:.0f}% ({ml['books']})", font=F(11),
-               fill=NEON_C + (255,), anchor="rm")
 
     def steps(vals):
         pts_ = []
@@ -1452,18 +1307,18 @@ def render_frames(p, outcome, S, n):
     pv = [h[2] * 100 for h in hist]
     ov = [100 - v for v in pv]
     lines = [(steps(ov), oc), (steps(pv), pc)]
-    for pts_, c in lines:                                   # glow, then crisp line
+    for pts_, c in lines:  # glow, then crisp line
         d.line(pts_, fill=c + (38,), width=lw(10), joint="curve")
     for pts_, c in lines:
         d.line(pts_, fill=c + (255,), width=lw(3.2), joint="curve")
-
     # session high / low markers on the pick line
     if len(pv) > 2 and max(pv) - min(pv) >= 2:
         for idx, lab, up in ((pv.index(max(pv)), "HI", True), (pv.index(min(pv)), "LO", False)):
             hx, hy = X(hist[idx][0]), Y(pv[idx])
-            d.ellipse([hx - k(4.5), hy - k(4.5), hx + k(4.5), hy + k(4.5)], fill=BG, outline=pc + (255,), width=lw(2))
-            d.text((hx, hy + (-k(14) if up else k(14))), f"{lab} {pv[idx]:.0f}%", font=F(11),
-                   fill=SUB, anchor="mm")
+            d.ellipse([hx - k(4.5), hy - k(4.5), hx + k(4.5), hy + k(4.5)], fill=BG, outline=pc + (255,),
+                      width=lw(2))
+            d.text((hx, hy + (-k(14) if up else k(14))), f"{lab} {pv[idx]:.0f}%", font=F(11), fill=SUB,
+                   anchor="mm")
 
     # end dots, name pills and big readouts
     ex = k(PXE)
@@ -1485,11 +1340,12 @@ def render_frames(p, outcome, S, n):
         d.text((PXL + PW / 2, pill_cy), t_, font=f_, fill=WHITE, anchor="mm")
         d.text((PXL, ay + k(26)), f"{val:.0f}%", font=F(42), fill=c + (255,), anchor="lm")
         d.text((PXL + k(2), ay + k(58)), sub, font=F(12, False), fill=AXIS, anchor="lm")
-        d.ellipse([ex - k(8.5), ys[key] - k(8.5), ex + k(8.5), ys[key] + k(8.5)], fill=c + (255,), outline=BG, width=lw(2))
+        d.ellipse([ex - k(8.5), ys[key] - k(8.5), ex + k(8.5), ys[key] + k(8.5)], fill=c + (255,), outline=BG,
+                  width=lw(2))
 
     # time axis
-    d.text((k(PX0_), k(654)), "PICKED " + time.strftime("%H:%M UTC", time.gmtime(t0)),
-           font=F(11, False), fill=AXIS, anchor="lm")
+    d.text((k(PX0_), k(654)), "PICKED " + time.strftime("%H:%M UTC", time.gmtime(t0)), font=F(11, False),
+           fill=AXIS, anchor="lm")
     d.text((k(PXE), k(654)), "NOW" if outcome is None else "FINAL", font=F(11), fill=AXIS, anchor="rm")
 
     # ===== bottom row: sport art + stat chips =====
@@ -1498,9 +1354,7 @@ def render_frames(p, outcome, S, n):
     ART[kind](d, (k(32), k(684), k(336), k(828)), k, pc, win / 100)
     up_c, dn_c = C_UP + (255,), C_DN + (255,)
     if outcome is None:
-        chip6 = (f"BOOKS ({mlp - win:+.1f} VS KALSHI)" if mlp is not None else "SPORTSBOOKS",
-                 f"{mlp:.0f}%" if mlp is not None else "n/a",
-                 (up_c if mlp >= win else dn_c) if mlp is not None else AXIS)
+        chip6 = ("IF WIN", f"+{(1 - entry - fee(entry)) * 100:.0f}c", up_c)
     else:
         chip6 = ("RESULT", f"{p.get('pnl', 0):+.2f}u", up_c if outcome == "win" else dn_c)
     chips = [("ENTRY", f"{entry * 100:.0f}c", WHITE),
@@ -1513,8 +1367,8 @@ def render_frames(p, outcome, S, n):
     for i, (lab, val, col) in enumerate(chips):
         cx0 = 364 + (i % 3) * (cw_ + g)
         cy0 = 676 + (i // 3) * (chh + g)
-        d.rounded_rectangle([k(cx0), k(cy0), k(cx0 + cw_), k(cy0 + chh)], radius=k(12),
-                            fill=(255, 255, 255, 10), outline=(255, 255, 255, 26), width=lw(1))
+        d.rounded_rectangle([k(cx0), k(cy0), k(cx0 + cw_), k(cy0 + chh)], radius=k(12), fill=(255, 255, 255, 10),
+                            outline=(255, 255, 255, 26), width=lw(1))
         d.text((k(cx0 + 14), k(cy0 + 18)), lab, font=F(11, False), fill=AXIS, anchor="lm")
         d.text((k(cx0 + 14), k(cy0 + 48)), val, font=F(27), fill=col, anchor="lm")
 
@@ -1528,19 +1382,19 @@ def render_frames(p, outcome, S, n):
            font=F(10, False), fill=AXIS, anchor="rm")
 
     def inj_col(x0, name_, col_, items):
-        BW = 190                                                    # badge shows the full team name
+        BW = 190  # badge shows the full team name
         d.rounded_rectangle([k(x0), k(IY0 + 38), k(x0 + BW), k(IY0 + 60)], radius=k(6), fill=col_ + (255,))
         f_, t_ = fit(name_, k(BW - 14), 13)
         d.text((k(x0 + BW / 2), k(IY0 + 49)), t_, font=f_, fill=WHITE, anchor="mm")
         if items is None:
-            d.text((k(x0), k(IY0 + 92)), "Injury data not available for this matchup",
-                   font=F(13, False), fill=AXIS, anchor="lm")
+            d.text((k(x0), k(IY0 + 92)), "Injury data not available for this matchup", font=F(13, False),
+                   fill=AXIS, anchor="lm")
             return
         if not items:
             d.text((k(x0), k(IY0 + 92)), "No injuries reported", font=F(14), fill=C_UP + (255,), anchor="lm")
             return
         cnt = [sum(1 for i in items if _sev(i["status"]) == s_) for s_ in (3, 2, 1)]
-        summ = "   ".join(f"{c} {lab}" for c, lab in zip(cnt, ("OUT", "DOUBTFUL", "QUESTIONABLE")) if c)
+        summ = " ".join(f"{c} {lab}" for c, lab in zip(cnt, ("OUT", "DOUBTFUL", "QUESTIONABLE")) if c)
         f2, t2 = fit(summ or "All probable", k(220), 11, False, 8)
         d.text((k(x0 + BW + 12), k(IY0 + 49)), t2, font=f2, fill=SUB, anchor="lm")
         show = items if len(items) <= 4 else items[:3]
@@ -1554,13 +1408,13 @@ def render_frames(p, outcome, S, n):
             meta = " | ".join(x for x in (it["pos"], it["detail"]) if x)[:24]
             d.text((k(x0 + 428), k(ry)), meta, font=F(11, False), fill=SUB, anchor="rm")
         if len(items) > 4:
-            d.text((k(x0 + 64), k(IY0 + 78 + 3 * 27 + 13)), f"+{len(items) - 3} more",
-                   font=F(12, False), fill=AXIS, anchor="lm")
+            d.text((k(x0 + 64), k(IY0 + 78 + 3 * 27 + 13)), f"+{len(items) - 3} more", font=F(12, False),
+                   fill=AXIS, anchor="lm")
 
     inj_col(40, team, pc, p.get("inj"))
     inj_col(492, opp, oc, p.get("inj_opp"))
-    d.text((k(CW / 2), k(1058)), "Signals only, not financial advice", font=F(10, False),
-           fill=(90, 90, 95, 255), anchor="mm")
+    d.text((k(CW / 2), k(1058)), "Signals only, not financial advice", font=F(10, False), fill=(90, 90, 95, 255),
+           anchor="mm")
 
     # ===== frames (pulsing end dots) =====
     out = []
@@ -1571,8 +1425,8 @@ def render_frames(p, outcome, S, n):
         for key, c in (("p", pc), ("o", oc)):
             r = k(14 + 8 * ph)
             fd.ellipse([ex - r, ys[key] - r, ex + r, ys[key] + r], fill=c + (int(75 - 45 * ph),))
-            fd.ellipse([ex - k(8.5), ys[key] - k(8.5), ex + k(8.5), ys[key] + k(8.5)],
-                       fill=c + (255,), outline=BG, width=lw(2))
+            fd.ellipse([ex - k(8.5), ys[key] - k(8.5), ex + k(8.5), ys[key] + k(8.5)], fill=c + (255,), outline=BG,
+                       width=lw(2))
         out.append(im.convert("RGB").resize((int(CW * S), int(CH * S)), RESAMPLE))
     return out
 
@@ -1605,20 +1459,16 @@ def stats(h):
     lw_ = sum(1 for x in last if x["win"])
     pnl = sum(x["pnl"] for x in h)
     stake = sum(x["price"] for x in h)
-    return (f"{w}W-{n - w}L ({w / n * 100:.0f}%)",
-            f"{pnl:+.2f}u ({pnl / stake * 100:+.1f}% ROI)",
+    return (f"{w}W-{n - w}L ({w / n * 100:.0f}%)", f"{pnl:+.2f}u ({pnl / stake * 100:+.1f}% ROI)",
             f"{lw_}W-{len(last) - lw_}L ({lw_ / len(last) * 100:.0f}%)")
 
 
 def build_embed(p, state, outcome=None):
     rec, pnl, last = stats(state["history"])
     lg = p.get("league") or (p.get("game") or "").split(" | ")[0]
-    lines = [f"**Game:** {p['game']}",
-             f"**Pick:** {p['team']} to win",
-             f"**Opponent:** {_opp_name(p, lg)}",
+    lines = [f"**Game:** {p['game']}", f"**Pick:** {p['team']} to win", f"**Opponent:** {_opp_name(p, lg)}",
              f"**Price:** {p['price'] * 100:.0f}c | **Payout:** {1 / p['price']:.2f}x",
-             f"**Win prob:** {p['p'] * 100:.0f}%",
-             f"**Closes:** <t:{int(p['commence'])}:R>"]
+             f"**Win prob:** {p['p'] * 100:.0f}%", f"**Closes:** <t:{int(p['commence'])}:R>"]
     if outcome in ("win", "loss"):
         title = f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} | {p['game']}"
         color = GREEN if outcome == "win" else RED
@@ -1630,8 +1480,7 @@ def build_embed(p, state, outcome=None):
             "fields": [{"name": "Record", "value": rec, "inline": True},
                        {"name": "Last 20", "value": last, "inline": True},
                        {"name": "P&L", "value": pnl, "inline": True},
-                       {"name": "🩺 Injury report", "value": inj_text(p), "inline": False},
-                       {"name": "📈 Moneyline", "value": ml_text(p), "inline": False}],
+                       {"name": "🩺 Injury report", "value": inj_text(p), "inline": False}],
             "footer": {"text": "Signals only, not financial advice"},
             "timestamp": datetime.now(timezone.utc).isoformat()}
 
@@ -1703,8 +1552,7 @@ def post_status(state, leans):
 def post_watch(top):
     rows = [f"**{i}.** {l['game']}\n**{l['team']}** at {l['price'] * 100:.0f}c | "
             f"{l['p'] * 100:.0f}% win prob" for i, l in enumerate(top, 1)]
-    embed = {"title": f"📋 Hourly top {len(top)}",
-             "description": "\n\n".join(rows), "color": GREY,
+    embed = {"title": f"📋 Hourly top {len(top)}", "description": "\n\n".join(rows), "color": GREY,
              "footer": {"text": "Not tracked in the record | Signals only, not financial advice"},
              "timestamp": datetime.now(timezone.utc).isoformat()}
     send(embed)
@@ -1737,7 +1585,7 @@ def settle(state):
 
 
 def refresh_open(state, marks, now):
-    """Update open picks (live price, win probability, injuries, moneyline) and re-post the chart."""
+    """Update open picks (live price, win probability, injuries) and re-post the chart."""
     for t, old in state["open"].items():
         if now >= old["commence"] or t not in marks:
             continue
@@ -1749,8 +1597,6 @@ def refresh_open(state, marks, now):
         old["pts"] = (old.get("pts", []) + [[round(now), round(price, 4), round(win, 4)]])[-600:]
         if now - old.get("inj_at", 0) >= INJ_TTL:
             attach_injuries(old)
-        if now - old.get("ml_at", 0) >= ODDS_TTL:
-            attach_moneyline(old)
         if now - old.get("last_edit", 0) >= EDIT_SECONDS:
             try:
                 post(old, state)
@@ -1764,12 +1610,11 @@ def tick(state):
     picks, marks, arbs, leans = scan()
     now = time.time()
     refresh_open(state, marks, now)
-
     sent = 0
     for a in sorted(arbs, key=lambda x: -x["profit"]):
         if sent >= 3 or now - state["arbs"].get(a["event"], 0) < ARB_REPEAT:
             continue
-        first_time = a["event"] not in state["arbs"]   # count profit once per game per 24h
+        first_time = a["event"] not in state["arbs"]  # count profit once per game per 24h
         try:
             post_arb(a, state)
             state["arbs"][a["event"]] = now
@@ -1780,7 +1625,6 @@ def tick(state):
         except Exception as e:
             print("arb send error", repr(e), flush=True)
     state["arbs"] = {k_: v for k_, v in state["arbs"].items() if now - v < 86400}
-
     # new picks: best win probability first, max TOP_N per scan, one pick per game
     done = {h["ticker"] for h in state["history"]}
     locked = {h.get("event") for h in state["history"] if h.get("event")}
@@ -1793,7 +1637,6 @@ def tick(state):
         if fresh >= TOP_N or len(state["open"]) >= MAX_OPEN:
             continue
         attach_injuries(p)
-        attach_moneyline(p)
         p["pts"] = [[round(now), round(p["price"], 4), round(p["p"], 4)]]
         p["entry_price"], p["last_edit"] = p["price"], now
         p["p0"], p["ev0"] = p["p"], p["ev"]
@@ -1805,7 +1648,6 @@ def tick(state):
         state["open"][t] = p
         locked.add(p["event"])
         fresh += 1
-
     # hourly watchlist: top WATCH_N games by win probability
     if now - state.get("last_watch", 0) >= WATCH_EVERY:
         seen, top = set(), []
@@ -1822,7 +1664,6 @@ def tick(state):
                 state["last_watch"] = now
             except Exception as e:
                 print("watchlist send error", repr(e), flush=True)
-
     if now - state.get("last_status", 0) >= STATUS_EVERY:
         try:
             post_status(state, leans)
