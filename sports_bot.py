@@ -8,6 +8,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -111,6 +112,7 @@ COLLEGE = (
     "Northern Iowa=Panthers;Furman=Paladins;Chattanooga=Mocs;Delaware=Blue Hens;Towson=Tigers")
 
 COLLEGE_EXTRA = (
+    "Alabama A&M=Bulldogs;"
     "North Dakota=Fighting Hawks;Central Arkansas=Bears;Florida A&M=Rattlers;UT Arlington=Mavericks;"
     "Texas A&M-Corpus Christi=Islanders;Portland=Pilots;Tennessee-Martin=Skyhawks;"
     "Southern University=Jaguars;Western Illinois=Leathernecks;Valparaiso=Beacons;"
@@ -376,13 +378,27 @@ def find_arb(ms, now, league=None):
     return best
 
 
-# ---------- injury report (ESPN public feed, no key) ----------
-ESPN = "https://site.api.espn.com/apis/site/v2/sports"
+# ---------- injury report (Yahoo Sports page first, ESPN feed as backup; no keys) ----------
+INJ_SOURCE = os.getenv("INJURY_SOURCE", "yahoo").lower()      # "yahoo" or "espn" (which one goes first)
+YAHOO_SLUG = {"NFL": "nfl", "NBA": "nba", "NHL": "nhl", "MLB": "mlb",
+              "NCAAF": "college-football", "NCAAM": "college-basketball"}
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0.0.0 Safari/537.36")
+YAHOO_HEADERS = {"User-Agent": BROWSER_UA, "Accept": "text/html,application/xhtml+xml",
+                 "Accept-Language": "en-US,en;q=0.9"}
+ESPN_HOSTS = ("https://site.api.espn.com/apis/site/v2/sports",
+              "https://site.web.api.espn.com/apis/site/v2/sports")
+ESPN_HEADERS = {"User-Agent": BROWSER_UA, "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9", "Origin": "https://www.espn.com",
+                "Referer": "https://www.espn.com/"}
 INJ_PATH = {"NFL": "football/nfl", "NBA": "basketball/nba", "NHL": "hockey/nhl", "MLB": "baseball/mlb",
             "NCAAF": "football/college-football", "NCAAM": "basketball/mens-college-basketball",
             "EPL": "soccer/eng.1", "MLS": "soccer/usa.1"}
-INJ_TTL = float(os.getenv("INJURY_TTL", "600"))      # seconds between feed refreshes per league
-INJ_CACHE = {}                                       # league -> (fetched_at, {team_key: [players]} or None)
+INJ_TTL = float(os.getenv("INJURY_TTL", "600"))              # seconds between refreshes per league
+INJ_FAIL_TTL = float(os.getenv("INJURY_FAIL_TTL", "1800"))   # wait after a failure before retrying
+INJ_CACHE = {}                                               # league -> (fetched_at, {team_key: [players]} or None)
+INJ_SRC = {}                                                 # league -> "Yahoo Sports" / "ESPN"
+INJ_WARNED = set()
 
 
 def _sev(status):
@@ -406,31 +422,156 @@ def _st(status):
     return (s[:5].upper() or "?")
 
 
+# ----- Yahoo: read the public injuries page -----
+def _yahoo_team(text, fulls):
+    """Heading text -> normalized full team name (accepts 'Boston Celtics', 'Celtics', 'LA Clippers')."""
+    if len(text) > 40:
+        return None
+    n = _norm(text)
+    if n.startswith("la "):
+        n = "los angeles " + n[3:]
+    for nf in fulls:
+        if n == nf or (len(n) >= 4 and nf.endswith(" " + n)):
+            return nf
+    return None
+
+
+class _InjParse(HTMLParser):
+    """Walks the page: remembers the latest team heading, reads every table row under it."""
+
+    def __init__(self, fulls):
+        super().__init__(convert_charrefs=True)
+        self.fulls, self.team = fulls, None
+        self.in_table, self.row, self.cell = False, None, None
+        self.cell_tag, self.headers, self.out = "td", None, {}
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self.in_table, self.headers = True, None
+        elif tag == "tr" and self.in_table:
+            self.row = []
+        elif tag in ("td", "th") and self.in_table:
+            self.cell, self.cell_tag = [], tag
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self.cell is not None and self.row is not None:
+            self.row.append((" ".join("".join(self.cell).split()), self.cell_tag))
+            self.cell = None
+        elif tag == "tr" and self.row is not None:
+            self._finish_row()
+            self.row = None
+        elif tag == "table":
+            self.in_table = False
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+            return
+        t = " ".join(data.split())
+        if t:
+            k_ = _yahoo_team(t, self.fulls)
+            if k_:
+                self.team = k_
+
+    def _finish_row(self):
+        cells = [c for c, _ in self.row]
+        if len(cells) < 2:
+            return
+        if all(t == "th" for _, t in self.row):
+            self.headers = [c.lower() for c in cells]
+            return
+        if self.team is None:
+            return
+        h = self.headers or []
+
+        def col(names, default=""):
+            for i, nm in enumerate(h):
+                if any(x in nm for x in names) and i < len(cells):
+                    return cells[i]
+            return default
+
+        name = col(("player", "name"), cells[0])
+        if not name:
+            return
+        self.out.setdefault(self.team, []).append({
+            "name": name[:40],
+            "pos": col(("pos",), cells[1] if len(cells) > 2 else "")[:6],
+            "status": col(("status",), cells[2] if len(cells) > 2 else "") or "Unknown",
+            "detail": col(("injury", "comment", "detail", "note"), cells[3] if len(cells) > 3 else "")[:40]})
+
+
+def _inj_yahoo(league):
+    slug = YAHOO_SLUG.get(league)
+    fulls = sorted({_norm(v) for v in NAME_MAP.get(league, {}).values()})
+    if not slug or not fulls:
+        return None
+    r = DATA.get(f"https://sports.yahoo.com/{slug}/injuries/", headers=YAHOO_HEADERS, timeout=(3.05, 12))
+    r.raise_for_status()
+    ps = _InjParse(fulls)
+    ps.feed(r.text)
+    out = ps.out
+    if out and len(out) >= max(3, len(fulls) // 3):       # healthy parse: teams not listed have no injuries
+        for nf in fulls:
+            out.setdefault(nf, [])
+    return out or None
+
+
+# ----- ESPN: public JSON feed (backup) -----
+def _espn_get(path):
+    last = None
+    for host in ESPN_HOSTS:
+        try:
+            r = DATA.get(f"{host}/{path}/injuries", headers=ESPN_HEADERS, timeout=(3.05, 10))
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+    raise last
+
+
+def _inj_espn(league):
+    path = INJ_PATH.get(league)
+    if not path:
+        return None
+    data = {}
+    for t in _espn_get(path).get("injuries", []):
+        items = []
+        for i in t.get("injuries", []):
+            a = i.get("athlete") or {}
+            det = i.get("details") or {}
+            kind = det.get("type") or det.get("detail") or ""
+            items.append({
+                "name": a.get("displayName") or a.get("shortName") or "?",
+                "pos": (a.get("position") or {}).get("abbreviation") or "",
+                "status": i.get("status") or (i.get("type") or {}).get("description") or "Unknown",
+                "detail": " ".join(x for x in (det.get("side"), kind) if x and x != "Not Specified")})
+        data[_norm(t.get("displayName", ""))] = items
+    return data or None
+
+
 def _inj_league(league):
     now = time.time()
     hit = INJ_CACHE.get(league)
-    if hit and now - hit[0] < INJ_TTL:
+    if hit and now - hit[0] < (INJ_TTL if hit[1] is not None else INJ_FAIL_TTL):
         return hit[1]
-    data, path = None, INJ_PATH.get(league)
-    if path:
+    order = ((_inj_yahoo, "Yahoo Sports"), (_inj_espn, "ESPN"))
+    if INJ_SOURCE == "espn":
+        order = order[::-1]
+    data = None
+    for fn, label in order:
         try:
-            raw = get_json(f"{ESPN}/{path}/injuries")
-            data = {}
-            for t in raw.get("injuries", []):
-                items = []
-                for i in t.get("injuries", []):
-                    a = i.get("athlete") or {}
-                    det = i.get("details") or {}
-                    kind = det.get("type") or det.get("detail") or ""
-                    items.append({
-                        "name": a.get("displayName") or a.get("shortName") or "?",
-                        "pos": (a.get("position") or {}).get("abbreviation") or "",
-                        "status": i.get("status") or (i.get("type") or {}).get("description") or "Unknown",
-                        "detail": " ".join(x for x in (det.get("side"), kind) if x and x != "Not Specified")})
-                data[_norm(t.get("displayName", ""))] = items
+            data = fn(league)
         except Exception as e:
-            print("injury fetch error", league, repr(e), flush=True)
+            if (label, league) not in INJ_WARNED:           # log once, not every tick
+                INJ_WARNED.add((label, league))
+                print(f"injury source {label} failed for {league}: {repr(e)}", flush=True)
             data = None
+        if data:
+            INJ_SRC[league] = label
+            break
+        if (label, league) not in INJ_WARNED:
+            INJ_WARNED.add((label, league))
+            print(f"injury source {label} returned nothing for {league}", flush=True)
     INJ_CACHE[league] = (now, data)
     return data
 
@@ -482,6 +623,107 @@ def inj_text(p):
         more = f" +{len(sig) - 4} more" if len(sig) > 4 else ""
         parts.append(f"**{label}:** {top}{more}")
     return "\n".join(parts)[:1000]
+
+
+# ---------- sportsbook moneyline (optional, The Odds API, needs ODDS_API_KEY) ----------
+ODDS_KEY = os.getenv("ODDS_API_KEY", "")
+ODDS_TTL = float(os.getenv("ODDS_TTL", "1800"))           # seconds between fetches per league (1 credit each)
+ODDS_FAIL_TTL = float(os.getenv("ODDS_FAIL_TTL", "1800"))
+ODDS_REGIONS = os.getenv("ODDS_REGIONS", "us")
+ODDS_SPORT = {"NFL": "americanfootball_nfl", "NCAAF": "americanfootball_ncaaf", "NBA": "basketball_nba",
+              "NCAAM": "basketball_ncaab", "NHL": "icehockey_nhl", "MLB": "baseball_mlb",
+              "EPL": "soccer_epl", "MLS": "soccer_usa_mls"}
+ODDS_CACHE = {}
+ODDS_WARNED = set()
+
+
+def _american(dec):
+    if not dec or dec <= 1:
+        return "n/a"
+    return f"+{(dec - 1) * 100:.0f}" if dec >= 2 else f"-{100 / (dec - 1):.0f}"
+
+
+def _same(a, b):
+    na, nb = _norm(a), _norm(b)
+    if not na or not nb:
+        return False
+    if na == nb or na in nb or nb in na:
+        return True
+    return na.split()[-1] == nb.split()[-1]
+
+
+def _odds_league(league):
+    sport = ODDS_SPORT.get(league)
+    if not ODDS_KEY or not sport:
+        return None
+    now = time.time()
+    hit = ODDS_CACHE.get(league)
+    if hit and now - hit[0] < (ODDS_TTL if hit[1] is not None else ODDS_FAIL_TTL):
+        return hit[1]
+    events = None
+    try:
+        r = DATA.get(f"https://api.the-odds-api.com/v4/sports/{sport}/odds/",
+                     params={"apiKey": ODDS_KEY, "regions": ODDS_REGIONS, "markets": "h2h",
+                             "oddsFormat": "decimal"}, timeout=(3.05, 10))
+        r.raise_for_status()
+        events = []
+        for ev in r.json():
+            probs, best, books = {}, {}, 0
+            for bk in ev.get("bookmakers", []):
+                mk = next((m for m in bk.get("markets", []) if m.get("key") == "h2h"), None)
+                outs = [(o["name"], float(o["price"])) for o in (mk or {}).get("outcomes", []) if o.get("price")]
+                tot = sum(1 / pr for _, pr in outs)
+                if len(outs) < 2 or tot <= 0:
+                    continue
+                books += 1
+                for nm, pr in outs:                          # remove the book's margin, then average
+                    probs.setdefault(nm, []).append((1 / pr) / tot)
+                    best[nm] = max(best.get(nm, 0), pr)
+            if books:
+                events.append({"home": ev.get("home_team", ""), "away": ev.get("away_team", ""),
+                               "n": books, "best": best,
+                               "p": {nm: sum(v) / len(v) for nm, v in probs.items()}})
+    except Exception as e:
+        if league not in ODDS_WARNED:
+            ODDS_WARNED.add(league)
+            print("moneyline fetch error", league, repr(e), flush=True)
+        events = None
+    ODDS_CACHE[league] = (now, events)
+    return events
+
+
+def moneyline_for(team, opp, league):
+    for ev in _odds_league(league) or []:
+        h, a = ev["home"], ev["away"]
+        if (_same(team, h) and _same(opp, a)) or (_same(team, a) and _same(opp, h)):
+            for nm, pr in ev["p"].items():
+                if _same(team, nm):
+                    return {"prob": pr, "books": ev["n"], "best_odds": _american(ev["best"].get(nm))}
+    return None
+
+
+def attach_moneyline(p):
+    lg = p.get("league") or (p.get("game") or "").split(" | ")[0]
+    try:
+        p["ml"] = moneyline_for(p["team"], _title_opp(p), lg)
+    except Exception as e:
+        print("moneyline attach error", repr(e), flush=True)
+        p["ml"] = None
+    p["ml_at"] = time.time()
+
+
+def ml_text(p):
+    lg = p.get("league") or (p.get("game") or "").split(" | ")[0]
+    ml = p.get("ml")
+    if lg not in ODDS_SPORT:
+        return "Not covered for this league"
+    if not ODDS_KEY:
+        return "Add ODDS_API_KEY to turn this on"
+    if not ml:
+        return "No matching sportsbook line yet"
+    gap = (ml["prob"] - p["p"]) * 100
+    return (f"Books: **{ml['prob'] * 100:.0f}%** ({ml['books']} books) | Kalshi: **{p['p'] * 100:.0f}%** | "
+            f"Gap: **{gap:+.1f} pts**\nBest line: {ml['best_odds']}")
 
 
 LAST_LOG = [0.0]
@@ -703,11 +945,7 @@ def _title_opp(p):
 
 
 def _opp_name(p, league):
-    if p.get("opp"):
-        return p["opp"]
-    if league in ("EPL", "MLS"):
-        return "Other outcomes"          # 3-way market: the other line includes the draw
-    return _title_opp(p)
+    return p.get("opp") or _title_opp(p)
 
 
 # ---------- sport art (bottom-left panel) ----------
@@ -1072,6 +1310,8 @@ def render_frames(p, outcome, S, n):
     win = hist[-1][2] * 100
     p0 = (p.get("p0") or hist[0][2]) * 100
     delta = win - p0
+    ml = p.get("ml")
+    mlp = ml["prob"] * 100 if ml else None
 
     base = Image.new("RGBA", (W, H), BG)
     d = ImageDraw.Draw(base, "RGBA")
@@ -1083,8 +1323,9 @@ def render_frames(p, outcome, S, n):
     d.text((k(848), k(166)), a2, font=F(26), fill=WHITE, anchor="mm")
     d.text((k(255), k(86)), f"{price * 100:.0f}", font=F(62), fill=GOLD, anchor="mm")
     d.text((k(705), k(86)), f"{(1 - price) * 100:.0f}", font=F(62), fill=GOLD, anchor="mm")
-    d.text((k(255), k(128)), "PICK PRICE (c)", font=F(11, False), fill=AXIS, anchor="mm")
-    d.text((k(705), k(128)), "IMPLIED OPP (c)", font=F(11, False), fill=AXIS, anchor="mm")
+    d.text((k(255), k(128)), f"{team.upper()[:16]} (c)", font=F(11, False), fill=AXIS, anchor="mm")
+    d.text((k(705), k(128)), f"{opp.upper()[:16]}{' / DRAW' if league in ('EPL', 'MLS') else ''} (c)",
+           font=F(11, False), fill=AXIS, anchor="mm")
     if outcome is None:
         tag_c = (0, 217, 142, 255) if started else AMBER + (255,)
         d.ellipse([k(432), k(38), k(442), k(48)], fill=tag_c)
@@ -1109,6 +1350,8 @@ def render_frames(p, outcome, S, n):
     PX0_, PXE, GX1, LBL = 24, 700, 842, 936
     allv = [h[2] * 100 for h in hist]
     allv += [100 - v for v in allv]
+    if mlp is not None:
+        allv += [mlp, 100 - mlp]
     lo = min(30, math.floor((min(allv) - 2) / 10) * 10)
     hi = max(70, math.ceil((max(allv) + 2) / 10) * 10)
     Y = lambda v: k(CB) - (v - lo) / (hi - lo) * (k(CB) - k(CT))
@@ -1123,6 +1366,11 @@ def render_frames(p, outcome, S, n):
     ey = Y(p0)
     _dots(d, k(PX0_), ey, k(PXE), ey, AMBER + (210,), lw(1.4), k(2), k(5))
     d.text((k(PX0_ + 4), ey - k(9)), f"ENTRY {p0:.0f}%", font=F(11), fill=AMBER + (255,), anchor="lm")
+    if mlp is not None:                                     # sportsbook consensus line
+        my_ = Y(mlp)
+        _dots(d, k(PX0_), my_, k(PXE), my_, NEON_C + (200,), lw(1.4), k(6), k(4))
+        d.text((k(PXE - 6), my_ - k(9)), f"BOOKS {mlp:.0f}% ({ml['books']})", font=F(11),
+               fill=NEON_C + (255,), anchor="rm")
 
     def steps(vals):
         pts_ = []
@@ -1182,14 +1430,18 @@ def render_frames(p, outcome, S, n):
                         outline=(255, 255, 255, 28), width=lw(1))
     ART[kind](d, (k(32), k(684), k(336), k(828)), k, pc, win / 100)
     up_c, dn_c = C_UP + (255,), C_DN + (255,)
+    if outcome is None:
+        chip6 = (f"BOOKS ({mlp - win:+.1f} VS KALSHI)" if mlp is not None else "SPORTSBOOKS",
+                 f"{mlp:.0f}%" if mlp is not None else "n/a",
+                 (up_c if mlp >= win else dn_c) if mlp is not None else AXIS)
+    else:
+        chip6 = ("RESULT", f"{p.get('pnl', 0):+.2f}u", up_c if outcome == "win" else dn_c)
     chips = [("ENTRY", f"{entry * 100:.0f}c", WHITE),
              ("NOW", f"{price * 100:.0f}c", up_c if price >= entry else dn_c),
              ("PAYOUT", f"{1 / price:.2f}x", WHITE),
              ("WIN PROB", f"{win:.0f}%", pc + (255,)),
              ("EDGE VS ENTRY", f"{delta:+.1f} pts", up_c if delta >= 0 else dn_c),
-             ("CLOSES" if outcome is None else "RESULT",
-              _hhmm(left) if outcome is None else f"{p.get('pnl', 0):+.2f}u",
-              WHITE if outcome is None else (up_c if outcome == "win" else dn_c))]
+             chip6]
     cw_, chh, g = (572 - 24) / 3, 74, 12
     for i, (lab, val, col) in enumerate(chips):
         cx0 = 364 + (i % 3) * (cw_ + g)
@@ -1206,8 +1458,8 @@ def render_frames(p, outcome, S, n):
     d.rounded_rectangle([k(24), k(IY0), k(936), k(IY1)], radius=k(14), fill=(255, 255, 255, 8),
                         outline=(255, 255, 255, 28), width=lw(1))
     d.text((k(40), k(IY0 + 20)), "INJURY REPORT", font=F(14), fill=WHITE, anchor="lm")
-    d.text((k(920), k(IY0 + 20)), "ESPN feed | statuses can change before game time", font=F(10, False),
-           fill=AXIS, anchor="rm")
+    d.text((k(920), k(IY0 + 20)), f"{INJ_SRC.get(league, 'Injury feed')} | statuses can change before game time",
+           font=F(10, False), fill=AXIS, anchor="rm")
 
     def inj_col(x0, ab_, col_, items):
         d.rounded_rectangle([k(x0), k(IY0 + 38), k(x0 + 56), k(IY0 + 60)], radius=k(6), fill=col_ + (255,))
@@ -1307,7 +1559,8 @@ def build_embed(p, state, outcome=None):
             "fields": [{"name": "Record", "value": rec, "inline": True},
                        {"name": "Last 20", "value": last, "inline": True},
                        {"name": "P&L", "value": pnl, "inline": True},
-                       {"name": "🩺 Injury report", "value": inj_text(p), "inline": False}],
+                       {"name": "🩺 Injury report", "value": inj_text(p), "inline": False},
+                       {"name": "📈 Moneyline", "value": ml_text(p), "inline": False}],
             "footer": {"text": "Signals only, not financial advice"},
             "timestamp": datetime.now(timezone.utc).isoformat()}
 
@@ -1413,7 +1666,7 @@ def settle(state):
 
 
 def refresh_open(state, marks, now):
-    """Update open picks (live price, win probability, injuries) and re-post the chart."""
+    """Update open picks (live price, win probability, injuries, moneyline) and re-post the chart."""
     for t, old in state["open"].items():
         if now >= old["commence"] or t not in marks:
             continue
@@ -1425,6 +1678,8 @@ def refresh_open(state, marks, now):
         old["pts"] = (old.get("pts", []) + [[round(now), round(price, 4), round(win, 4)]])[-600:]
         if now - old.get("inj_at", 0) >= INJ_TTL:
             attach_injuries(old)
+        if now - old.get("ml_at", 0) >= ODDS_TTL:
+            attach_moneyline(old)
         if now - old.get("last_edit", 0) >= EDIT_SECONDS:
             try:
                 post(old, state)
@@ -1467,6 +1722,7 @@ def tick(state):
         if fresh >= TOP_N or len(state["open"]) >= MAX_OPEN:
             continue
         attach_injuries(p)
+        attach_moneyline(p)
         p["pts"] = [[round(now), round(p["price"], 4), round(p["p"], 4)]]
         p["entry_price"], p["last_edit"] = p["price"], now
         p["p0"], p["ev0"] = p["p"], p["ev"]
