@@ -1705,16 +1705,23 @@ def post(p, state, outcome=None):
 
 
 def post_inj_alert(p):
-    """Separate heads-up when an open pick's injury check turns flagged after it was posted."""
+    """Heads-up when an open pick's injury check turns flagged after it was posted. Includes the live chart."""
     chk = p.get("inj_check") or {}
     body = [f"**Pick:** {p['team']} to win", f"**Game:** {p['game']}", f"**Check:** {chk.get('text', '')}"]
     if chk.get("news"):
         body.append("**Headlines:**\n" + "\n".join(f"• {h}" for h in chk["news"]))
-    embed = {"title": f"⚠️ INJURY ALERT: {p['team']}"[:250], "description": "\n".join(body)[:4000],
-             "color": 0xFFB400,
-             "footer": {"text": f"Sources: {', '.join(chk.get('sources', [])) or 'n/a'} | Signals only, not financial advice"},
-             "timestamp": datetime.now(timezone.utc).isoformat()}
-    send(embed)
+
+    def make_embed():
+        return {"title": f"⚠️ INJURY ALERT: {p['team']}"[:250], "description": "\n".join(body)[:4000],
+                "color": 0xFFB400,
+                "footer": {"text": f"Sources: {', '.join(chk.get('sources', [])) or 'n/a'} | Signals only, not financial advice"},
+                "timestamp": datetime.now(timezone.utc).isoformat()}
+
+    try:
+        send(make_embed(), pick=p)  # new message with the chart attached
+    except Exception as e:
+        print("injury alert chart failed, sending text only:", repr(e), flush=True)
+        send(make_embed())
 
 
 def post_arb(a, state):
