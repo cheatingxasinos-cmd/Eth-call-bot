@@ -7,7 +7,10 @@ import math
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 
 import requests
@@ -392,10 +395,22 @@ def find_arb(ms, now, league=None):
     return best
 
 
-# ---------- injury report (Yahoo Sports page first, ESPN feed as backup; no keys) ----------
-INJ_SOURCE = os.getenv("INJURY_SOURCE", "yahoo").lower()  # "yahoo" or "espn" (which one goes first)
+# =====================================================================
+# INJURY CHECK: Yahoo + CBS Sports + ESPN (merged), then Google News + Bing News headlines
+# =====================================================================
+INJ_SOURCES = [s.strip().lower() for s in os.getenv("INJURY_SOURCES", "yahoo,cbs,espn").split(",") if s.strip()]
+INJ_MIN_SOURCES = int(os.getenv("INJ_MIN_SOURCES", "2"))  # sources that must answer before we say "confirmed"
+INJ_SKIP_FLAGGED = os.getenv("INJ_SKIP_FLAGGED", "0") == "1"  # 1 = do not post picks with a flagged player
+INJ_ALERT = os.getenv("INJ_ALERT", "1") == "1"  # post an alert if an open pick gets flagged later
+# Minor ranking nudge (win-probability points added to the sort score). Never blocks a pick.
+INJ_NUDGE = float(os.getenv("INJ_NUDGE", "1.0"))  # 0 = injuries never affect ranking, 0.5 = half, 2 = double
+INJ_ADJ = {"flagged": -0.03, "review": -0.01, "unverified": 0.0, "clear": 0.005}
+NEWS_TTL = float(os.getenv("NEWS_TTL", "600"))
+NEWS_MAX_AGE_H = float(os.getenv("NEWS_MAX_AGE_H", "48"))
 YAHOO_SLUG = {"NFL": "nfl", "NBA": "nba", "NHL": "nhl", "MLB": "mlb",
               "NCAAF": "college-football", "NCAAM": "college-basketball"}
+CBS_SLUG = {"NFL": "nfl", "NBA": "nba", "NHL": "nhl", "MLB": "mlb",
+            "NCAAF": "college-football", "NCAAM": "college-basketball"}
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Safari/537.36")
 YAHOO_HEADERS = {"User-Agent": BROWSER_UA, "Accept": "text/html,application/xhtml+xml",
@@ -407,11 +422,15 @@ ESPN_HEADERS = {"User-Agent": BROWSER_UA, "Accept": "application/json, text/plai
 INJ_PATH = {"NFL": "football/nfl", "NBA": "basketball/nba", "NHL": "hockey/nhl", "MLB": "baseball/mlb",
             "NCAAF": "football/college-football", "NCAAM": "basketball/mens-college-basketball",
             "EPL": "soccer/eng.1", "MLS": "soccer/usa.1"}
-INJ_TTL = float(os.getenv("INJURY_TTL", "600"))  # seconds between refreshes per league
+INJ_TTL = float(os.getenv("INJURY_TTL", "300"))  # seconds between refreshes per league
 INJ_FAIL_TTL = float(os.getenv("INJURY_FAIL_TTL", "1800"))  # wait after a failure before retrying
-INJ_CACHE = {}  # league -> (fetched_at, {team_key: [players]} or None)
-INJ_SRC = {}  # league -> "Yahoo Sports" / "ESPN"
+INJ_CACHE = {}  # league -> (fetched_at, merged {team_key: [players]} or None)
+INJ_PER = {}  # league -> {source label: {team_key: [players]}} (what each source returned)
 INJ_WARNED = set()
+NEWS_CACHE = {}  # (source label, team) -> (fetched_at, [headlines] or None)
+INJ_WORDS = re.compile(r"\b(injur\w*|ruled out|out for|out vs|out against|sidelined|questionable|doubtful|"
+                       r"day-to-day|will not play|won't play|scratched|suspend\w*|withdr\w+|"
+                       r"retire[sd]?|surgery|concussion)\b", re.I)
 
 
 def _sev(status):
@@ -435,7 +454,7 @@ def _st(status):
     return (s[:5].upper() or "?")
 
 
-# ----- Yahoo: read the public injuries page -----
+# ----- HTML injury pages (Yahoo Sports and CBS Sports share one parser) -----
 def _yahoo_team(text, fulls):
     """Heading text -> normalized full team name (accepts 'Boston Celtics', 'Celtics', 'LA Clippers')."""
     if len(text) > 40:
@@ -457,8 +476,14 @@ class _InjParse(HTMLParser):
         self.fulls, self.team = fulls, None
         self.in_table, self.row, self.cell = False, None, None
         self.cell_tag, self.headers, self.out = "td", None, {}
+        self.skip = 0  # depth inside a duplicate short-name span (CBS prints short + long names)
 
     def handle_starttag(self, tag, attrs):
+        if tag == "span":
+            if self.skip:
+                self.skip += 1
+            elif "--short" in (dict(attrs).get("class") or ""):
+                self.skip = 1
         if tag == "table":
             self.in_table, self.headers = True, None
         elif tag == "tr" and self.in_table:
@@ -467,6 +492,8 @@ class _InjParse(HTMLParser):
             self.cell, self.cell_tag = [], tag
 
     def handle_endtag(self, tag):
+        if tag == "span" and self.skip:
+            self.skip -= 1
         if tag in ("td", "th") and self.cell is not None and self.row is not None:
             self.row.append((" ".join("".join(self.cell).split()), self.cell_tag))
             self.cell = None
@@ -477,6 +504,8 @@ class _InjParse(HTMLParser):
             self.in_table = False
 
     def handle_data(self, data):
+        if self.skip:
+            return
         if self.cell is not None:
             self.cell.append(data)
             return
@@ -513,12 +542,11 @@ class _InjParse(HTMLParser):
             "detail": col(("injury", "comment", "detail", "note"), cells[3] if len(cells) > 3 else "")[:40]})
 
 
-def _inj_yahoo(league):
-    slug = YAHOO_SLUG.get(league)
+def _inj_html(url, league):
     fulls = sorted({_norm(v) for v in NAME_MAP.get(league, {}).values()})
-    if not slug or not fulls:
+    if not fulls:
         return None
-    r = DATA.get(f"https://sports.yahoo.com/{slug}/injuries/", headers=YAHOO_HEADERS, timeout=(3.05, 12))
+    r = DATA.get(url, headers=YAHOO_HEADERS, timeout=(3.05, 12))
     r.raise_for_status()
     ps = _InjParse(fulls)
     ps.feed(r.text)
@@ -529,7 +557,17 @@ def _inj_yahoo(league):
     return out or None
 
 
-# ----- ESPN: public JSON feed (backup) -----
+def _inj_yahoo(league):
+    slug = YAHOO_SLUG.get(league)
+    return _inj_html(f"https://sports.yahoo.com/{slug}/injuries/", league) if slug else None
+
+
+def _inj_cbs(league):
+    slug = CBS_SLUG.get(league)
+    return _inj_html(f"https://www.cbssports.com/{slug}/injuries/", league) if slug else None
+
+
+# ----- ESPN: public JSON feed -----
 def _espn_get(path):
     last = None
     for host in ESPN_HOSTS:
@@ -546,6 +584,7 @@ def _inj_espn(league):
     path = INJ_PATH.get(league)
     if not path:
         return None
+    fulls = sorted({_norm(v) for v in NAME_MAP.get(league, {}).values()})
     data = {}
     for t in _espn_get(path).get("injuries", []):
         items = []
@@ -558,8 +597,42 @@ def _inj_espn(league):
                 "pos": (a.get("position") or {}).get("abbreviation") or "",
                 "status": i.get("status") or (i.get("type") or {}).get("description") or "Unknown",
                 "detail": " ".join(x for x in (det.get("side"), kind) if x and x != "Not Specified")})
-        data[_norm(t.get("displayName", ""))] = items
+        tname = t.get("displayName", "")
+        key = (_yahoo_team(tname, fulls) if fulls else None) or _norm(tname)
+        data[key] = items
     return data or None
+
+
+SRC_FUNCS = {"yahoo": (_inj_yahoo, "Yahoo Sports"), "cbs": (_inj_cbs, "CBS Sports"), "espn": (_inj_espn, "ESPN")}
+
+
+def _run_source(key, league):
+    fn, label = SRC_FUNCS[key]
+    try:
+        data = fn(league)
+    except Exception as e:
+        if (label, league) not in INJ_WARNED:  # log once, not every tick
+            INJ_WARNED.add((label, league))
+            print(f"injury source {label} failed for {league}: {repr(e)}", flush=True)
+        return label, None
+    if not data and (label, league) not in INJ_WARNED:
+        INJ_WARNED.add((label, league))
+        print(f"injury source {label} returned nothing for {league}", flush=True)
+    return label, (data or None)
+
+
+def _merge_inj(datas):
+    """Union of all sources; for the same player the worst status wins."""
+    out = {}
+    for d in datas:
+        for team, items in d.items():
+            cur = out.setdefault(team, {})
+            for it in items:
+                k_ = _norm(it["name"])
+                old = cur.get(k_)
+                if old is None or _sev(it["status"]) > _sev(old["status"]):
+                    cur[k_] = it
+    return {t: list(v.values()) for t, v in out.items()}
 
 
 def _inj_league(league):
@@ -567,31 +640,28 @@ def _inj_league(league):
     hit = INJ_CACHE.get(league)
     if hit and now - hit[0] < (INJ_TTL if hit[1] is not None else INJ_FAIL_TTL):
         return hit[1]
-    order = ((_inj_yahoo, "Yahoo Sports"), (_inj_espn, "ESPN"))
-    if INJ_SOURCE == "espn":
-        order = order[::-1]
-    data = None
-    for fn, label in order:
-        try:
-            data = fn(league)
-        except Exception as e:
-            if (label, league) not in INJ_WARNED:  # log once, not every tick
-                INJ_WARNED.add((label, league))
-                print(f"injury source {label} failed for {league}: {repr(e)}", flush=True)
-            data = None
-        if data:
-            INJ_SRC[league] = label
-            break
-        if (label, league) not in INJ_WARNED:
-            INJ_WARNED.add((label, league))
-            print(f"injury source {label} returned nothing for {league}", flush=True)
-    INJ_CACHE[league] = (now, data)
-    return data
+    if league not in YAHOO_SLUG and league not in CBS_SLUG and league not in INJ_PATH:
+        INJ_CACHE[league] = (now, None)
+        return None
+    keys = [k_ for k_ in INJ_SOURCES if k_ in SRC_FUNCS]
+    per = {}
+    if keys:
+        with ThreadPoolExecutor(max_workers=len(keys)) as ex:
+            for label, data in ex.map(lambda k_: _run_source(k_, league), keys):
+                if data:
+                    per[label] = data
+    INJ_PER[league] = per
+    merged = _merge_inj(list(per.values())) if per else None
+    INJ_CACHE[league] = (now, merged)
+    return merged
 
 
-def injuries_for(team, league):
-    """Injured players for a team, worst first. None = no data for this league/team."""
-    data = _inj_league(league)
+def inj_src_label(league):
+    return ", ".join(INJ_PER.get(league, {}).keys()) or "Injury feed"
+
+
+def _find_team(data, team):
+    """Players listed for a team in one data set, or None if that data has no entry for the team."""
     if data is None:
         return None
     n = _norm(team)
@@ -601,9 +671,104 @@ def injuries_for(team, league):
         c = [v for k_, v in data.items() if k_.split() and k_.split()[-1] == nick]
         if len(c) == 1:
             items = c[0]
+    return items
+
+
+def injuries_for(team, league):
+    """Injured players for a team (all sources merged), worst first. None = no data for this league/team."""
+    items = _find_team(_inj_league(league), team)
     if items is None:
         return None
     return sorted(items, key=lambda x: -_sev(x["status"]))
+
+
+# ----- news headlines (Google News + Bing News RSS, no keys) -----
+def _parse_rss(content):
+    root = ET.fromstring(content)
+    out = []
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        try:
+            t = parsedate_to_datetime(it.findtext("pubDate")).timestamp()
+        except Exception:
+            t = None
+        out.append((title, t))
+    return out
+
+
+def _fetch_google(team):
+    q = f'"{team}" (injury OR injured OR "ruled out" OR questionable OR doubtful) when:2d'
+    r = DATA.get("https://news.google.com/rss/search",
+                 params={"q": q, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+                 headers={"User-Agent": BROWSER_UA}, timeout=(3.05, 8))
+    r.raise_for_status()
+    return _parse_rss(r.content)
+
+
+def _fetch_bing(team):
+    q = f'"{team}" injury OR injured OR "ruled out" OR questionable OR doubtful'
+    r = DATA.get("https://www.bing.com/news/search", params={"q": q, "format": "rss", "setlang": "en-US"},
+                 headers={"User-Agent": BROWSER_UA}, timeout=(3.05, 8))
+    r.raise_for_status()
+    return _parse_rss(r.content)
+
+
+NEWS_SOURCES = (("Google News", _fetch_google), ("Bing News", _fetch_bing))
+
+
+def news_hits(label, fn, team):
+    """Recent headlines naming the team and an injury word. List (maybe empty), or None if the lookup failed."""
+    key = (label, _norm(team))
+    hit = NEWS_CACHE.get(key)
+    if hit and time.time() - hit[0] < (NEWS_TTL if hit[1] is not None else 300):
+        return hit[1]
+    try:
+        items = fn(team)
+        last = _norm(team).split()[-1]
+        cutoff = time.time() - NEWS_MAX_AGE_H * 3600
+        res = []
+        for title, t in items:
+            if t is not None and t < cutoff:
+                continue
+            if INJ_WORDS.search(title) and last in _norm(title) and title[:110] not in res:
+                res.append(title[:110])
+        res = res[:3]
+    except Exception as e:
+        print(f"{label} check failed for {team}: {repr(e)}", flush=True)
+        res = None
+    NEWS_CACHE[key] = (time.time(), res)
+    return res
+
+
+def injury_check(p):
+    """Sets p['inj_check'] = {status, text, sources, news}. Says 'confirmed' only if enough sources answered
+    and nothing was found for the picked team."""
+    lg = p.get("league") or (p.get("game") or "").split(" | ")[0]
+    bad = [i for i in (p.get("inj") or []) if _sev(i["status"]) >= 1]
+    srcs = [label for label, data in INJ_PER.get(lg, {}).items() if _find_team(data, p["team"]) is not None]
+    hits = []
+    for label, fn in NEWS_SOURCES:
+        res = news_hits(label, fn, p["team"])
+        if res is not None:
+            srcs.append(label)
+            hits += [h for h in res if h not in hits]
+    hits = hits[:3]
+    need = 1 if lg in ("ATP", "WTA") else INJ_MIN_SOURCES  # tennis has no injury feed, news only
+    if bad:
+        names = ", ".join(f"{i['name']} ({_st(i['status'])})" for i in bad[:3])
+        status, text = "flagged", f"Injury check flagged: {names}"
+    elif hits:
+        status, text = "review", "Injury check: news mentions injuries, review headlines"
+    elif len(srcs) >= need:
+        status, text = "clear", "Injury check confirmed: none found"
+    else:
+        status, text = "unverified", "Injury check unverified: sources unavailable"
+    p["inj_check"] = {"status": status, "text": text, "sources": srcs, "news": hits}
+
+
+def _inj_key(p):
+    c = p.get("inj_check") or {}
+    return f"{c.get('status')}|{c.get('text')}|{'|'.join(c.get('news', []))}"
 
 
 def attach_injuries(p):
@@ -615,6 +780,12 @@ def attach_injuries(p):
         print("injury attach error", repr(e), flush=True)
         p.setdefault("inj", None)
         p.setdefault("inj_opp", None)
+    try:
+        injury_check(p)
+    except Exception as e:
+        print("injury check error", repr(e), flush=True)
+        p["inj_check"] = {"status": "unverified", "text": "Injury check unverified: sources unavailable",
+                          "sources": [], "news": []}
     p["inj_at"] = time.time()
 
 
@@ -1378,8 +1549,8 @@ def render_frames(p, outcome, S, n):
     d.rounded_rectangle([k(24), k(IY0), k(936), k(IY1)], radius=k(14), fill=(255, 255, 255, 8),
                         outline=(255, 255, 255, 28), width=lw(1))
     d.text((k(40), k(IY0 + 20)), "INJURY REPORT", font=F(14), fill=WHITE, anchor="lm")
-    d.text((k(920), k(IY0 + 20)), f"{INJ_SRC.get(league, 'Injury feed')} | statuses can change before game time",
-           font=F(10, False), fill=AXIS, anchor="rm")
+    f_, t_ = fit(f"{inj_src_label(league)} | statuses can change before game time", k(700), 10, False, 8)
+    d.text((k(920), k(IY0 + 20)), t_, font=f_, fill=AXIS, anchor="rm")
 
     def inj_col(x0, name_, col_, items):
         BW = 190  # badge shows the full team name
@@ -1413,8 +1584,15 @@ def render_frames(p, outcome, S, n):
 
     inj_col(40, team, pc, p.get("inj"))
     inj_col(492, opp, oc, p.get("inj_opp"))
-    d.text((k(CW / 2), k(1058)), "Signals only, not financial advice", font=F(10, False), fill=(90, 90, 95, 255),
-           anchor="mm")
+
+    # injury check result line at the bottom of the pick
+    chk = p.get("inj_check") or {}
+    ccol = {"clear": C_UP, "flagged": C_DN, "review": AMBER}.get(chk.get("status"), (124, 124, 124)) + (255,)
+    ctext = (chk.get("text") or "Injury check pending").upper()
+    if chk.get("sources"):
+        ctext += "  |  " + ", ".join(chk["sources"])
+    f_, t_ = fit(ctext, k(900), 12)
+    d.text((k(CW / 2), k(1058)), t_, font=f_, fill=ccol, anchor="mm")
 
     # ===== frames (pulsing end dots) =====
     out = []
@@ -1476,12 +1654,17 @@ def build_embed(p, state, outcome=None):
     else:
         title = f"PICK: {p['team']}"
         color = GREEN
-    return {"title": title[:250], "description": "\n".join(lines), "color": color,
-            "fields": [{"name": "Record", "value": rec, "inline": True},
-                       {"name": "Last 20", "value": last, "inline": True},
-                       {"name": "P&L", "value": pnl, "inline": True},
-                       {"name": "🩺 Injury report", "value": inj_text(p), "inline": False}],
-            "footer": {"text": "Signals only, not financial advice"},
+    chk = p.get("inj_check") or {"text": "Injury check pending", "sources": [], "news": []}
+    src = f" ({', '.join(chk['sources'])})" if chk["sources"] else ""
+    fields = [{"name": "Record", "value": rec, "inline": True},
+              {"name": "Last 20", "value": last, "inline": True},
+              {"name": "P&L", "value": pnl, "inline": True},
+              {"name": "🩺 Injury report", "value": inj_text(p), "inline": False}]
+    if chk["news"]:
+        fields.append({"name": "📰 Injury headlines", "value": "\n".join(f"• {h}" for h in chk["news"])[:1000],
+                       "inline": False})
+    return {"title": title[:250], "description": "\n".join(lines), "color": color, "fields": fields,
+            "footer": {"text": f"{chk['text']}{src} | Signals only, not financial advice"[:2000]},
             "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
@@ -1519,6 +1702,19 @@ def send(embed, message_id=None, pick=None, outcome=None):
 
 def post(p, state, outcome=None):
     p["message_id"] = send(build_embed(p, state, outcome), p.get("message_id"), pick=p, outcome=outcome)
+
+
+def post_inj_alert(p):
+    """Separate heads-up when an open pick's injury check turns flagged after it was posted."""
+    chk = p.get("inj_check") or {}
+    body = [f"**Pick:** {p['team']} to win", f"**Game:** {p['game']}", f"**Check:** {chk.get('text', '')}"]
+    if chk.get("news"):
+        body.append("**Headlines:**\n" + "\n".join(f"• {h}" for h in chk["news"]))
+    embed = {"title": f"⚠️ INJURY ALERT: {p['team']}"[:250], "description": "\n".join(body)[:4000],
+             "color": 0xFFB400,
+             "footer": {"text": f"Sources: {', '.join(chk.get('sources', [])) or 'n/a'} | Signals only, not financial advice"},
+             "timestamp": datetime.now(timezone.utc).isoformat()}
+    send(embed)
 
 
 def post_arb(a, state):
@@ -1597,6 +1793,13 @@ def refresh_open(state, marks, now):
         old["pts"] = (old.get("pts", []) + [[round(now), round(price, 4), round(win, 4)]])[-600:]
         if now - old.get("inj_at", 0) >= INJ_TTL:
             attach_injuries(old)
+            chk = old.get("inj_check") or {}
+            if INJ_ALERT and chk.get("status") in ("flagged", "review") and old.get("alerted") != _inj_key(old):
+                try:
+                    post_inj_alert(old)
+                    old["alerted"] = _inj_key(old)
+                except Exception as e:
+                    print("injury alert error", repr(e), flush=True)
         if now - old.get("last_edit", 0) >= EDIT_SECONDS:
             try:
                 post(old, state)
@@ -1625,21 +1828,31 @@ def tick(state):
         except Exception as e:
             print("arb send error", repr(e), flush=True)
     state["arbs"] = {k_: v for k_, v in state["arbs"].items() if now - v < 86400}
-    # new picks: best win probability first, max TOP_N per scan, one pick per game
+    # new picks: win probability with a small injury nudge, max TOP_N per scan, one pick per game
     done = {h["ticker"] for h in state["history"]}
     locked = {h.get("event") for h in state["history"] if h.get("event")}
     locked |= {p.get("event") for p in state["open"].values() if p.get("event")}
     fresh = 0
-    for p in picks:
+    cands = [p for p in picks if p["ticker"] not in state["open"] and p["ticker"] not in done
+             and p["event"] not in locked]
+    cands = cands[:max(TOP_N * 4, 8)]  # only check the best few, keeps requests down
+    for p in cands:
+        attach_injuries(p)  # Yahoo, CBS, ESPN, Google News, Bing News
+        p["rank"] = p["growth"] + INJ_NUDGE * INJ_ADJ.get(p["inj_check"]["status"], 0.0)
+    cands.sort(key=lambda x: -x["rank"])
+    for p in cands:
         t = p["ticker"]
-        if t in state["open"] or t in done or p["event"] in locked:
+        if p["event"] in locked:
             continue
         if fresh >= TOP_N or len(state["open"]) >= MAX_OPEN:
+            break
+        if INJ_SKIP_FLAGGED and p["inj_check"]["status"] == "flagged":
+            print(f"skipped {p['team']}: {p['inj_check']['text']}", flush=True)
             continue
-        attach_injuries(p)
         p["pts"] = [[round(now), round(p["price"], 4), round(p["p"], 4)]]
         p["entry_price"], p["last_edit"] = p["price"], now
         p["p0"], p["ev0"] = p["p"], p["ev"]
+        p["alerted"] = _inj_key(p)  # already visible in the pick footer, no duplicate alert
         try:
             post(p, state)
         except Exception as e:
